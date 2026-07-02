@@ -732,7 +732,7 @@ export function ChatPage() {
   // (no synthesized title yet) reads as "New session" to match its
   // sidebar row; the landing page (no active session) stays "Omnigent".
   useEffect(() => {
-    const fallback = urlConvId ? UNTITLED_CONVERSATION_LABEL : "Omnigent";
+    const fallback = urlConvId ? UNTITLED_CONVERSATION_LABEL : "Automaton OS";
     const base = truncateTitle(activeConv?.title ?? fallback);
     document.title = showsWorking ? `● ${base}` : base;
   }, [activeConv?.title, showsWorking, urlConvId]);

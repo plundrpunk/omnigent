@@ -255,7 +255,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
           onClick={onNavClick}
           className="rounded-sm text-[15px] font-semibold tracking-tight text-foreground transition-colors hover:text-foreground/70"
         >
-          Omnigent
+          Automaton OS
         </Link>
         <div className="flex items-center gap-1">
           <ThemeModeMenu />

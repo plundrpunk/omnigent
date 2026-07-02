@@ -149,8 +149,8 @@
   --input: #e8ecf0;
   /* Focus ring matches --primary. */
   --ring: #11171c;
-  /* Brand pink — reserved for brand moments, not status. */
-  --brand-accent: #df3c85;
+  /* Brand purple — reserved for brand moments, not status. */
+  --brand-accent: #4a7cf0;
   /* Named status hues. success/warning/info above mirror green/yellow/blue. */
   --status-blue: #3b8ff5;
   --status-green: #2ea65c;
@@ -180,10 +180,11 @@
 }
 
 .dark {
-  /* Dark mode tokens — semi-transparent for glassmorphism backdrop-filter */
-  --background: #0d1218;
-  --foreground: oklch(0.965 0.003 240);
-  --card: rgba(40, 34, 58, 0.6);
+  /* Dark mode tokens — semi-transparent for glassmorphism backdrop-filter.
+     * AUTOMATON palette: deep-black canvas, gold primary, blue accents. */
+  --background: #0d0d0d;
+  --foreground: #e0e0e0;
+  --card: rgba(26, 26, 26, 0.6);
   /* Opaque stand-in for the glass --card. The composer card uses this
      * instead of --card: its trays tuck their square corners behind the
      * card (negative-margin overlap), and a translucent card lets the
@@ -191,65 +192,65 @@
      * (#28223a) — full-alpha that read lighter than the neighboring
      * glass surfaces; this approximates the glass card's perceived
      * color: 60% of #28223a composited over the dark canvas gradient. */
-  --card-solid: #201c30;
-  --card-foreground: oklch(0.965 0.003 240);
+  --card-solid: #171717;
+  --card-foreground: #e0e0e0;
   /* Dark counterpart of the tray surface — semi-transparent for glass effect */
-  --tray: rgba(40, 34, 58, 0.6);
-  --popover: rgba(26, 33, 41, 0.8);
-  --popover-foreground: oklch(0.965 0.003 240);
-  --primary: #e8ecf0;
-  --primary-foreground: #11171c;
-  --secondary: #1f272d;
-  --secondary-foreground: #e8ecf0;
+  --tray: rgba(26, 26, 26, 0.6);
+  --popover: rgba(20, 20, 20, 0.85);
+  --popover-foreground: #e0e0e0;
+  --primary: #ffd700;
+  --primary-foreground: #0d0d0d;
+  --secondary: #242424;
+  --secondary-foreground: #e0e0e0;
   /* Active/selected states, hover backgrounds, subtle containers. */
   /* Opaque base (#28223a is var(--card)'s solid form — the dark-mode --card
        itself is translucent). bg-muted backs ~160 solid utility surfaces (code
        blocks, badges, hover rows) that must not let the canvas gradient bleed
        through; the frosted look is reserved for the .dark .bg-card rule. */
-  --muted: color-mix(in srgb, var(--muted-foreground) 15%, #28223a);
-  --muted-foreground: #92a4b3;
-  --code-bg: oklch(0.38 0.005 240);
-  --accent: #04355d;
-  --accent-foreground: #4299e0;
-  --destructive: #e65b77;
+  --muted: color-mix(in srgb, var(--muted-foreground) 15%, #1a1a1a);
+  --muted-foreground: #888888;
+  --code-bg: #242424;
+  --accent: #24334f;
+  --accent-foreground: #9cc4f0;
+  --destructive: #ff4757;
   --destructive-foreground: #fff;
   /* success/warning/info repointed onto the status hues below, mirroring
      * light mode so dark mode doesn't carry a second green/yellow/blue. */
   --success: #2ea65c;
   --warning: #d4972a;
-  --info: #3b8ff5;
-  /* Brand pink + named status hues (same values as light — the brand
+  --info: #00d9ff;
+  /* Brand purple + named status hues (same values as light — the brand
      * status palette is hue-stable across themes). Defined explicitly here
      * rather than inheriting from :root so dark mode is self-contained. */
-  --brand-accent: #df3c85;
+  --brand-accent: #4a7cf0;
   --status-blue: #3b8ff5;
   --status-green: #2ea65c;
   --status-yellow: #d4972a;
   --status-red: #f04858;
   --status-gray: #8e99a4;
-  --border: oklch(0.28 0.005 240);
-  --input: oklch(0.28 0.005 240);
+  --border: #333333;
+  --input: #333333;
   /* Focus ring matches --primary. */
-  --ring: #e8ecf0;
-  --chart-1: oklch(0.64 0.22 254);
-  --chart-2: oklch(0.65 0.14 200);
-  --chart-3: oklch(0.68 0.15 145);
-  --chart-4: oklch(0.75 0.16 70);
-  --chart-5: oklch(0.65 0.008 240);
+  --ring: #ffd700;
+  --chart-1: #ffd700;
+  --chart-2: #4a7cf0;
+  --chart-3: #00d9ff;
+  --chart-4: #2ea65c;
+  --chart-5: #8e99a4;
   /* bg-sidebar surfaces blend into the dark .app-shell gradient — a 45°
      * diagonal sweeping green (rgb 17,24,28) → purple (rgb 19,13,33);
      * --sidebar sits in the green-dominant region and stays translucent
      * so it tracks the canvas underneath (a flat color can't match a
      * diagonal everywhere). Mirrors the light-mode treatment. */
-  --sidebar: rgba(17, 23, 28, 0.75);
-  --sidebar-foreground: oklch(0.965 0.003 240);
-  --sidebar-primary: oklch(0.64 0.22 254);
-  --sidebar-primary-foreground: oklch(0.12 0.004 240);
-  --sidebar-accent: oklch(0.245 0.005 240);
-  --sidebar-accent-foreground: oklch(0.965 0.003 240);
-  --sidebar-border: oklch(0.28 0.005 240);
-  --sidebar-ring: oklch(0.92 0.003 240 / 0.4);
-  --tooltip-bg: #2a2440;
+  --sidebar: rgba(13, 13, 13, 0.75);
+  --sidebar-foreground: #e0e0e0;
+  --sidebar-primary: #ffd700;
+  --sidebar-primary-foreground: #0d0d0d;
+  --sidebar-accent: #2a2a2a;
+  --sidebar-accent-foreground: #e0e0e0;
+  --sidebar-border: #333333;
+  --sidebar-ring: rgba(255, 215, 0, 0.4);
+  --tooltip-bg: #242424;
 }
 
 /* App-shell canvas gradient. Copied verbatim from the brand mock
@@ -280,11 +281,13 @@
   );
 }
 .dark .app-shell {
+  /* AUTOMATON canvas: deep black with an ultramarine-to-baby-blue blend
+   * and a faint gold ember. */
   background:
-    radial-gradient(ellipse at 20% 50%, rgba(100, 40, 180, 0.15) 0%, transparent 50%),
-    radial-gradient(ellipse at 80% 20%, rgba(80, 30, 140, 0.1) 0%, transparent 45%),
-    radial-gradient(ellipse at 60% 80%, rgba(140, 30, 100, 0.08) 0%, transparent 40%),
-    linear-gradient(145deg, #1e1035 0%, #11171c 50%, #161020 100%);
+    radial-gradient(ellipse at 20% 50%, rgba(65, 102, 245, 0.16) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 20%, rgba(255, 215, 0, 0.06) 0%, transparent 45%),
+    radial-gradient(ellipse at 60% 80%, rgba(137, 207, 240, 0.09) 0%, transparent 40%),
+    linear-gradient(145deg, #0e1424 0%, #0d0d0d 50%, #0e1220 100%);
 }
 
 /* Chat scroll fade: the ChatHeader overlay paints no background (a flat
