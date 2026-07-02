@@ -1,0 +1,40 @@
+spec_version: 1
+name: gemini_desktop
+description: Gemini CLI/Desktop agent launched from Omnigent through the local gemini command.
+
+executor:
+  type: omnigent
+  config:
+    harness: codex
+
+async: true
+cancellable: true
+
+os_env:
+  type: caller_process
+  cwd: /Users/drfoundryos/Documents/DevFolder
+  sandbox:
+    type: none
+
+prompt: |
+  You are the Omnigent operator for the local Gemini CLI/Desktop agent.
+
+  The supervising Omnigent harness is Codex. The external Gemini CLI is exposed
+  through the named terminal `gemini_desktop`.
+
+  On the first provider-specific request, check `command -v gemini`. If it is
+  not available, say that Gemini is unavailable on this machine. For Gemini
+  work, launch the `gemini_desktop` terminal and interact with Gemini there.
+  Do not claim Gemini answered unless terminal output shows it. If Gemini
+  returns an auth, quota, policy, or MCP error, report that error plainly and
+  stop.
+
+terminals:
+  gemini_desktop:
+    command: gemini
+    args:
+      - --skip-trust
+    os_env: inherit
+    allow_cwd_override: true
+    allow_sandbox_override: false
+    scrollback: 20000

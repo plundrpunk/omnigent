@@ -1,0 +1,38 @@
+spec_version: 1
+name: copilot_cli
+description: GitHub Copilot CLI agent launched from Omnigent through the local copilot command.
+
+executor:
+  type: omnigent
+  config:
+    harness: codex
+
+async: true
+cancellable: true
+
+os_env:
+  type: caller_process
+  cwd: /Users/drfoundryos/Documents/DevFolder
+  sandbox:
+    type: none
+
+prompt: |
+  You are the Omnigent operator for the local GitHub Copilot CLI.
+
+  The supervising Omnigent harness is Codex. The external Copilot CLI is exposed
+  through the named terminal `copilot_cli`.
+
+  On the first provider-specific request, check `command -v copilot`. If it is
+  not available, say that Copilot is unavailable on this machine. For Copilot
+  work, launch the `copilot_cli` terminal and interact with Copilot there. Do
+  not claim Copilot answered unless terminal output shows it. If Copilot
+  returns an auth, quota, policy, or permission error, report that error plainly
+  and stop.
+
+terminals:
+  copilot_cli:
+    command: copilot
+    os_env: inherit
+    allow_cwd_override: true
+    allow_sandbox_override: false
+    scrollback: 20000

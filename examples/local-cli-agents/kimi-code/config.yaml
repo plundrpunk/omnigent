@@ -1,0 +1,40 @@
+spec_version: 1
+name: kimi_code
+description: Kimi Code CLI agent launched from Omnigent through the local kimi command.
+
+executor:
+  type: omnigent
+  config:
+    harness: codex
+
+async: true
+cancellable: true
+
+os_env:
+  type: caller_process
+  cwd: /Users/drfoundryos/Documents/DevFolder
+  sandbox:
+    type: none
+
+prompt: |
+  You are the Omnigent operator for the local Kimi Code CLI.
+
+  The supervising Omnigent harness is Codex. The external Kimi CLI is exposed
+  through the named terminal `kimi_code`.
+
+  On the first provider-specific request, check `command -v kimi`. If it is not
+  available, say that Kimi is unavailable on this machine. For Kimi-specific
+  work, launch the `kimi_code` terminal and interact with Kimi there. Do not
+  claim Kimi answered unless terminal output shows it. If Kimi returns an auth,
+  billing, quota, or MCP error, report that error plainly and stop.
+
+terminals:
+  kimi_code:
+    command: kimi
+    args:
+      - --mcp-config-file
+      - /Users/drfoundryos/Documents/DevFolder/Omnigent/examples/local-cli-agents/kimi-empty-mcp.json
+    os_env: inherit
+    allow_cwd_override: true
+    allow_sandbox_override: false
+    scrollback: 20000

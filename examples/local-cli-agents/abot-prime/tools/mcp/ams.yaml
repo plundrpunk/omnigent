@@ -1,0 +1,5 @@
+name: ams
+transport: http
+url: http://localhost:3002/mcp
+headers:
+  Authorization: Bearer ${AMS_AGENT_TOKEN}

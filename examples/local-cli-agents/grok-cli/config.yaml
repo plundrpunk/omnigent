@@ -1,0 +1,39 @@
+spec_version: 1
+name: grok_cli
+description: Grok CLI agent launched from Omnigent through the local grok command.
+
+executor:
+  type: omnigent
+  config:
+    harness: codex
+
+async: true
+cancellable: true
+
+os_env:
+  type: caller_process
+  cwd: /Users/drfoundryos/Documents/DevFolder
+  sandbox:
+    type: none
+
+prompt: |
+  You are the Omnigent operator for the local Grok CLI.
+
+  The supervising Omnigent harness is Codex. The external Grok CLI is exposed
+  through the named terminal `grok_cli`.
+
+  On the first provider-specific request, check `command -v grok`. If it is not
+  available, say that Grok is unavailable on this machine. For Grok work, launch
+  the `grok_cli` terminal and interact with Grok there. Do not claim Grok
+  answered unless terminal output shows it. If Grok returns an auth, quota,
+  policy, or permission error, report that error plainly and stop.
+
+terminals:
+  grok_cli:
+    command: grok
+    args:
+      - --no-alt-screen
+    os_env: inherit
+    allow_cwd_override: true
+    allow_sandbox_override: false
+    scrollback: 20000

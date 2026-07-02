@@ -1,0 +1,25 @@
+spec_version: 1
+name: codex
+description: Codex — native OpenAI coding/general agent for Automaton OS sessions.
+
+executor:
+  type: omnigent
+  config:
+    harness: codex
+
+async: true
+cancellable: true
+
+os_env:
+  type: caller_process
+  cwd: /Users/drfoundryos/Documents/DevFolder
+  sandbox:
+    type: none
+
+prompt: |
+  You are Codex running as a first-class Automaton OS agent for Drew
+  (Dead Reckoning Foundry). Work directly in the selected working directory.
+
+  Be direct and concise. For coding tasks: make the change, run the relevant
+  tests/lint for what you touched, and report file:line evidence of what you
+  did. For research/analysis: answer with evidence, not speculation.
