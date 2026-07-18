@@ -1,4 +1,4 @@
-import { BotIcon, FileIcon, ListTodoIcon, TerminalIcon, XIcon } from "lucide-react";
+import { BotIcon, FileIcon, ListTodoIcon, TerminalIcon, WaypointsIcon, XIcon } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -9,6 +9,7 @@ import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { TodoPanel } from "./TodoPanel";
 import { type RightRailTab, TAB_BADGE_BASE } from "./railTabs";
+import { WorkLoopPanel, type WorkLoopPanelProps } from "./WorkLoopPanel";
 
 // ---------------------------------------------------------------------------
 // FileTabsStrip — open file tabs rendered in the top rail tab strip, as peers
@@ -140,6 +141,8 @@ interface WorkspacePanelProps {
    * file + its comments + URL) so they can't drift from the tab state.
    */
   onRightRailTabChange: (next: RightRailTab) => void;
+  /** Live Work Loop data and navigation handlers for the primary Run tab. */
+  workLoop: WorkLoopPanelProps;
   /** Whether the Files tab is available (agent spec exposes an os_env). */
   showFilesPanel: boolean;
   /** Count of changed files, shown as the Files tab badge. */
@@ -225,6 +228,7 @@ export function WorkspacePanel({
   inert,
   rightRailTab,
   onRightRailTabChange,
+  workLoop,
   showFilesPanel,
   changedCount,
   showShellsTab,
@@ -304,6 +308,13 @@ export function WorkspacePanel({
           onValueChange={(v) => onRightRailTabChange(v as RightRailTab)}
         >
           <TabsList variant="pill">
+            <TabsTrigger
+              value="run"
+              className="h-[32px] gap-[6px] rounded-[8px] px-[12px] text-[13px] leading-5"
+            >
+              <WaypointsIcon className="size-4" />
+              Run
+            </TabsTrigger>
             {showFilesPanel && (
               <TabsTrigger
                 value="files"
@@ -416,6 +427,8 @@ export function WorkspacePanel({
             onCommentsOpenChange={onCommentsOpenChange}
             sort={filesPanelSort}
           />
+        ) : rightRailTab === "run" ? (
+          <WorkLoopPanel {...workLoop} />
         ) : rightRailTab === "subagents" && rootSessionId ? (
           <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
         ) : rightRailTab === "todos" && isClaudeNative ? (

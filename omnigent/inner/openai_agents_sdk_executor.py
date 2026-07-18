@@ -1279,7 +1279,7 @@ class OpenAIAgentsSDKExecutor(Executor):
             return state.agent
 
         state.agent = agents_sdk.Agent(
-            name="Omnigent",
+            name="Automaton OS",
             instructions=system_prompt or None,
             model=model,
             model_settings=agents_sdk.ModelSettings(

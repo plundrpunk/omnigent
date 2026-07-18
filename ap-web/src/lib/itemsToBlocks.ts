@@ -22,6 +22,7 @@ import {
   type ToolGroup,
   type ToolResultBlock,
   type UserMessageBlock,
+  type WorkReceiptBlock,
   slashCommandEchoItemId,
   slashCommandEchoText,
 } from "./blocks";
@@ -36,6 +37,7 @@ import {
   type NativeToolItem,
   type SlashCommandItem,
   type TerminalCommandItem,
+  type WorkReceiptItem,
   isCompactionItem,
   isErrorItem,
   isFunctionCallItem,
@@ -44,7 +46,9 @@ import {
   isNativeToolItem,
   isSlashCommandItem,
   isTerminalCommandItem,
+  isWorkReceiptItem,
 } from "./conversationItems";
+import { parseHarnessReceiptEventV1 } from "./workReceipt";
 
 /**
  * Walk persisted items in arrival order and emit a flat block list.
@@ -101,6 +105,9 @@ function itemToBlock(item: ConversationItem): AnyBlock | null {
   }
   if (isTerminalCommandItem(item)) {
     return terminalCommandToBlock(item);
+  }
+  if (isWorkReceiptItem(item)) {
+    return workReceiptToBlock(item);
   }
   // Unknown future item types — skip silently so the page still renders.
   return null;
@@ -247,6 +254,16 @@ function terminalCommandToBlock(item: TerminalCommandItem): TerminalCommandBlock
     input: item.input ?? null,
     stdout: item.stdout ?? null,
     stderr: item.stderr ?? null,
+  };
+}
+
+function workReceiptToBlock(item: WorkReceiptItem): WorkReceiptBlock | null {
+  const receipt = parseHarnessReceiptEventV1(item);
+  if (receipt === null) return null;
+  return {
+    type: "work_receipt",
+    ctx: ctxFor(item),
+    receipt,
   };
 }
 

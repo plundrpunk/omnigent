@@ -24,6 +24,9 @@ vi.mock("./SubagentsPanel", () => ({
 vi.mock("./TodoPanel", () => ({
   TodoPanel: () => <div data-testid="todos-stub" />,
 }));
+vi.mock("./WorkLoopPanel", () => ({
+  WorkLoopPanel: () => <div data-testid="work-loop-stub" />,
+}));
 
 afterEach(() => {
   cleanup();
@@ -52,6 +55,17 @@ function renderWorkspace(
       handleProps={{ tabIndex: 0 }}
       rightRailTab={overrides.rightRailTab ?? "files"}
       onRightRailTabChange={onRightRailTabChange}
+      workLoop={{
+        conversationId: "conv_ws",
+        liveness: { kind: "online" },
+        pendingApprovalCount: 0,
+        changedCount: 0,
+        agentCount: 1,
+        agentsWorking: 0,
+        showFilesPanel: true,
+        onOpenFiles: vi.fn(),
+        onOpenAgents: vi.fn(),
+      }}
       showFilesPanel
       changedCount={0}
       showShellsTab={false}
@@ -158,6 +172,13 @@ describe("WorkspacePanel open-file tabs", () => {
 });
 
 describe("WorkspacePanel content area", () => {
+  it("renders the Work Loop as the Run tab's primary session surface", () => {
+    renderWorkspace({ rightRailTab: "run", selectedFilePath: null });
+
+    expect(screen.getByRole("tab", { name: /^Run$/i })).toHaveAttribute("data-state", "active");
+    expect(screen.getByTestId("work-loop-stub")).toBeInTheDocument();
+  });
+
   it("renders the FileViewer for the active path (not the scope panel)", () => {
     renderWorkspace({
       openFiles: ["src/App.tsx"],

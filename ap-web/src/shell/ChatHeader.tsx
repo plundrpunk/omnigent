@@ -11,6 +11,7 @@ import {
   PanelRightIcon,
   ShareIcon,
   TerminalIcon,
+  WaypointsIcon,
 } from "lucide-react";
 import { Link } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
@@ -48,6 +49,8 @@ interface MobileSessionMenuProps {
   subagentsPanelOpen: boolean;
   /** True while the mobile tasks drawer is open. */
   todosPanelOpen: boolean;
+  /** True while the mobile Work Loop drawer is open. */
+  workLoopPanelOpen: boolean;
   /** Hide the Shells entry (claude-native sub-agents only). */
   hideTerminalsTab: boolean;
   /** Number of open terminals (entry badge + visibility). */
@@ -71,6 +74,8 @@ interface MobileSessionMenuProps {
   agentCount: number;
   /** Open the mobile files drawer. */
   onOpenFiles: () => void;
+  /** Open the mobile Work Loop drawer. */
+  onOpenWorkLoop: () => void;
   /** Open the first terminal in the terminals push panel. */
   onOpenFirstTerminal: () => void;
   /** Open the mobile agents drawer. */
@@ -356,6 +361,7 @@ export function ChatHeader({
           !mobileMenu.filesPanelOpen &&
           !mobileMenu.subagentsPanelOpen &&
           !mobileMenu.todosPanelOpen &&
+          !mobileMenu.workLoopPanelOpen &&
           (hasRailContent || mobileMenu.debugMode) && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -370,6 +376,13 @@ export function ChatHeader({
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="min-w-44">
+                <DropdownMenuItem
+                  onSelect={mobileMenu.onOpenWorkLoop}
+                  className="gap-2.5 px-2.5 py-2 text-base"
+                >
+                  <WaypointsIcon className="size-4" />
+                  Run
+                </DropdownMenuItem>
                 {showFilesPanel && (
                   <DropdownMenuItem
                     onSelect={mobileMenu.onOpenFiles}

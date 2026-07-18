@@ -183,7 +183,7 @@ def _tmux_status_option_commands() -> list[list[str]]:
             "set-option",
             "-g",
             "status-left",
-            f"Omnigent: #{{{_TMUX_CONVERSATION_LINK_OPTION}}}",
+            f"Automaton OS: #{{{_TMUX_CONVERSATION_LINK_OPTION}}}",
         ],
         ["set-option", "-g", "status-left-style", "fg=default,bg=default"],
         ["set-option", "-g", "status-left-length", "200"],

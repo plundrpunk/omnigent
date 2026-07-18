@@ -26,6 +26,24 @@ const ApprovePage = lazy(() =>
   import("@/pages/ApprovePage").then((m) => ({ default: m.ApprovePage })),
 );
 const InboxPage = lazy(() => import("@/pages/InboxPage").then((m) => ({ default: m.InboxPage })));
+const SystemPage = lazy(() =>
+  import("@/pages/SystemPage").then((m) => ({ default: m.SystemPage })),
+);
+const FleetPage = lazy(() =>
+  import("@/pages/FleetPage").then((m) => ({ default: m.FleetPage })),
+);
+const PatternsPage = lazy(() =>
+  import("@/pages/PatternsPage").then((m) => ({ default: m.PatternsPage })),
+);
+const ModelsPage = lazy(() =>
+  import("@/pages/ModelsPage").then((m) => ({ default: m.ModelsPage })),
+);
+const LoopsPage = lazy(() =>
+  import("@/pages/LoopsPage").then((m) => ({ default: m.LoopsPage })),
+);
+const TrainingPage = lazy(() =>
+  import("@/pages/TrainingPage").then((m) => ({ default: m.TrainingPage })),
+);
 
 interface AppProps {
   /**
@@ -120,6 +138,12 @@ function App({ basename }: AppProps = {}) {
           <Route path={prefix || "/"} element={<ChatPage />} />
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
+          <Route path={`${prefix}/system`} element={<SystemPage />} />
+          <Route path={`${prefix}/fleet`} element={<FleetPage />} />
+          <Route path={`${prefix}/patterns`} element={<PatternsPage />} />
+          <Route path={`${prefix}/models`} element={<ModelsPage />} />
+          <Route path={`${prefix}/loops`} element={<LoopsPage />} />
+          <Route path={`${prefix}/training`} element={<TrainingPage />} />
           {info.accounts_enabled && (
             <>
               <Route path={`${prefix}/members`} element={<MembersPage />} />

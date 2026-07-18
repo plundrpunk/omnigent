@@ -1,5 +1,5 @@
 name: ams
 transport: http
-url: http://localhost:3002/mcp
+url: https://automaton-memory.com/mcp/
 headers:
-  Authorization: Bearer ${AMS_AGENT_TOKEN}
+  X-API-Key: ${AMS_AGENT_TOKEN}

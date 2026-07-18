@@ -2412,6 +2412,59 @@ async def test_post_external_conversation_item_persists_and_streams_visible_item
     assert published[5][1]["item"]["type"] == "terminal_command"
 
 
+async def test_post_external_work_receipt_persists_and_streams_versioned_event(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda session_id, event: published.append((session_id, event)),
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    receipt = {
+        "schema_version": "harness.receipt.v1",
+        "event_id": "28f721ce-cf1a-4c64-b8d4-dcd7d3d6a225",
+        "user_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+        "project": "harness-automaton",
+        "work_item_id": "wi-1",
+        "session_id": session["id"],
+        "response_id": "resp-receipt-1",
+        "status": "completed",
+        "created_at": "2026-07-10T00:00:00+00:00",
+        "verifier": {
+            "status": "passed",
+            "verdict": "ACCEPT",
+            "reason": "tests passed",
+            "evidence": ["97 tests passed"],
+        },
+        "artifact": {
+            "artifact_id": "artifact-1",
+            "changed_files": ["src/example.py"],
+        },
+    }
+    response = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "work_receipt",
+                "response_id": "resp-receipt-1",
+                "item_data": receipt,
+            },
+        },
+    )
+    assert response.status_code == 202, response.text
+    snapshot = await client.get(f"/v1/sessions/{session['id']}")
+    receipt_items = [item for item in snapshot.json()["items"] if item["type"] == "work_receipt"]
+    assert len(receipt_items) == 1
+    assert receipt_items[0]["data"]["event_id"] == receipt["event_id"]
+    assert receipt_items[0]["data"]["verifier"]["status"] == "passed"
+    assert published[-1][1]["type"] == "response.output_item.done"
+    assert published[-1][1]["item"]["type"] == "work_receipt"
+
+
 async def test_post_external_function_call_output_caps_oversized_output(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

@@ -29,6 +29,7 @@ from omnigent.entities.conversation import (
     NewConversationItem,
     ResourceEventData,
     SlashCommandData,
+    WorkReceiptData,
 )
 
 
@@ -417,6 +418,35 @@ def test_extract_search_text_for_resource_event_item() -> None:
     assert "terminal" in text
     assert "opaque" not in text
     assert "not indexed" not in text
+
+
+def test_extract_search_text_for_work_receipt() -> None:
+    item = NewConversationItem(
+        type="work_receipt",
+        response_id="resp_1",
+        data=WorkReceiptData(
+            schema_version="harness.receipt.v1",
+            event_id="28f721ce-cf1a-4c64-b8d4-dcd7d3d6a225",
+            user_id="user-1",
+            project="harness-automaton",
+            work_item_id="wi-1",
+            session_id="conv-1",
+            status="completed",
+            created_at="2026-07-10T00:00:00+00:00",
+            verifier={
+                "status": "passed",
+                "verdict": "ACCEPT",
+                "reason": "tests passed",
+                "evidence": ["97 tests passed"],
+            },
+            artifact={"artifact_id": "artifact-1"},
+        ),
+    )
+    text = extract_search_text(item)
+    assert "harness-automaton" in text
+    assert "wi-1" in text
+    assert "ACCEPT" in text
+    assert "artifact-1" in text
 
 
 @pytest.mark.parametrize(

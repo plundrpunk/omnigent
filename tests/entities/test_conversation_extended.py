@@ -23,6 +23,7 @@ from omnigent.entities.conversation import (
     NewConversationItem,
     ResourceEventData,
     TerminalCommandData,
+    WorkReceiptData,
     _validate_type_matches_data,
     parse_item_data,
 )
@@ -169,7 +170,14 @@ def test_terminal_command_invalid_kind() -> None:
 
 def test_non_content_item_types_complete() -> None:
     """All expected non-content types are present."""
-    expected = {"compaction", "error", "resource_event", "slash_command", "terminal_command"}
+    expected = {
+        "compaction",
+        "error",
+        "resource_event",
+        "slash_command",
+        "terminal_command",
+        "work_receipt",
+    }
     assert expected == NON_CONTENT_ITEM_TYPES
 
 
@@ -192,6 +200,7 @@ def test_item_type_map_covers_all_types() -> None:
         "resource_event",
         "slash_command",
         "terminal_command",
+        "work_receipt",
     }
     assert set(ITEM_TYPE_TO_DATA_CLS.keys()) == expected_types
 
@@ -248,6 +257,42 @@ def test_parse_resource_event_data() -> None:
 def test_parse_terminal_command_data() -> None:
     data = parse_item_data("terminal_command", {"kind": "input", "input": "ls"})
     assert isinstance(data, TerminalCommandData)
+
+
+def test_parse_versioned_work_receipt_data() -> None:
+    data = parse_item_data(
+        "work_receipt",
+        {
+            "schema_version": "harness.receipt.v1",
+            "event_id": "28f721ce-cf1a-4c64-b8d4-dcd7d3d6a225",
+            "user_id": "user-1",
+            "project": "harness-automaton",
+            "work_item_id": "wi-1",
+            "session_id": "conv-1",
+            "status": "completed",
+            "created_at": "2026-07-10T00:00:00+00:00",
+            "verifier": {"status": "passed", "verdict": "ACCEPT"},
+            "artifact": {"artifact_id": "artifact-1"},
+        },
+    )
+    assert isinstance(data, WorkReceiptData)
+    assert data.verifier.status == "passed"
+
+
+def test_work_receipt_rejects_unknown_schema_version() -> None:
+    with pytest.raises(ValidationError, match=r"harness\.receipt\.v1"):
+        WorkReceiptData(
+            schema_version="harness.receipt.v2",  # type: ignore[arg-type]
+            event_id="28f721ce-cf1a-4c64-b8d4-dcd7d3d6a225",
+            user_id="user-1",
+            project="harness-automaton",
+            work_item_id="wi-1",
+            session_id="conv-1",
+            status="completed",
+            created_at="2026-07-10T00:00:00+00:00",
+            verifier={"status": "passed"},
+            artifact={"artifact_id": "artifact-1"},
+        )
 
 
 # ── Conversation field defaults ───────────────────────

@@ -1117,7 +1117,7 @@ def _print_version_callback(ctx: click.Context, _param: click.Parameter, value: 
     help="Show the version and exit.",
 )
 def cli() -> None:
-    """Omnigent CLI."""
+    """Automaton OS CLI."""
 
 
 # Names of every subcommand the click group owns. Used by

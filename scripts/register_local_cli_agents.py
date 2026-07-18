@@ -21,6 +21,8 @@ AGENT_SPECS = [
     ROOT / "examples/local-cli-agents/grok-cli",
     # AMS fleet orchestrator (AMS MCP toolbag attached via tools/mcp/ams.yaml).
     ROOT / "examples/local-cli-agents/abot-prime",
+    # DRF work-loop operator (AMS toolbag + HA WorkItem bridge terminal).
+    ROOT / "examples/local-cli-agents/drf-command",
 ]
 
 

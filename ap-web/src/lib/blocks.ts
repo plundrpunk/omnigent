@@ -9,6 +9,7 @@
 // Python class name lowercased (e.g. ResponseStartBlock → "response_start").
 
 import type { Response } from "./types";
+import type { HarnessReceiptEventV1 } from "./workReceipt";
 
 /**
  * Metadata attached to every stream block.
@@ -206,6 +207,12 @@ export interface TerminalCommandBlock {
   stdout: string | null;
   /** Captured stderr; set when `kind="output"`. */
   stderr: string | null;
+}
+
+export interface WorkReceiptBlock {
+  type: "work_receipt";
+  ctx: BlockContext;
+  receipt: HarnessReceiptEventV1;
 }
 
 // ── Text ─────────────────────────────────────────────────
@@ -446,6 +453,7 @@ export type AnyBlock =
   | NativeToolBlock
   | SlashCommandBlock
   | TerminalCommandBlock
+  | WorkReceiptBlock
   | TextChunk
   | TextDone
   | ReasoningStartBlock

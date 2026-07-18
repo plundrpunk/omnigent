@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Omnigent Chat</title>
+<title>Automaton OS Chat</title>
 <!-- Markdown + syntax highlighting + HTML sanitization from CDN -->
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
@@ -214,7 +214,7 @@ header { flex-shrink: 0; border-bottom: 1px solid var(--border); background: var
     <textarea id="msg-input" rows="1" placeholder="Type a message..." onkeydown="handleKey(event)"></textarea>
     <button class="btn-send" id="send-btn" onclick="sendMessage()">Send</button>
   </div>
-  <div class="powered">Powered by Omnigent</div>
+  <div class="powered">Powered by Automaton OS</div>
 </div>
 
 <script>
@@ -603,7 +603,7 @@ function notifyTurnDone(tab, preview) {
   //  - the chat tab that finished is not the one the user is looking at
   const userIsWatching = !document.hidden && tab.id === activeTabId;
   if (userIsWatching) return;
-  const title = (agentInfo?.name || 'Omnigent') + ' replied';
+  const title = (agentInfo?.name || 'Automaton OS') + ' replied';
   const body = (tab.title !== ('Chat ' + tab.id) ? tab.title + ': ' : '') +
     (preview.length > 120 ? preview.substring(0, 120) + '...' : preview);
   const n = new Notification(title, { body, tag: 'omnigent-' + tab.id });
@@ -634,7 +634,7 @@ async function init() {
     const name = agentInfo.name || 'Agent';
     document.getElementById('agent-name').textContent = name;
     fillHeaderMascot();
-    document.title = 'Omnigent \u2014 ' + name;
+    document.title = 'Automaton OS \u2014 ' + name;
     if (agentInfo.tools?.length > 0) {
       const toggle = document.getElementById('tools-toggle');
       toggle.style.display = '';

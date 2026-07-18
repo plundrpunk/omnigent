@@ -1,8 +1,9 @@
 import { forwardRef, type SVGProps } from "react";
 
-// AUTOMATON mascot: a greaser wolf — pompadour, leather jacket, circle-A
-// patch — with a pup sidekick (replaces the Otto starfish; keeps Otto's
-// animation contract so OttoEyes/index.css need no changes):
+// AUTOMATON mascot: a grey greaser wolf — silver fur, jet-black pompadour
+// traced in neon green, leather jacket, circle-A patch — with a neon-green
+// pup sidekick that carries its own aura (replaces the Otto starfish; keeps
+// Otto's animation contract so OttoEyes/index.css need no changes):
 // - Pass className="otto-working" for the bob + blink (see index.css). Each eye
 //   (the wolf's two and the buddy pup's two) is a `g.otto-eye` group of
 //   sclera + pupil + glint so the blink collapses each eye in place.
@@ -16,53 +17,83 @@ export const OttoIcon = forwardRef<SVGSVGElement, SVGProps<SVGSVGElement>>(
   function OttoIcon(props, ref) {
     return (
       <svg ref={ref} viewBox="0 0 1024 1024" fill="none" aria-hidden="true" {...props}>
-        {/* Ears — tall angular triangles. */}
-        <path d="M336 330 L242 100 L462 282 Z" fill="#FFD700" />
-        <path d="M696 330 L790 100 L570 282 Z" fill="#FFD700" />
-        {/* Inner ears. */}
-        <path d="M348 300 L286 148 L430 270 Z" fill="#2B4ECC" />
-        <path d="M684 300 L746 148 L602 270 Z" fill="#2B4ECC" />
+        <defs>
+          {/* Green aura for the pup sidekick. */}
+          <filter id="otto-aura" x="-60%" y="-60%" width="220%" height="220%">
+            <feDropShadow dx="0" dy="0" stdDeviation="16" floodColor="#39FF14" floodOpacity="0.7" />
+          </filter>
+          {/* Green aura for the whole wolf. */}
+          <filter id="otto-wolf-aura" x="-40%" y="-40%" width="180%" height="180%">
+            <feDropShadow dx="0" dy="0" stdDeviation="20" floodColor="#39FF14" floodOpacity="0.6" />
+          </filter>
+        </defs>
+        {/* Whole-wolf green aura wrapper (pup keeps its own tighter aura). */}
+        <g filter="url(#otto-wolf-aura)">
+        {/* Ears — tall angular triangles, wolf grey. */}
+        <path d="M336 330 L242 100 L462 282 Z" fill="#8B93A3" />
+        <path d="M696 330 L790 100 L570 282 Z" fill="#8B93A3" />
+        {/* Inner ears — dark slate. */}
+        <path d="M348 300 L286 148 L430 270 Z" fill="#3A4150" />
+        <path d="M684 300 L746 148 L602 270 Z" fill="#3A4150" />
         {/* Head — angular silhouette with spiked cheek fur and a V chin. */}
         <path
           d="M336 316 C400 284 632 284 696 316 L724 470 L788 540 L706 588 L768 668 L664 706 L588 810 L516 848 L444 810 L368 706 L264 668 L326 588 L244 540 L308 470 Z"
-          fill="#FFD700"
+          fill="#8B93A3"
         />
-        {/* Pompadour — solid mound with a front quiff and slick highlights. */}
-        <path d="M330 320 Q330 130 516 118 Q696 130 696 320 Z" fill="#4A7CF0" />
-        <path d="M394 158 C426 78 546 60 610 112 C544 92 462 106 424 172 Z" fill="#4A7CF0" />
-        <path d="M560 252 C620 202 664 224 676 288 C644 254 602 252 560 252 Z" fill="#8FC8F5" />
-        <path d="M414 148 C450 96 530 84 584 110 C528 100 462 112 430 160 Z" fill="#8FC8F5" />
+        {/* Pompadour — jet black, traced with a neon-green edge. */}
+        <path
+          d="M330 320 Q330 130 516 118 Q696 130 696 320 Z"
+          fill="#14161C"
+          stroke="#39FF14"
+          strokeWidth="7"
+          strokeLinejoin="round"
+        />
+        <path
+          d="M394 158 C426 78 546 60 610 112 C544 92 462 106 424 172 Z"
+          fill="#14161C"
+          stroke="#39FF14"
+          strokeWidth="6"
+          strokeLinejoin="round"
+        />
+        {/* Slick gloss streaks — silver shine on black hair. */}
+        <path d="M560 252 C620 202 664 224 676 288 C644 254 602 252 560 252 Z" fill="#3A4150" />
+        <path d="M414 148 C450 96 530 84 584 110 C528 100 462 112 430 160 Z" fill="#C9CED8" />
         <path
           d="M380 300 C390 210 450 160 520 150 L524 166 C462 176 408 222 396 302 Z"
-          fill="#2B4ECC"
+          fill="#0B0C10"
         />
-        {/* Brows — angled down for the cool scowl. */}
-        <path d="M320 424 L474 462 L478 492 L326 452 Z" fill="#2B4ECC" />
-        <path d="M712 424 L558 462 L554 492 L706 452 Z" fill="#2B4ECC" />
+        {/* Forehead fur peak under the pompadour. */}
+        <path d="M478 322 L516 384 L554 322 Z" fill="#6E7684" />
+        {/* Cheek fur streaks. */}
+        <path d="M340 555 L398 585 L346 606 Z" fill="#6E7684" />
+        <path d="M692 555 L634 585 L686 606 Z" fill="#6E7684" />
+        {/* Brows — angled down for the cool scowl, dark fur markings. */}
+        <path d="M320 424 L474 462 L478 492 L326 452 Z" fill="#262B36" />
+        <path d="M712 424 L558 462 L554 492 L706 452 Z" fill="#262B36" />
         {/* Scar — slashes over the right brow. */}
-        <path d="M610 350 L622 344 L648 424 L636 430 Z" fill="#2B4ECC" />
-        <path d="M646 342 L658 336 L684 416 L672 422 Z" fill="#2B4ECC" />
-        {/* Muzzle shading. */}
-        <path d="M516 588 L610 690 L588 772 L516 806 L444 772 L422 690 Z" fill="#C79200" />
+        <path d="M610 350 L622 344 L648 424 L636 430 Z" fill="#262B36" />
+        <path d="M646 342 L658 336 L684 416 L672 422 Z" fill="#262B36" />
+        {/* Muzzle — light grey like a real wolf's snout. */}
+        <path d="M516 588 L610 690 L588 772 L516 806 L444 772 L422 690 Z" fill="#C9CED8" />
         {/* Nose. */}
         <path d="M472 646 L560 646 L516 706 Z" fill="#0D0D0D" />
         {/* Smirk — angled mouth line with bared fangs. */}
         <path d="M448 752 L586 736 L588 750 L450 766 Z" fill="#0D0D0D" />
         <path d="M468 752 L484 796 L500 748 Z" fill="#FEFEFE" />
         <path d="M540 744 L554 788 L568 741 Z" fill="#FEFEFE" />
-        {/* Hoop earrings on the left ear. */}
+        {/* Gold hoop earrings on the left ear. */}
         <path
           d="M268 242 a24 24 0 1 0 48 0 a24 24 0 1 0 -48 0 M282 242 a10 10 0 1 1 20 0 a10 10 0 1 1 -20 0"
-          fill="#4A7CF0"
+          fill="#FFD700"
           fillRule="evenodd"
         />
         <path
           d="M299 300 a19 19 0 1 0 38 0 a19 19 0 1 0 -38 0 M310 300 a8 8 0 1 1 16 0 a8 8 0 1 1 -16 0"
-          fill="#4A7CF0"
+          fill="#FFD700"
           fillRule="evenodd"
         />
-        {/* Neck. */}
-        <path d="M470 820 L562 820 L552 910 L480 910 Z" fill="#C79200" />
+        {/* Neck — light chest fur. */}
+        <path d="M470 820 L562 820 L552 910 L480 910 Z" fill="#C9CED8" />
         {/* Leather jacket — shoulders with popped collar. */}
         <path
           d="M150 1024 L150 940 C220 850 330 812 400 800 L516 872 L632 800 C702 812 812 850 874 940 L874 1024 Z"
@@ -71,7 +102,7 @@ export const OttoIcon = forwardRef<SVGSVGElement, SVGProps<SVGSVGElement>>(
         <path d="M400 800 L344 706 L482 794 L516 872 Z" fill="#1b1b1f" />
         <path d="M632 800 L688 706 L550 794 L516 872 Z" fill="#1b1b1f" />
         {/* Chest fur in the jacket's V. */}
-        <path d="M482 794 L550 794 L516 886 Z" fill="#C79200" />
+        <path d="M482 794 L550 794 L516 886 Z" fill="#C9CED8" />
         {/* Zipper + pull. */}
         <path d="M511 886 L521 886 L521 1024 L511 1024 Z" fill="#FFD700" />
         <path d="M506 906 L526 906 L526 934 L506 934 Z" fill="#FFD700" />
@@ -91,15 +122,17 @@ export const OttoIcon = forwardRef<SVGSVGElement, SVGProps<SVGSVGElement>>(
         <path d="M255 1006 L291 850 L307 850 L271 1006 Z" fill="#FFD700" />
         <path d="M291 850 L307 850 L343 1006 L327 1006 Z" fill="#FFD700" />
         <path d="M212 952 L384 928 L386 944 L214 968 Z" fill="#FFD700" />
-        {/* Buddy pup — small blue wolf perched on the right shoulder. */}
-        <path d="M756 738 L728 660 L792 704 Z" fill="#4A7CF0" />
-        <path d="M846 738 L874 660 L810 704 Z" fill="#4A7CF0" />
-        <path d="M778 718 L801 684 L824 718 Z" fill="#2B4ECC" />
-        <path
-          d="M752 732 C776 716 826 716 850 732 L864 782 L852 832 L801 860 L750 832 L738 782 Z"
-          fill="#4A7CF0"
-        />
-        <path d="M786 820 L816 820 L801 842 Z" fill="#0D0D0D" />
+        {/* Buddy pup — neon-green wolf on the right shoulder, glowing aura. */}
+        <g filter="url(#otto-aura)">
+          <path d="M756 738 L728 660 L792 704 Z" fill="#39FF14" />
+          <path d="M846 738 L874 660 L810 704 Z" fill="#39FF14" />
+          <path d="M778 718 L801 684 L824 718 Z" fill="#0FA607" />
+          <path
+            d="M752 732 C776 716 826 716 850 732 L864 782 L852 832 L801 860 L750 832 L738 782 Z"
+            fill="#39FF14"
+          />
+          <path d="M786 820 L816 820 L801 842 Z" fill="#0D0D0D" />
+        </g>
         {/* Wolf left eye (viewer left) — sclera outside the pupil group. */}
         <g className="otto-eye">
           <path
@@ -138,6 +171,7 @@ export const OttoIcon = forwardRef<SVGSVGElement, SVGProps<SVGSVGElement>>(
           <path d="M812 786 a15 15 0 1 0 30 0 a15 15 0 1 0 -30 0" fill="#FEFEFE" />
           <path d="M817.5 786 a9.5 9.5 0 1 0 19 0 a9.5 9.5 0 1 0 -19 0" fill="#0D0D0D" />
           <path d="M828 781 a3.5 3.5 0 1 0 7 0 a3.5 3.5 0 1 0 -7 0" fill="#FEFEFE" />
+        </g>
         </g>
       </svg>
     );

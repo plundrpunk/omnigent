@@ -13,6 +13,7 @@
 // translator can skip them without crashing.
 
 import type { MessageContentBlock } from "./blocks";
+import type { HarnessReceiptEventV1 } from "./workReceipt";
 
 export interface BaseItem {
   id: string;
@@ -136,6 +137,8 @@ export interface TerminalCommandItem extends BaseItem {
   stderr?: string;
 }
 
+export type WorkReceiptItem = BaseItem & HarnessReceiptEventV1 & { type: "work_receipt" };
+
 export type ConversationItem =
   | MessageItem
   | FunctionCallItem
@@ -145,6 +148,7 @@ export type ConversationItem =
   | CompactionItem
   | SlashCommandItem
   | TerminalCommandItem
+  | WorkReceiptItem
   | (BaseItem & Record<string, unknown>);
 
 export function isMessageItem(item: ConversationItem): item is MessageItem {
@@ -177,6 +181,10 @@ export function isSlashCommandItem(item: ConversationItem): item is SlashCommand
 
 export function isTerminalCommandItem(item: ConversationItem): item is TerminalCommandItem {
   return item.type === "terminal_command";
+}
+
+export function isWorkReceiptItem(item: ConversationItem): item is WorkReceiptItem {
+  return item.type === "work_receipt";
 }
 
 // Cursor-paginated history fetching lives in `sessionsApi.ts`

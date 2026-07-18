@@ -181,10 +181,10 @@
 
 .dark {
   /* Dark mode tokens — semi-transparent for glassmorphism backdrop-filter.
-     * AUTOMATON palette: deep-black canvas, gold primary, blue accents. */
-  --background: #0d0d0d;
+     * AUTOMATON palette: deep-black canvas, gold primary, cyan/green neon accents. */
+  --background: #0a0b12;
   --foreground: #e0e0e0;
-  --card: rgba(26, 26, 26, 0.6);
+  --card: rgba(18, 20, 31, 0.6);
   /* Opaque stand-in for the glass --card. The composer card uses this
      * instead of --card: its trays tuck their square corners behind the
      * card (negative-margin overlap), and a translucent card lets the
@@ -192,65 +192,65 @@
      * (#28223a) — full-alpha that read lighter than the neighboring
      * glass surfaces; this approximates the glass card's perceived
      * color: 60% of #28223a composited over the dark canvas gradient. */
-  --card-solid: #171717;
+  --card-solid: #12141f;
   --card-foreground: #e0e0e0;
   /* Dark counterpart of the tray surface — semi-transparent for glass effect */
-  --tray: rgba(26, 26, 26, 0.6);
-  --popover: rgba(20, 20, 20, 0.85);
+  --tray: rgba(18, 20, 31, 0.6);
+  --popover: rgba(14, 16, 26, 0.85);
   --popover-foreground: #e0e0e0;
   --primary: #ffd700;
-  --primary-foreground: #0d0d0d;
-  --secondary: #242424;
+  --primary-foreground: #0a0b12;
+  --secondary: #1a1d2b;
   --secondary-foreground: #e0e0e0;
   /* Active/selected states, hover backgrounds, subtle containers. */
   /* Opaque base (#28223a is var(--card)'s solid form — the dark-mode --card
        itself is translucent). bg-muted backs ~160 solid utility surfaces (code
        blocks, badges, hover rows) that must not let the canvas gradient bleed
        through; the frosted look is reserved for the .dark .bg-card rule. */
-  --muted: color-mix(in srgb, var(--muted-foreground) 15%, #1a1a1a);
+  --muted: color-mix(in srgb, var(--muted-foreground) 15%, #12141f);
   --muted-foreground: #888888;
-  --code-bg: #242424;
-  --accent: #24334f;
-  --accent-foreground: #9cc4f0;
-  --destructive: #ff4757;
+  --code-bg: #161927;
+  --accent: #0f2b33;
+  --accent-foreground: #7deefc;
+  --destructive: #ff1744;
   --destructive-foreground: #fff;
   /* success/warning/info repointed onto the status hues below, mirroring
      * light mode so dark mode doesn't carry a second green/yellow/blue. */
-  --success: #2ea65c;
-  --warning: #d4972a;
-  --info: #00d9ff;
+  --success: #39ff14;
+  --warning: #e8ff00;
+  --info: #00f0ff;
   /* Brand purple + named status hues (same values as light — the brand
      * status palette is hue-stable across themes). Defined explicitly here
      * rather than inheriting from :root so dark mode is self-contained. */
-  --brand-accent: #4a7cf0;
-  --status-blue: #3b8ff5;
-  --status-green: #2ea65c;
-  --status-yellow: #d4972a;
-  --status-red: #f04858;
+  --brand-accent: #00f0ff;
+  --status-blue: #00aaff;
+  --status-green: #39ff14;
+  --status-yellow: #e8ff00;
+  --status-red: #ff1744;
   --status-gray: #8e99a4;
-  --border: #333333;
-  --input: #333333;
+  --border: #364066;
+  --input: #364066;
   /* Focus ring matches --primary. */
   --ring: #ffd700;
   --chart-1: #ffd700;
-  --chart-2: #4a7cf0;
-  --chart-3: #00d9ff;
-  --chart-4: #2ea65c;
-  --chart-5: #8e99a4;
+  --chart-2: #b026ff;
+  --chart-3: #00f0ff;
+  --chart-4: #39ff14;
+  --chart-5: #ff1493;
   /* bg-sidebar surfaces blend into the dark .app-shell gradient — a 45°
      * diagonal sweeping green (rgb 17,24,28) → purple (rgb 19,13,33);
      * --sidebar sits in the green-dominant region and stays translucent
      * so it tracks the canvas underneath (a flat color can't match a
      * diagonal everywhere). Mirrors the light-mode treatment. */
-  --sidebar: rgba(13, 13, 13, 0.75);
+  --sidebar: rgba(10, 11, 18, 0.75);
   --sidebar-foreground: #e0e0e0;
   --sidebar-primary: #ffd700;
-  --sidebar-primary-foreground: #0d0d0d;
-  --sidebar-accent: #2a2a2a;
+  --sidebar-primary-foreground: #0a0b12;
+  --sidebar-accent: #142c3d;
   --sidebar-accent-foreground: #e0e0e0;
-  --sidebar-border: #333333;
+  --sidebar-border: #364066;
   --sidebar-ring: rgba(255, 215, 0, 0.4);
-  --tooltip-bg: #242424;
+  --tooltip-bg: #1a1d2b;
 }
 
 /* App-shell canvas gradient. Copied verbatim from the brand mock
@@ -281,13 +281,21 @@
   );
 }
 .dark .app-shell {
-  /* AUTOMATON canvas: deep black with an ultramarine-to-baby-blue blend
-   * and a faint gold ember. */
+  /* AUTOMATON canvas: near-black with CRT scanlines plus faint neon washes
+   * (green low-left, cyan top-right, gold ember center) so the palette
+   * reads on the walls, not just in rare status accents. */
   background:
-    radial-gradient(ellipse at 20% 50%, rgba(65, 102, 245, 0.16) 0%, transparent 50%),
-    radial-gradient(ellipse at 80% 20%, rgba(255, 215, 0, 0.06) 0%, transparent 45%),
-    radial-gradient(ellipse at 60% 80%, rgba(137, 207, 240, 0.09) 0%, transparent 40%),
-    linear-gradient(145deg, #0e1424 0%, #0d0d0d 50%, #0e1220 100%);
+    repeating-linear-gradient(
+      0deg,
+      rgba(255, 255, 255, 0.015) 0px,
+      rgba(255, 255, 255, 0.015) 1px,
+      transparent 1px,
+      transparent 3px
+    ),
+    radial-gradient(ellipse at 15% 85%, rgba(57, 255, 20, 0.08) 0%, transparent 48%),
+    radial-gradient(ellipse at 85% 12%, rgba(0, 240, 255, 0.1) 0%, transparent 50%),
+    radial-gradient(ellipse at 55% 45%, rgba(255, 215, 0, 0.05) 0%, transparent 42%),
+    #090a10;
 }
 
 /* Chat scroll fade: the ChatHeader overlay paints no background (a flat
@@ -996,4 +1004,24 @@
 /* Cursor when hovering over a resizable column border */
 .tiptap-md-content .resize-cursor {
   cursor: col-resize;
+}
+
+/* AUTOMATON wordmark — chromatic-aberration split: white core, cyan/pink
+ * RGB ghosts, a faint neon-green under-halo. Static on purpose (it lives in
+ * persistent chrome); the glitch is in the color, not in motion. */
+.dark .automaton-wordmark {
+  letter-spacing: 0.03em;
+}
+
+
+/* AUTOMATON OS hero banner (NewChatDialog) */
+.banner-core {
+  color: color-mix(in srgb, var(--foreground) 62%, transparent);
+}
+.banner-a {
+  color: var(--foreground);
+}
+@keyframes bannerBreathe {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.22); }
 }

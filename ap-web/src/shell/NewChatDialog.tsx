@@ -1167,6 +1167,31 @@ export function NewChatLandingScreen() {
       {/* Padding lives inside the 840px cap, so the composer renders at
           840 − 80 = 760px max. */}
       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-10 pt-8 pb-16">
+        {/* AUTOMATON OS banner — ANSI-shadow blocks, grayscale. The two
+            A’s render at full foreground, the rest at ~62% — emphasis by
+            value, not hue: Lars is the only color on this page.
+            Decorative: hidden from AT, non-selectable. */}
+        <pre
+          aria-hidden="true"
+          data-testid="automaton-ascii-banner"
+          className="select-none overflow-hidden text-center font-mono text-[6px] leading-[1.22] sm:text-[11px]"
+        >
+          {[
+            " █████╗  ██╗   ██╗ ████████╗  ██████╗  ███╗   ███╗  █████╗  ████████╗  ██████╗  ███╗   ██╗    ██████╗  ███████╗",
+            "██╔══██╗ ██║   ██║ ╚══██╔══╝ ██╔═══██╗ ████╗ ████║ ██╔══██╗ ╚══██╔══╝ ██╔═══██╗ ████╗  ██║   ██╔═══██╗ ██╔════╝",
+            "███████║ ██║   ██║    ██║    ██║   ██║ ██╔████╔██║ ███████║    ██║    ██║   ██║ ██╔██╗ ██║   ██║   ██║ ███████╗",
+            "██╔══██║ ██║   ██║    ██║    ██║   ██║ ██║╚██╔╝██║ ██╔══██║    ██║    ██║   ██║ ██║╚██╗██║   ██║   ██║ ╚════██║",
+            "██║  ██║ ╚██████╔╝    ██║    ╚██████╔╝ ██║ ╚═╝ ██║ ██║  ██║    ██║    ╚██████╔╝ ██║ ╚████║   ╚██████╔╝ ███████║",
+            "╚═╝  ╚═╝  ╚═════╝     ╚═╝     ╚═════╝  ╚═╝     ╚═╝ ╚═╝  ╚═╝    ╚═╝     ╚═════╝  ╚═╝  ╚═══╝    ╚═════╝  ╚══════╝"
+          ].map((line, i) => (
+            <div key={i}>
+              <span className="banner-a">{line.slice(0, 8)}</span>
+              <span className="banner-core">{line.slice(8, 51)}</span>
+              <span className="banner-a">{line.slice(51, 59)}</span>
+              <span className="banner-core">{line.slice(59)}</span>
+            </div>
+          ))}
+        </pre>
         <div className="flex flex-col items-center gap-3.5 sm:flex-row">
           <OttoEyes className="h-18 w-auto shrink-0" />
           <h1 className="text-center text-3xl font-medium tracking-[-0.03em] text-foreground sm:text-left">

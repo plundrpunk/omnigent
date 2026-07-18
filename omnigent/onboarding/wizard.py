@@ -665,7 +665,7 @@ def _prompt_existing_or_new(configs: list[Path]) -> Path | None:
         console.print()
         console.print("[bold]What would you like to do?[/bold]")
         console.print()
-        choice = _arrow_menu(["Create a new Omnigent", "Run an existing Omnigent"])
+        choice = _arrow_menu(["Create a new Automaton", "Run an existing Automaton"])
         if choice == 0:
             return None
 
@@ -712,14 +712,14 @@ def _show_welcome() -> None:
     from omnigent.inner.mascots import MASCOT_ART_COLOR
 
     banner = startup_banner_strings(
-        "Welcome to Omnigent!",
+        "Welcome to Automaton OS!",
         hint_line="skip anytime: omnigent run <agent.yaml>",
         art_color=MASCOT_ART_COLOR,
     )
     console.print()
     sys.stdout.write(banner.ansi + "\n")
     console.print()
-    console.print("  Omnigent is a declarative agent authoring and runtime framework.")
+    console.print("  Automaton OS is a declarative agent authoring and runtime framework.")
     console.print("  Define your agent in a YAML config and the framework handles the rest.")
     console.print()
     console.print(
@@ -762,7 +762,7 @@ def _show_welcome() -> None:
 def _prompt_use_case() -> int:
     """Prompt for use case. Returns 1 (single), 2 (multi), or 3 (custom)."""
     console.print(
-        "  Here are two popular coding agent scenarios where people find Omnigent useful:"
+        "  Here are two popular coding agent scenarios where people find Automaton OS useful:"
     )
     console.print()
     options = [

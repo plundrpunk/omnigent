@@ -33,6 +33,7 @@ import {
   type ToolGroup,
   type ToolResultBlock,
   type UserMessageBlock,
+  type WorkReceiptBlock,
   slashCommandEchoItemId,
   slashCommandEchoText,
 } from "./blocks";
@@ -660,6 +661,16 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
         stdout: event.stdout,
         stderr: event.stderr,
       } satisfies TerminalCommandBlock;
+      return;
+    }
+
+    case "work_receipt": {
+      adoptResponseIdIfUnset(state, event.responseId);
+      yield {
+        type: "work_receipt",
+        ctx: ctx(state, event.itemId || null, event.responseId || null),
+        receipt: event.receipt,
+      } satisfies WorkReceiptBlock;
       return;
     }
 

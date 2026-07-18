@@ -1564,12 +1564,10 @@ describe("FilesPanel visibility", () => {
 });
 
 describe("Right workspace card visibility", () => {
-  it("keeps the card mounted with Agents as the only tab for a minimal agent", () => {
+  it("keeps the card mounted with Run and Agents for a minimal agent", () => {
     // A no-os_env agent (available: false) with no shells and no todos
-    // still has the unconditional Agents tab (the panel lists at least
-    // the main agent), so the card mounts, the Agents tab is selected
-    // by the fallback, and Files/Shells/Tasks are absent. An unmounted
-    // card here means the always-visible Agents rule regressed.
+    // still has the unconditional Run and Agents tabs, so the card mounts,
+    // Run becomes the truthful fallback, and Files/Shells/Tasks are absent.
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
@@ -1581,8 +1579,8 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: /Files/i })).toBeNull();
     expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
-    // The tab-fallback effect lands on Agents (the only available tab).
-    expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: /^Run$/i })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: /Agents/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 

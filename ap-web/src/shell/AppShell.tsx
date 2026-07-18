@@ -62,6 +62,7 @@ import { PermissionsModal } from "@/components/PermissionsModal";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { WorkspacePanel } from "./WorkspacePanel";
+import { WorkLoopPanel } from "./WorkLoopPanel";
 import type { RightRailTab } from "./railTabs";
 
 /**
@@ -169,6 +170,7 @@ export function AppShell() {
   // on a phone they open as full-screen overlays from the session-menu FAB.
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [todosPanelOpen, setTodosPanelOpen] = useState(false);
+  const [workLoopPanelOpen, setWorkLoopPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) is open by default and
   // remembers its open/closed state per session — a brand-new session starts
   // open; reopening a session restores how the user last left it. Toggled
@@ -390,6 +392,10 @@ export function AppShell() {
   const railTabsAvailable = useMemo(
     () =>
       ({
+        // Run is the primary session object. It is always available and
+        // reports missing verifier evidence explicitly rather than hiding the
+        // gap behind the chat transcript.
+        run: true,
         files: showFilesPanel,
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
@@ -428,7 +434,7 @@ export function AppShell() {
   // convergent even when several tabs vanish at once.
   useEffect(() => {
     if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "subagents", "terminals", "todos"] as const).find(
+    const next = (["files", "run", "subagents", "terminals", "todos"] as const).find(
       (t) => railTabsAvailable[t],
     );
     if (next) setRightRailTab(next);
@@ -478,6 +484,7 @@ export function AppShell() {
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
     setTodosPanelOpen(false);
+    setWorkLoopPanelOpen(false);
     setFilesPanelShowHidden(false);
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
@@ -620,11 +627,14 @@ export function AppShell() {
       setFilesPanelOpen(false); // close files drawer so the viewer is unobscured
       setSubagentsPanelOpen(false); // close mobile agents drawer
       setTodosPanelOpen(false); // close mobile tasks drawer
+      setWorkLoopPanelOpen(false); // close mobile Work Loop drawer
       // Pull the rail to the Files tab when parked on a tab where the viewer
       // won't render (Terminals, Subagents, Todos). The Files tab surfaces the
       // FileViewer inline, so leave it undisturbed.
       setRightRailTab((prev) =>
-        prev === "terminals" || prev === "subagents" || prev === "todos" ? "files" : prev,
+        prev === "run" || prev === "terminals" || prev === "subagents" || prev === "todos"
+          ? "files"
+          : prev,
       );
       // Reveal the rail so the viewer is actually visible — the rail defaults
       // open but a session the user collapsed restores collapsed, so opening a
@@ -677,6 +687,7 @@ export function AppShell() {
     setSelectedFilePath(null);
     setFileViewerCommentsOpen(false);
     clearFileViewerUrl();
+    setWorkLoopPanelOpen(false);
     setFilesPanelOpen(true);
   }
 
@@ -733,8 +744,8 @@ export function AppShell() {
         return next;
       });
     },
-    [setSearchParams],
-  ); // eslint-disable-line react-hooks/exhaustive-deps
+    [clearFileViewerUrl, setSearchParams],
+  );
 
   // Switch the workspace rail's tab. The side effect (closing any open
   // file + its comments + URL) lives here, not in WorkspacePanel, so the
@@ -758,6 +769,7 @@ export function AppShell() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
+    setWorkLoopPanelOpen(false); // close mobile Work Loop drawer
     setPanelInitialKey(key);
   }
 
@@ -768,6 +780,7 @@ export function AppShell() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
+    setWorkLoopPanelOpen(false); // close mobile Work Loop drawer
     setExecutionLogsKey(key);
   }
 
@@ -781,6 +794,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
+    setWorkLoopPanelOpen(false); // close mobile Work Loop drawer
     setFilesPanelOpen(true);
   }
 
@@ -793,6 +807,7 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setTodosPanelOpen(false); // close mobile tasks drawer
+    setWorkLoopPanelOpen(false); // close mobile Work Loop drawer
     setSubagentsPanelOpen(true);
   }
 
@@ -805,7 +820,22 @@ export function AppShell() {
     setExecutionLogsKey(null); // close execution-logs panel
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
+    setWorkLoopPanelOpen(false); // close mobile Work Loop drawer
     setTodosPanelOpen(true);
+  }
+
+  // Mobile FAB → "Run" opens the same Work Loop surface that leads the
+  // desktop workspace rail. It owns the drawer until the user drills into
+  // Files, Agents, or Inbox.
+  function openWorkLoopPanel() {
+    setSelectedFilePath(null);
+    clearFileViewerUrl();
+    setPanelInitialKey(null);
+    setExecutionLogsKey(null);
+    setFilesPanelOpen(false);
+    setSubagentsPanelOpen(false);
+    setTodosPanelOpen(false);
+    setWorkLoopPanelOpen(true);
   }
 
   function openFirstTerminal() {
@@ -1025,6 +1055,7 @@ export function AppShell() {
                     filesPanelOpen,
                     subagentsPanelOpen,
                     todosPanelOpen,
+                    workLoopPanelOpen,
                     hideTerminalsTab,
                     terminalsLength: railTerminals.length,
                     isClaudeNative,
@@ -1035,6 +1066,7 @@ export function AppShell() {
                     subagentsWorking,
                     agentCount,
                     onOpenFiles: openFilesPanel,
+                    onOpenWorkLoop: openWorkLoopPanel,
                     onOpenFirstTerminal: openFirstTerminal,
                     onOpenSubagents: openSubagentsPanel,
                     onOpenTodos: openTodosPanel,
@@ -1068,6 +1100,18 @@ export function AppShell() {
                       handleProps={inlinePanelHandleProps}
                       rightRailTab={rightRailTab}
                       onRightRailTabChange={handleRightRailTabChange}
+                      workLoop={{
+                        conversationId,
+                        sessionTitle: activeSession?.title ?? activeConv?.title ?? null,
+                        liveness,
+                        pendingApprovalCount: activeSession?.pendingElicitations?.length ?? 0,
+                        changedCount,
+                        agentCount,
+                        agentsWorking: subagentsWorking,
+                        showFilesPanel,
+                        onOpenFiles: () => handleRightRailTabChange("files"),
+                        onOpenAgents: () => handleRightRailTabChange("subagents"),
+                      }}
                       showFilesPanel={showFilesPanel}
                       changedCount={changedCount}
                       showShellsTab={railTabsAvailable.terminals}
@@ -1146,6 +1190,27 @@ export function AppShell() {
                   testId="subagents-panel-drawer"
                 >
                   <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+                </MobilePanelDrawer>
+              )}
+              {conversationId && (
+                <MobilePanelDrawer
+                  open={workLoopPanelOpen}
+                  title="Work Loop"
+                  onClose={() => setWorkLoopPanelOpen(false)}
+                  testId="work-loop-panel-drawer"
+                >
+                  <WorkLoopPanel
+                    conversationId={conversationId}
+                    sessionTitle={activeSession?.title ?? activeConv?.title ?? null}
+                    liveness={liveness}
+                    pendingApprovalCount={activeSession?.pendingElicitations?.length ?? 0}
+                    changedCount={changedCount}
+                    agentCount={agentCount}
+                    agentsWorking={subagentsWorking}
+                    showFilesPanel={showFilesPanel}
+                    onOpenFiles={openFilesPanel}
+                    onOpenAgents={openSubagentsPanel}
+                  />
                 </MobilePanelDrawer>
               )}
               {conversationId && (

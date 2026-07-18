@@ -16,8 +16,13 @@ import {
   ChevronRightIcon,
   CircleStopIcon,
   GitBranchIcon,
+  BookOpenIcon,
+  CpuIcon,
+  GraduationCapIcon,
   InboxIcon,
+  LayersIcon,
   Loader2Icon,
+  NetworkIcon,
   MoreHorizontalIcon,
   PanelRightOpenIcon,
   PencilIcon,
@@ -26,6 +31,7 @@ import {
   SearchIcon,
   ShareIcon,
   Trash2Icon,
+  WorkflowIcon,
   XIcon,
 } from "lucide-react";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
@@ -103,13 +109,21 @@ interface SidebarProps {
  * which is `inbox` in both standalone and embedded modes. Conversation ids are
  * `conv_…`-prefixed, so a chat route's leaf can never collide with `inbox`.
  */
-function useActiveNavItem(): { isNewChatPage: boolean; isInboxPage: boolean } {
+const AOS_NAV_LEAVES = ["inbox", "system", "fleet", "patterns", "models", "loops", "training"] as const;
+
+function useActiveNavItem(): {
+  isNewChatPage: boolean;
+  isInboxPage: boolean;
+  activeLeaf: string | undefined;
+} {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
-  const isInboxPage = useLocation().pathname.split("/").filter(Boolean).at(-1) === "inbox";
-  // Exclude inbox: it also has no `:conversationId`, so it would otherwise
-  // light up the "New session" button.
-  const isNewChatPage = activeConversationId == null && !isInboxPage;
-  return { isNewChatPage, isInboxPage };
+  const leaf = useLocation().pathname.split("/").filter(Boolean).at(-1);
+  const isInboxPage = leaf === "inbox";
+  const onNavPage = (AOS_NAV_LEAVES as readonly string[]).includes(leaf ?? "");
+  // Exclude nav pages: they also have no `:conversationId`, so they would
+  // otherwise light up the "New session" button.
+  const isNewChatPage = activeConversationId == null && !onNavPage;
+  return { isNewChatPage, isInboxPage, activeLeaf: leaf };
 }
 
 /**
@@ -175,7 +189,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
   }
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage } = useActiveNavItem();
+  const { isNewChatPage, isInboxPage, activeLeaf } = useActiveNavItem();
 
   // Sync pinned ids to localStorage whenever state changes. Keeping
   // the write here (instead of inside the state updater) preserves the
@@ -253,7 +267,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
         <Link
           to="/"
           onClick={onNavClick}
-          className="rounded-sm text-[15px] font-semibold tracking-tight text-foreground transition-colors hover:text-foreground/70"
+          className="automaton-wordmark rounded-sm text-[15px] font-semibold tracking-tight text-foreground transition-colors hover:text-foreground/70"
         >
           Automaton OS
         </Link>
@@ -325,6 +339,32 @@ export function Sidebar({ open, onClose }: SidebarProps) {
             )}
           </Link>
         </Button>
+        {(
+          [
+            { leaf: "system", label: "System", Icon: LayersIcon },
+            { leaf: "fleet", label: "Fleet", Icon: NetworkIcon },
+            { leaf: "patterns", label: "Patterns", Icon: BookOpenIcon },
+            { leaf: "models", label: "Models", Icon: CpuIcon },
+            { leaf: "loops", label: "Loops", Icon: WorkflowIcon },
+            { leaf: "training", label: "Training", Icon: GraduationCapIcon },
+          ] as const
+        ).map(({ leaf, label, Icon }) => (
+          <Button
+            key={leaf}
+            asChild
+            className={cn(
+              "w-full justify-start gap-2 text-sm",
+              activeLeaf === leaf && "bg-muted font-semibold",
+            )}
+            variant="ghost"
+            data-testid={`${leaf}-button`}
+          >
+            <Link to={`/${leaf}`} onClick={onNavClick}>
+              <Icon className="size-4" />
+              {label}
+            </Link>
+          </Button>
+        ))}
         <div className="relative mt-3">
           <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
           <input

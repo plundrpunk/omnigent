@@ -1,0 +1,58 @@
+diff --git a/ap-web/src/index.css b/ap-web/src/index.css
+--- a/ap-web/src/index.css
++++ b/ap-web/src/index.css
+@@ -1010,30 +1010,16 @@
+  * RGB ghosts, a faint neon-green under-halo. Static on purpose (it lives in
+  * persistent chrome); the glitch is in the color, not in motion. */
+ .dark .automaton-wordmark {
+-  color: #f2f4f8;
+-  font-weight: 800;
+   letter-spacing: 0.03em;
+-  text-shadow:
+-    -1.5px 0 0 rgba(0, 240, 255, 0.9),
+-    1.5px 0 0 rgba(255, 20, 147, 0.85),
+-    0 0 16px rgba(57, 255, 20, 0.28);
+ }
+ 
+ 
+ /* AUTOMATON OS hero banner (NewChatDialog) */
+ .banner-core {
+-  color: #39ff14;
+-  text-shadow:
+-    0 0 6px rgba(57, 255, 20, 0.55),
+-    0 0 24px rgba(57, 255, 20, 0.26),
+-    1px 0 0 rgba(0, 229, 255, 0.22),
+-    -1px 0 0 rgba(255, 41, 117, 0.22);
++  color: color-mix(in srgb, var(--foreground) 62%, transparent);
+ }
+ .banner-a {
+-  color: #ff2975;
+-  text-shadow:
+-    0 0 6px rgba(255, 41, 117, 0.6),
+-    0 0 24px rgba(255, 41, 117, 0.3);
++  color: var(--foreground);
+ }
+ @keyframes bannerBreathe {
+   0%, 100% { filter: brightness(1); }
+diff --git a/ap-web/src/shell/NewChatDialog.tsx b/ap-web/src/shell/NewChatDialog.tsx
+--- a/ap-web/src/shell/NewChatDialog.tsx
++++ b/ap-web/src/shell/NewChatDialog.tsx
+@@ -1167,13 +1167,14 @@
+       {/* Padding lives inside the 840px cap, so the composer renders at
+           840 − 80 = 760px max. */}
+       <div className="flex w-full max-w-[840px] flex-col items-center gap-8 px-10 pt-8 pb-16">
+-        {/* AUTOMATON OS banner — ANSI-shadow blocks; the two A’s burn
+-            anarchist red (circle-A spirit, louder). CRT chromatic glow +
+-            breathing brightness. Decorative: hidden from AT, non-selectable. */}
++        {/* AUTOMATON OS banner — ANSI-shadow blocks, grayscale. The two
++            A’s render at full foreground, the rest at ~62% — emphasis by
++            value, not hue: Lars is the only color on this page.
++            Decorative: hidden from AT, non-selectable. */}
+         <pre
+           aria-hidden="true"
+           data-testid="automaton-ascii-banner"
+-          className="select-none overflow-hidden text-center font-mono text-[6px] leading-[1.22] sm:text-[11px] [animation:bannerBreathe_3.2s_ease-in-out_infinite]"
++          className="select-none overflow-hidden text-center font-mono text-[6px] leading-[1.22] sm:text-[11px]"
+         >
+           {[
+             " █████╗  ██╗   ██╗ ████████╗  ██████╗  ███╗   ███╗  █████╗  ████████╗  ██████╗  ███╗   ██╗    ██████╗  ███████╗",

@@ -9,6 +9,7 @@
 // Python class name lowercased (e.g. ResponseCreated → "response_created").
 
 import type { ErrorInfo, ModelUsage, Response, SandboxLaunchStage } from "./types";
+import type { HarnessReceiptEventV1 } from "./workReceipt";
 
 /** Provider-native tool item types. */
 export const NATIVE_TOOL_TYPES = new Set<string>([
@@ -308,6 +309,13 @@ export interface TerminalCommandEvent {
   input: string | null;
   stdout: string | null;
   stderr: string | null;
+  itemId: string;
+  responseId: string;
+}
+
+export interface WorkReceiptDone {
+  type: "work_receipt";
+  receipt: HarnessReceiptEventV1;
   itemId: string;
   responseId: string;
 }
@@ -724,6 +732,7 @@ export type StreamEvent =
   | NativeToolCall
   | SlashCommand
   | TerminalCommandEvent
+  | WorkReceiptDone
   | MessageDone
   | OutputFileDone
   | RetryEvent

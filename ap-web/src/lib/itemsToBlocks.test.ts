@@ -12,6 +12,7 @@ import type {
   ToolGroup,
   ToolResultBlock,
   UserMessageBlock,
+  WorkReceiptBlock,
 } from "./blocks";
 import type { ConversationItem } from "./conversationItems";
 import { itemsToBlocks } from "./itemsToBlocks";
@@ -448,6 +449,42 @@ describe("itemsToBlocks — native tools and compaction", () => {
     expect(compactions.length).toBe(1);
     expect(compactions[0]!.ctx.responseId).toBe("resp_compact");
     expect(compactions[0]!.ctx.itemId).toBe("comp_1");
+  });
+
+  it("versioned work receipt hydrates into a non-chat WorkReceiptBlock", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "receipt_item_1",
+        response_id: "resp_receipt",
+        type: "work_receipt",
+        status: "completed",
+        schema_version: "harness.receipt.v1",
+        event_id: "28f721ce-cf1a-4c64-b8d4-dcd7d3d6a225",
+        user_id: "user-1",
+        project: "harness-automaton",
+        work_item_id: "wi-1",
+        session_id: "conv-1",
+        created_at: "2026-07-10T00:00:00+00:00",
+        verifier: {
+          status: "passed",
+          verdict: "ACCEPT",
+          evidence: ["tests passed"],
+          tool_result_ids: [],
+        },
+        artifact: {
+          artifact_id: "artifact-1",
+          changed_files: [],
+        },
+        tool_result_ids: [],
+        metadata: {},
+      },
+    ];
+    const receipt = itemsToBlocks(items).find(
+      (block): block is WorkReceiptBlock => block.type === "work_receipt",
+    );
+    expect(receipt?.receipt.schema_version).toBe("harness.receipt.v1");
+    expect(receipt?.receipt.verifier.status).toBe("passed");
+    expect(receipt?.ctx.itemId).toBe("receipt_item_1");
   });
 });
 

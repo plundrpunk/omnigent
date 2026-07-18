@@ -42,6 +42,7 @@ from omnigent.server.performance_metrics import (
     publish_server_metrics_periodically,
     set_request_duration_for_access_log,
 )
+from omnigent.server.routes.ams import create_ams_router
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -953,7 +954,7 @@ def create_app(
             # inside shutdown_all().
             await _mcp_pool.shutdown_all()
 
-    app = FastAPI(title="Omnigent Server", lifespan=_lifespan)
+    app = FastAPI(title="Automaton OS Server", lifespan=_lifespan)
     from omnigent.runtime import telemetry
 
     telemetry.instrument_fastapi_app(app)
@@ -1487,6 +1488,12 @@ def create_app(
         create_policy_registry_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["policy_registry"],
+    )
+    # GUI → AMS bridge (read-only whitelist proxy; see routes/ams.py).
+    app.include_router(
+        create_ams_router(auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["ams"],
     )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───

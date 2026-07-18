@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -477,6 +478,70 @@ class TerminalCommandData(BaseModel):
     stderr: str | None = None
 
 
+class WorkReceiptVerifierData(BaseModel):
+    """Verifier result carried by ``harness.receipt.v1``."""
+
+    status: Literal["passed", "failed", "not_run", "error"]
+    verdict: str | None = None
+    reason: str | None = None
+    evidence: list[str] = Field(default_factory=list)
+    verifier_event_id: str | None = None
+    tool_result_ids: list[str] = Field(default_factory=list)
+
+    model_config = {"extra": "forbid"}
+
+
+class WorkReceiptArtifactData(BaseModel):
+    """Artifact pointers carried by a Harness receipt."""
+
+    artifact_id: str
+    artifact_path: str | None = None
+    trace_report: str | None = None
+    changed_files: list[str] = Field(default_factory=list)
+
+    model_config = {"extra": "forbid"}
+
+
+class WorkReceiptData(BaseModel):
+    """Persistent Omnigent item for a versioned Harness receipt event."""
+
+    type: Literal["work_receipt"] = "work_receipt"
+    schema_version: Literal["harness.receipt.v1"]
+    event_id: str
+    user_id: str
+    project: str
+    work_item_id: str
+    continuation_id: str | None = None
+    session_id: str
+    response_id: str | None = None
+    trace_id: str | None = None
+    status: Literal["completed", "failed", "blocked"]
+    created_at: str
+    verifier: WorkReceiptVerifierData
+    artifact: WorkReceiptArtifactData
+    tool_result_ids: list[str] = Field(default_factory=list)
+    cost_usd: float | None = Field(default=None, ge=0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    model_config = {"extra": "forbid"}
+
+    @field_validator("event_id")
+    @classmethod
+    def validate_event_id(cls, value: str) -> str:
+        try:
+            return str(uuid.UUID(value))
+        except ValueError as exc:
+            raise ValueError("event_id must be a UUID") from exc
+
+    @field_validator("user_id", "project", "work_item_id", "session_id", "created_at")
+    @classmethod
+    def require_non_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
+
+
 class SlashCommandData(BaseModel):
     """
     Data payload for a slash-command invocation observed in a
@@ -521,6 +586,7 @@ ItemData = (
     | ResourceEventData
     | SlashCommandData
     | TerminalCommandData
+    | WorkReceiptData
 )
 
 ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
@@ -534,6 +600,7 @@ ITEM_TYPE_TO_DATA_CLS: dict[str, type[BaseModel]] = {
     "resource_event": ResourceEventData,
     "slash_command": SlashCommandData,
     "terminal_command": TerminalCommandData,
+    "work_receipt": WorkReceiptData,
 }
 
 # Item types that are metadata / lifecycle events — not content
@@ -546,6 +613,7 @@ NON_CONTENT_ITEM_TYPES: frozenset[str] = frozenset(
         "resource_event",
         "slash_command",
         "terminal_command",
+        "work_receipt",
     }
 )
 

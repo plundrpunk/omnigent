@@ -56,9 +56,11 @@ import type {
   TextDelta,
   ToolCall,
   ToolResult,
+  WorkReceiptDone,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
 import type { ErrorInfo, ModelUsage, Response } from "./types";
+import { parseHarnessReceiptEventV1 } from "./workReceipt";
 
 /**
  * Out-param for `parseSseStream`: `sawDone` is set when the server's `[DONE]`
@@ -902,6 +904,17 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
       itemId,
       responseId,
     } satisfies TerminalCommandEvent;
+  }
+
+  if (itemType === "work_receipt") {
+    const receipt = parseHarnessReceiptEventV1(rec);
+    if (receipt === null) return null;
+    return {
+      type: "work_receipt",
+      receipt,
+      itemId,
+      responseId,
+    } satisfies WorkReceiptDone;
   }
 
   if (NATIVE_TOOL_TYPES.has(itemType)) {
