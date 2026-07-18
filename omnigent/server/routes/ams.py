@@ -56,6 +56,17 @@ def _api_key() -> str:
 
 
 def _path_allowed(path: str) -> bool:
+    """Whitelist check on a *normalized* path.
+
+    Rejects traversal (`..`), absolute paths, empty/dot segments, and
+    scheme-ish prefixes so `api/v1/skills/../../admin` can't ride a
+    whitelisted prefix past the check (K3 review finding).
+    """
+    if path.startswith("/") or "//" in path or "\\" in path or ":" in path:
+        return False
+    segments = path.rstrip("/").split("/")  # tolerate one trailing slash
+    if any(seg in ("", ".", "..") for seg in segments):
+        return False
     return any(path == p or path.startswith(p + "/") for p in _ALLOWED_GET_PREFIXES)
 
 
