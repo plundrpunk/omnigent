@@ -1,10 +1,14 @@
 /**
- * Training — three numbers and one picture.
+ * Training — two honestly-labeled success numbers and one picture.
  *
- * The headline stats plus a horizontal bar chart of per-category
- * success rates from the AMS automata population (the evidence base
- * the eval deploy gate rules on). Full table lives behind "Details".
- * Promotion stays fail-closed — this page has no promote button.
+ * The headline is the run-weighted success rate (successes / runs);
+ * the secondary line is the unweighted per-automaton average — the
+ * two answer different questions, so both are shown and labeled.
+ * Below: a "needs attention" strip for sub-50% categories, then a
+ * horizontal bar chart of per-category success rates from the AMS
+ * automata population (the evidence base the eval deploy gate rules
+ * on). Full table lives behind "Details". Promotion stays
+ * fail-closed — this page has no promote button.
  */
 
 import { useEffect, useState } from "react";
@@ -21,6 +25,7 @@ export function TrainingPage() {
   const [stats, setStats] = useState<BayesianStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showDetails, setShowDetails] = useState(false);
+  const [worstFirst, setWorstFirst] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
@@ -39,9 +44,22 @@ export function TrainingPage() {
   }, [refreshKey]);
 
   const summary = stats?.summary;
-  const categories = [...(stats?.categories ?? [])].sort(
-    (a, b) => b.total_executions - a.total_executions,
+  const categories = [...(stats?.categories ?? [])].sort((a, b) =>
+    worstFirst
+      ? a.avg_success_rate - b.avg_success_rate
+      : b.total_executions - a.total_executions,
   );
+  // Sub-50% categories, worst first — surfaced without any expanding.
+  const needsAttention = [...(stats?.categories ?? [])]
+    .filter((c) => c.avg_success_rate < 0.5)
+    .sort((a, b) => a.avg_success_rate - b.avg_success_rate);
+  // Run-weighted rate: every recorded run counts once. Absent/empty
+  // summary fields render as "—", never an invented number.
+  const runWeighted =
+    summary && summary.total_executions > 0
+      ? summary.total_successes / summary.total_executions
+      : undefined;
+  const runWeightedOk = runWeighted != null && Number.isFinite(runWeighted);
 
   return (
     <PageShell
@@ -66,9 +84,16 @@ export function TrainingPage() {
       ) : (
         <div className="space-y-6">
           {summary && (
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
               {[
-                { label: "success rate", value: pct(summary.overall_success_rate) },
+                {
+                  label: "success rate (run-weighted)",
+                  value: runWeightedOk ? pct(runWeighted) : "—",
+                },
+                {
+                  label: "avg per automaton (unweighted)",
+                  value: pct(summary.overall_success_rate),
+                },
                 { label: "runs recorded", value: summary.total_executions.toLocaleString() },
                 { label: "automata", value: String(summary.total_automata) },
               ].map((c) => (
@@ -80,8 +105,26 @@ export function TrainingPage() {
             </div>
           )}
 
+          {needsAttention.length > 0 && (
+            <div className="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm">
+              <span className="font-semibold text-destructive">
+                Needs attention (below 50%):
+              </span>{" "}
+              {needsAttention.map((c) => (
+                <Badge key={c.category} variant="destructive" className="mr-1">
+                  {c.category} {pct(c.avg_success_rate)}
+                </Badge>
+              ))}
+            </div>
+          )}
+
           {/* one picture: success by category */}
           <div className="rounded-xl border border-border bg-card/50 p-5">
+            <div className="mb-2 flex justify-end">
+              <Button variant="ghost" size="sm" onClick={() => setWorstFirst((v) => !v)}>
+                {worstFirst ? "Sort by volume" : "Worst first"}
+              </Button>
+            </div>
             <svg
               viewBox={`0 0 640 ${categories.length * 30 + 8}`}
               className="h-auto w-full"
@@ -105,6 +148,17 @@ export function TrainingPage() {
                     <text x={550} y={y + 15} className="fill-muted-foreground text-[11px] tabular-nums">
                       {pct(c.avg_success_rate)}
                     </text>
+                    {c.avg_ci_width != null && c.avg_ci_width > 0 && (
+                      // Bayesian CI whisker centered on the rate.
+                      <line
+                        x1={160 + Math.max(0, (c.avg_success_rate - c.avg_ci_width / 2) * 380)}
+                        x2={160 + Math.min(380, (c.avg_success_rate + c.avg_ci_width / 2) * 380)}
+                        y1={y + 11}
+                        y2={y + 11}
+                        strokeWidth={2}
+                        className="stroke-foreground/50"
+                      />
+                    )}
                   </g>
                 );
               })}
