@@ -107,6 +107,7 @@ export interface LlmProvider {
 export interface ProvidersResponse {
   providers?: LlmProvider[];
   role_mappings?: Record<string, string>;
+  active_provider?: string;
 }
 
 export async function fetchProviders(): Promise<ProvidersResponse> {

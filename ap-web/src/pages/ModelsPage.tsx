@@ -2,7 +2,8 @@
  * Models page — role → provider routing drawn as a mapping diagram.
  *
  * Roles on the left, providers on the right, curves showing who routes
- * where; line and dot color carry provider health. Costs and endpoints
+ * where; line and dot color carry provider health. A banner leads the
+ * page whenever a routed provider isn't online. Costs and endpoints
  * live in the provider cards below the diagram. Read-only until the
  * bridge grows a reviewed write whitelist.
  */
@@ -18,9 +19,19 @@ import { fetchProviders, fetchRoleMappings, type LlmProvider } from "@/lib/ams";
 const ROW_H = 44;
 const PAD = 24;
 
+/** Honest cost label: $0 means plan-included, absent means unknown. */
+function costLabel(p: LlmProvider): string {
+  const inC = p.cost_per_mtok_input;
+  const outC = p.cost_per_mtok_output;
+  if (inC == null && outC == null) return "cost unknown";
+  if ((inC ?? 0) === 0 && (outC ?? 0) === 0) return "Included in plan";
+  return `$${inC} in / $${outC} out per Mtok`;
+}
+
 export function ModelsPage() {
   const [providers, setProviders] = useState<LlmProvider[] | null>(null);
   const [roles, setRoles] = useState<Record<string, string> | null>(null);
+  const [activeProvider, setActiveProvider] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
@@ -32,6 +43,7 @@ export function ModelsPage() {
         if (!cancelled) {
           setProviders(p.providers ?? []);
           setRoles(r);
+          setActiveProvider(p.active_provider ?? null);
         }
       })
       .catch((err: unknown) => {
@@ -51,6 +63,35 @@ export function ModelsPage() {
   }, [providers, roles]);
 
   const providerByType = new Map((providers ?? []).map((p) => [p.type, p]));
+
+  // Routed-but-offline providers: anything referenced by role_mappings or
+  // named as the active provider whose status isn't "online".
+  const allRoleNames = roles ? Object.keys(roles) : [];
+  const routedTypes = new Set([
+    ...Object.values(roles ?? {}),
+    ...(activeProvider ? [activeProvider] : []),
+  ]);
+  const offlineRouted = [...routedTypes].flatMap((type) => {
+    const p = providerByType.get(type);
+    if (!p || p.status === "online") return [];
+    const affected = allRoleNames.filter((r) => roles?.[r] === type);
+    const roleText =
+      affected.length === 0
+        ? "no roles routed"
+        : affected.length === allRoleNames.length && affected.length > 2
+          ? `${affected.slice(0, 2).join(", ")}, … (all ${affected.length} roles)`
+          : affected.join(", ");
+    return [
+      {
+        type,
+        name: p.name,
+        status: p.status ?? "unknown",
+        roleText,
+        isActive: type === activeProvider,
+      },
+    ];
+  });
+
   const W = 640;
   const LEFT_X = 150;
   const RIGHT_X = W - 160;
@@ -77,6 +118,21 @@ export function ModelsPage() {
         </div>
       ) : (
         <div className="space-y-6">
+          {offlineRouted.length > 0 && (
+            <div className="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+              <p className="font-semibold">Routed provider offline</p>
+              <ul className="mt-1 space-y-1">
+                {offlineRouted.map((o) => (
+                  <li key={o.type}>
+                    <span className="font-medium">{o.name}</span>
+                    {` — status: ${o.status} · routes: ${o.roleText}`}
+                    {o.isActive ? " · active provider" : ""}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
           <div className="overflow-x-auto rounded-xl border border-border bg-card/50 p-4">
             <svg
               viewBox={`0 0 ${W} ${diagram.height}`}
@@ -170,16 +226,22 @@ export function ModelsPage() {
               <div key={p.type} className="rounded-xl border border-border bg-card p-4">
                 <div className="flex items-center justify-between gap-2">
                   <span className="truncate text-sm font-semibold">{p.name}</span>
-                  <Badge variant={p.status === "online" ? "default" : "destructive"}>
-                    {p.status ?? "unknown"}
-                  </Badge>
+                  <span className="flex shrink-0 items-center gap-1">
+                    {p.type === activeProvider && <Badge variant="secondary">active</Badge>}
+                    <Badge variant={p.status === "online" ? "default" : "destructive"}>
+                      {p.status ?? "unknown"}
+                    </Badge>
+                  </span>
                 </div>
-                <p className="mt-1 truncate font-mono text-xs text-muted-foreground">{p.model}</p>
+                <p className="mt-1 truncate font-mono text-xs text-muted-foreground">
+                  {p.model ?? "—"}
+                </p>
+                <p className="truncate font-mono text-xs text-muted-foreground">
+                  {p.endpoint ?? "—"}
+                </p>
                 <p className="mt-2 text-xs text-muted-foreground">
                   {p.latency_ms != null ? `${p.latency_ms}ms · ` : ""}
-                  {p.cost_per_mtok_input != null
-                    ? `$${p.cost_per_mtok_input} in / $${p.cost_per_mtok_output} out per Mtok`
-                    : "cost unknown"}
+                  {costLabel(p)}
                 </p>
               </div>
             ))}
