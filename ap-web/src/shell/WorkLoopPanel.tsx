@@ -15,9 +15,11 @@ import {
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import type { AnyBlock } from "@/lib/blocks";
+import { checkpointResumeCommand, type GoalRun } from "@/lib/goal";
 import { Link } from "@/lib/routing";
 import type { SessionStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { useGoalRuns } from "@/hooks/useGoalRuns";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { useChatStore } from "@/store/chatStore";
 
@@ -377,6 +379,116 @@ export function deriveWorkLoopSnapshot(input: DeriveWorkLoopInput): WorkLoopSnap
   };
 }
 
+const GOAL_STATUS_META: Record<
+  GoalRun["status"],
+  { label: string; tone: string; spinning?: boolean }
+> = {
+  running: { label: "Running", tone: "bg-primary/15 text-primary", spinning: true },
+  completed: { label: "Gate passed", tone: "bg-success/15 text-success" },
+  blocked: { label: "Blocked by gate", tone: "bg-destructive/15 text-destructive" },
+  paused: { label: "Paused", tone: "bg-warning/15 text-warning" },
+  setup_error: { label: "Setup error", tone: "bg-destructive/15 text-destructive" },
+  error: { label: "Error", tone: "bg-destructive/15 text-destructive" },
+};
+
+function clipArtifact(text: string, max = 600): string {
+  return text.length <= max ? text : `${text.slice(0, max)}…`;
+}
+
+/**
+ * Verbatim rendering of the harness' goal runs (R9 V2).
+ *
+ * Every field shown here is the harness' own output: status is the CLI
+ * exit code's mapping, blocker/checkpoint text is quoted as written.
+ * The section renders nothing when there are no runs — absence is
+ * absence, not an empty-state invitation.
+ */
+export function GoalRunsSection({ runs }: { runs: GoalRun[] }) {
+  if (runs.length === 0) return null;
+  return (
+    <section
+      data-testid="goal-runs-section"
+      className="rounded-lg border border-border bg-card p-3"
+    >
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-xs font-medium text-foreground">Goal runs (Harness)</span>
+        <span className="font-mono text-[10px] text-muted-foreground">
+          {runs.length} run{runs.length === 1 ? "" : "s"}
+        </span>
+      </div>
+      <div className="flex flex-col gap-3">
+        {runs.map((run) => {
+          const meta = GOAL_STATUS_META[run.status] ?? {
+            label: run.status,
+            tone: "bg-muted text-muted-foreground",
+          };
+          const resume = checkpointResumeCommand(run.checkpoint);
+          return (
+            <div
+              key={run.run_id}
+              data-testid="goal-run-card"
+              className="rounded-md border border-border/70 p-2.5"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="truncate font-mono text-xs text-foreground" title={run.goal_id}>
+                  {run.goal_id}
+                </span>
+                <span
+                  className={cn(
+                    "inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+                    meta.tone,
+                  )}
+                >
+                  {meta.spinning && <LoaderCircleIcon className="size-3 animate-spin" />}
+                  {meta.label}
+                </span>
+              </div>
+              <p className="mt-1 font-mono text-[10px] text-muted-foreground">
+                {run.exit_code === null ? "exit —" : `exit ${run.exit_code}`}
+                {run.provider ? ` · ${run.provider}` : ""}
+                {run.finished_at ? ` · finished ${run.finished_at}` : ""}
+              </p>
+              {run.error && (
+                <p className="mt-1.5 text-[11px] leading-4 text-destructive">{run.error}</p>
+              )}
+              {run.blocker_md && (
+                <div className="mt-1.5">
+                  <p className="text-[10px] font-medium uppercase tracking-wide text-destructive">
+                    Blocker (verbatim)
+                  </p>
+                  <pre className="mt-1 overflow-x-auto rounded bg-muted/40 p-2 font-mono text-[10px] leading-4 whitespace-pre-wrap text-foreground/90">
+                    {clipArtifact(run.blocker_md)}
+                  </pre>
+                </div>
+              )}
+              {run.status === "paused" && (
+                <div className="mt-1.5">
+                  <p className="text-[10px] font-medium uppercase tracking-wide text-warning">
+                    Resume command
+                  </p>
+                  <pre className="mt-1 overflow-x-auto rounded bg-muted/40 p-2 font-mono text-[10px] leading-4 whitespace-pre-wrap text-foreground/90">
+                    {resume ?? clipArtifact(run.checkpoint ?? "checkpoint.json not reported")}
+                  </pre>
+                </div>
+              )}
+              {run.outcome && (
+                <details className="mt-1.5">
+                  <summary className="cursor-pointer text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                    goal-outcome.json
+                  </summary>
+                  <pre className="mt-1 max-h-48 overflow-auto rounded bg-muted/40 p-2 font-mono text-[10px] leading-4 whitespace-pre-wrap text-foreground/90">
+                    {clipArtifact(JSON.stringify(run.outcome, null, 2), 2000)}
+                  </pre>
+                </details>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function StageIcon({ state }: { state: LoopStageState }) {
   if (state === "complete") return <CheckCircle2Icon className="size-4" />;
   if (state === "active") return <LoaderCircleIcon className="size-4 animate-spin" />;
@@ -408,6 +520,7 @@ export function WorkLoopPanel({
   const sessionCostUsd = useChatStore((state) => state.sessionCostUsd);
   const boundAgentName = useChatStore((state) => state.boundAgentName);
   const gitBranch = useChatStore((state) => state.gitBranch);
+  const goalRuns = useGoalRuns(conversationId);
 
   const snapshot = useMemo(
     () =>
@@ -532,6 +645,8 @@ export function WorkLoopPanel({
             ))}
           </div>
         </section>
+
+        {goalRuns !== null && <GoalRunsSection runs={goalRuns} />}
 
         <section className="rounded-lg border border-border bg-card p-3">
           <div className="mb-3 flex items-center gap-2 text-xs font-medium text-foreground">

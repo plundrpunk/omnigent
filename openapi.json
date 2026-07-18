@@ -3592,7 +3592,7 @@
     }
   },
   "info": {
-    "title": "Omnigent Server",
+    "title": "Automaton OS Server",
     "version": "0.1.0"
   },
   "openapi": "3.2.0",
@@ -3771,6 +3771,216 @@
         "summary": "List Builtin Agents",
         "tags": [
           "agents"
+        ]
+      }
+    },
+    "/v1/ams/config": {
+      "get": {
+        "description": "Report whether the bridge is configured (never leaks the key).",
+        "operationId": "ams_config_v1_ams_config_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Ams Config V1 Ams Config Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Ams Config",
+        "tags": [
+          "ams"
+        ]
+      }
+    },
+    "/v1/ams/{path}": {
+      "get": {
+        "description": "Forward a whitelisted GET to the AMS REST API.",
+        "operationId": "ams_proxy_v1_ams__path__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Ams Proxy V1 Ams  Path  Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ams Proxy",
+        "tags": [
+          "ams"
+        ]
+      }
+    },
+    "/v1/goal": {
+      "get": {
+        "description": "List runs, newest first; empty list means exactly that.",
+        "operationId": "list_goals_v1_goal_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "conversation_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Conversation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Goals V1 Goal Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Goals",
+        "tags": [
+          "goal"
+        ]
+      },
+      "post": {
+        "description": "Validate the contract and start a background goal run.",
+        "operationId": "start_goal_v1_goal_post",
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Start Goal V1 Goal Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Start Goal",
+        "tags": [
+          "goal"
+        ]
+      }
+    },
+    "/v1/goal/config": {
+      "get": {
+        "description": "Report whether the bridge is configured (never leaks paths).",
+        "operationId": "goal_config_v1_goal_config_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Goal Config V1 Goal Config Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Goal Config",
+        "tags": [
+          "goal"
+        ]
+      }
+    },
+    "/v1/goal/{run_id}": {
+      "get": {
+        "description": "One run by id.",
+        "operationId": "get_goal_v1_goal__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Goal V1 Goal  Run Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Goal",
+        "tags": [
+          "goal"
         ]
       }
     },

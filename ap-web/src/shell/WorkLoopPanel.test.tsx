@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AnyBlock, BlockContext } from "@/lib/blocks";
 import { useChatStore } from "@/store/chatStore";
-import { deriveWorkLoopSnapshot, WorkLoopPanel } from "./WorkLoopPanel";
+import { deriveWorkLoopSnapshot, GoalRunsSection, WorkLoopPanel } from "./WorkLoopPanel";
 
 const ctx: BlockContext = {
   agent: null,
@@ -217,5 +217,81 @@ describe("WorkLoopPanel", () => {
       "href",
       "/inbox",
     );
+  });
+});
+
+describe("GoalRunsSection", () => {
+  const baseRun = {
+    run_id: "r-1",
+    goal_id: "fix-tests",
+    conversation_id: "conv_1",
+    provider: "codex",
+    status: "completed" as const,
+    exit_code: 0,
+    outcome: { gate: { test_command: "ran" } },
+    blocker_md: null,
+    checkpoint: null,
+    stderr_tail: null,
+    error: null,
+    started_at: "2026-07-18T00:00:00Z",
+    finished_at: "2026-07-18T00:01:00Z",
+  };
+
+  it("renders nothing for an empty run list — absence is absence", () => {
+    const { container } = render(<GoalRunsSection runs={[]} />);
+    expect(container.querySelector("[data-testid=goal-runs-section]")).toBeNull();
+  });
+
+  it("shows a gate-passed run with its exit code and outcome verbatim", () => {
+    render(<GoalRunsSection runs={[baseRun]} />);
+    expect(screen.getByText("fix-tests")).toBeInTheDocument();
+    expect(screen.getByText("Gate passed")).toBeInTheDocument();
+    expect(screen.getByText(/exit 0 · codex/)).toBeInTheDocument();
+    expect(screen.getByText("goal-outcome.json")).toBeInTheDocument();
+  });
+
+  it("labels exit 3 as blocked and quotes blocker.md verbatim", () => {
+    render(
+      <GoalRunsSection
+        runs={[
+          {
+            ...baseRun,
+            run_id: "r-2",
+            status: "blocked",
+            exit_code: 3,
+            blocker_md: "# Blocked\nthe gate failed honestly",
+          },
+        ]}
+      />,
+    );
+    expect(screen.getByText("Blocked by gate")).toBeInTheDocument();
+    expect(screen.getByText(/the gate failed honestly/)).toBeInTheDocument();
+  });
+
+  it("surfaces the checkpoint resume command for a paused run", () => {
+    render(
+      <GoalRunsSection
+        runs={[
+          {
+            ...baseRun,
+            run_id: "r-3",
+            status: "paused",
+            exit_code: 6,
+            checkpoint: JSON.stringify({ resume_command: "automaton goal --resume r-3" }),
+          },
+        ]}
+      />,
+    );
+    expect(screen.getByText("Paused")).toBeInTheDocument();
+    expect(screen.getByText("automaton goal --resume r-3")).toBeInTheDocument();
+  });
+
+  it("shows the raw checkpoint when no resume command is parseable", () => {
+    render(
+      <GoalRunsSection
+        runs={[{ ...baseRun, run_id: "r-4", status: "paused", exit_code: 6, checkpoint: "raw text" }]}
+      />,
+    );
+    expect(screen.getByText("raw text")).toBeInTheDocument();
   });
 });
