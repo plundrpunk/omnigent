@@ -134,6 +134,12 @@ export default defineConfig({
     globals: true,
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
+    // Node 25 ships the WebStorage globals on by default, and its native
+    // `localStorage` (a method-less exotic object in workers) shadows jsdom's
+    // Storage when vitest populates test globals — every test that touches
+    // localStorage then fails with "localStorage.clear is not a function".
+    // Disable Node's webstorage in worker processes so jsdom's wins.
+    execArgv: ["--no-experimental-webstorage"],
     coverage: {
       provider: "v8",
       // With `include` set, vitest counts every matching source file (untested

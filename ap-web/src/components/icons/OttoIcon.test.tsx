@@ -7,11 +7,11 @@ afterEach(cleanup);
 describe("OttoIcon", () => {
   it("exposes four otto-eye groups for the blink animation", () => {
     const { container } = render(<OttoIcon />);
-    // The blink keyframes target `.otto-working .otto-eye` in index.css; CSS
-    // selectors fail silently, so renaming/flattening these groups would
-    // freeze the eyes with no other signal.
-    const eyes = container.querySelectorAll("svg > g.otto-eye");
-    // 4 = Otto's two eyes + the buddy starfish's two; dropping the buddy's
+    // The blink keyframes target `.otto-working .otto-eye` in index.css — a
+    // descendant selector, so nesting depth doesn't matter, but renaming the
+    // class would freeze the eyes with no other signal (CSS fails silently).
+    const eyes = container.querySelectorAll("svg g.otto-eye");
+    // 4 = Otto's two eyes + the buddy pup's two; dropping the buddy's
     // groups would leave it staring unblinking next to a blinking Otto.
     expect(eyes).toHaveLength(4);
     // 3 paths per eye = sclera + pupil + highlight; losing one shifts the
