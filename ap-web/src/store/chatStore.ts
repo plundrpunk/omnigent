@@ -3415,6 +3415,37 @@ export function handleSessionEvent(event: StreamEvent): void {
       // claude-native session (chat clears/sets working instantly while
       // the sidebar dot stays stale).
       patchConversationStatusInCache(event.conversationId, event.status);
+      // A live failure can reach a viewer with no accompanying
+      // response.error / response_failed SSE (the stream has no replay,
+      // and between-turn failures never stream one) — historically the
+      // chat just went quiet. The durable reason is `last_task_error`
+      // on the snapshot: fetch it and synthesize the same inline error
+      // block the cold-load path renders, so every terminal failed
+      // state gets a visible card.
+      if (event.status === "failed") {
+        void (async () => {
+          try {
+            const session = await getSessionSlim(event.conversationId);
+            if (session.status !== "failed" || session.lastTaskError == null) return;
+            const { message, code } = session.lastTaskError;
+            useChatStore.setState((s) => {
+              if (s.conversationId !== event.conversationId) return {};
+              // Skip when the live pump already surfaced this failure.
+              if (s.blocks.some((b) => b.type === "error" && b.message === message)) return {};
+              const synthetic: ErrorBlock = {
+                type: "error",
+                ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
+                message,
+                source: "",
+                code,
+              };
+              return { blocks: [...s.blocks, synthetic] };
+            });
+          } catch {
+            // Best-effort: the failed status badge still shows without it.
+          }
+        })();
+      }
       // On turn completion, refresh the Agents-rail preview for this
       // conversation. A child (added agent) finishing a turn leaves a stale
       // last_message_preview in its parent's child-sessions list (the runner

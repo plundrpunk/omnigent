@@ -4,6 +4,7 @@ import { agentBaseName } from "@/lib/forkHarness";
 import { capitalizeAgentName } from "@/lib/agentLabels";
 import {
   nativeCodingAgentForAgentName,
+  nativeCodingAgentForAvailableAgent,
   nativeCodingAgentForHarness,
 } from "@/lib/nativeCodingAgents";
 
@@ -203,7 +204,26 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
   // Built-ins first; custom agents follow in scan order (newest session
   // first). NewChatDialog's display-order sort is stable, so unranked
   // custom names keep this relative order.
-  return [...builtins, ...enriched];
+  //
+  // Collapse rows that resolve to the SAME native coding agent (e.g. a
+  // seeded `claude_code` row, the `claude-native-ui` wrapper row, and a
+  // session-discovered claude-native agent all display "Claude Code"):
+  // they are one picker choice, and listing them 3× reads as a bug. The
+  // canonical wrapper row (agentName matches the spec) wins; otherwise
+  // first-seen wins. Non-native agents are never collapsed — distinct
+  // custom agents may legitimately share a display name.
+  const all = [...builtins, ...enriched];
+  const nativeRowByKey = new Map<string, AvailableAgent>();
+  for (const agent of all) {
+    const spec = nativeCodingAgentForAvailableAgent(agent);
+    if (!spec) continue;
+    const existing = nativeRowByKey.get(spec.key);
+    if (!existing || agent.name === spec.agentName) nativeRowByKey.set(spec.key, agent);
+  }
+  return all.filter((agent) => {
+    const spec = nativeCodingAgentForAvailableAgent(agent);
+    return !spec || nativeRowByKey.get(spec.key) === agent;
+  });
 }
 
 interface UseAvailableAgentsOptions {
