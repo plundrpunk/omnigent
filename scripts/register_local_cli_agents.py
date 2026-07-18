@@ -23,6 +23,8 @@ AGENT_SPECS = [
     ROOT / "examples/local-cli-agents/abot-prime",
     # DRF work-loop operator (AMS toolbag + HA WorkItem bridge terminal).
     ROOT / "examples/local-cli-agents/drf-command",
+    # Harness Automaton goal-contract runner (fail-closed deliverable work).
+    ROOT / "examples/local-cli-agents/harness-goal",
 ]
 
 
