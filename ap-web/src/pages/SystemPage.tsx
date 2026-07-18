@@ -53,7 +53,7 @@ function extractRows(payload: unknown): Record<string, unknown>[] {
 }
 
 function chooseColumns(rows: Record<string, unknown>[], max = 5): string[] {
-  const preferred = ["name", "agent_name", "title", "slug", "status", "alive", "context_pct", "description", "cron_expression"];
+  const preferred = ["name", "agent_name", "title", "slug", "status", "alive", "last_heartbeat", "context_pct", "description", "cron_expression"];
   const seen = new Set<string>();
   for (const row of rows.slice(0, 20)) {
     for (const [k, v] of Object.entries(row)) {

@@ -61,9 +61,28 @@ export interface ObservatoryExecution {
   status: string;
   created_at?: number;
   started_at?: number;
+  /** Failure text from the runner; null/absent when the run didn't fail. */
+  error?: string | null;
+  /** Warden REST serializes numerics as strings — coerce before math. */
+  runtime_seconds?: number | string | null;
+  total_tokens?: number | string | null;
+  tokens_used?: number | string | null;
   /** Parsed out of `task` by {@link parseExecutionTask}. */
   parent_execution_id?: string | null;
   task_summary?: string;
+}
+
+/** Coerce warden's string-serialized numerics; 0/absent → null (absence renders as absence). */
+export function execTokenCount(exec: ObservatoryExecution): number | null {
+  const n = Number(exec.total_tokens ?? exec.tokens_used);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Normalize error text; Python-side "None" leakage counts as absent. */
+export function execErrorText(exec: ObservatoryExecution): string | null {
+  const e = exec.error;
+  if (typeof e !== "string" || e.length === 0 || e === "None") return null;
+  return e;
 }
 
 /** Parse the `task` JSON payload, folding parentage onto the record. */

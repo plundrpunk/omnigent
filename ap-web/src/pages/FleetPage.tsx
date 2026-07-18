@@ -17,6 +17,8 @@ import { Button } from "@/components/ui/button";
 import { PageShell } from "@/components/PageShell";
 import { Spinner } from "@/components/ui/spinner";
 import {
+  execErrorText,
+  execTokenCount,
   fetchExecutions,
   fetchWardenAgents,
   type ObservatoryExecution,
@@ -218,6 +220,8 @@ export function FleetPage() {
   }, [agents, executions, showHistory]);
 
   const selectedAgent = agents?.find((a) => a.agent_name === selected);
+  // Transient nodes (seen only in executions) still deserve a panel — execs exist even without warden data.
+  const selectedNode = graph?.placed.find((n) => n.id === selected) ?? null;
   const selectedExecs = (graph?.execsByAgent.get(selected ?? "") ?? []).slice(0, 8);
   const aliveCount = agents?.filter((a) => a.alive).length ?? 0;
   const runningCount = executions.filter((e) => e.status === "running").length;
@@ -255,7 +259,7 @@ export function FleetPage() {
         </div>
       ) : (
         <div className="flex gap-4">
-          <div className="min-w-0 flex-1 rounded-xl border border-border bg-card/50">
+          <div className="min-w-0 flex-1 overflow-x-auto rounded-xl border border-border bg-card/50">
             <svg
               viewBox={`0 0 ${graph.width} ${graph.height}`}
               preserveAspectRatio="xMidYMin meet"
@@ -289,6 +293,9 @@ export function FleetPage() {
                   className="cursor-pointer"
                   onClick={() => setSelected(n.id === selected ? null : n.id)}
                 >
+                  <title>
+                    {`${n.label} — ${n.status}${n.contextPct > 0 ? ` · ctx ${n.contextPct.toFixed(1)}%` : ""}`}
+                  </title>
                   <rect
                     width={NODE_W}
                     height={NODE_H}
@@ -327,30 +334,36 @@ export function FleetPage() {
             </svg>
           </div>
 
-          {selectedAgent && (
+          {selectedNode && (
             <div className="w-80 shrink-0 overflow-auto rounded-lg border border-border bg-card p-4">
               <div className="mb-2 flex items-center justify-between">
-                <h2 className="font-semibold">{selectedAgent.agent_name}</h2>
-                <Badge variant={selectedAgent.alive ? "default" : "secondary"}>
-                  {selectedAgent.alive ? "alive" : "gone"}
+                <h2 className="font-semibold">{selectedNode.label}</h2>
+                <Badge variant={selectedNode.alive ? "default" : "secondary"}>
+                  {selectedAgent ? (selectedAgent.alive ? "alive" : "gone") : "transient"}
                 </Badge>
               </div>
-              <dl className="space-y-1 text-sm">
-                <div className="flex justify-between">
-                  <dt className="text-muted-foreground">status</dt>
-                  <dd>{selectedAgent.status}</dd>
-                </div>
-                <div className="flex justify-between">
-                  <dt className="text-muted-foreground">context</dt>
-                  <dd>{(Number(selectedAgent.context_pct) || 0).toFixed(1)}%</dd>
-                </div>
-                {selectedAgent.registered_at && (
-                  <div className="flex justify-between gap-2">
-                    <dt className="text-muted-foreground">registered</dt>
-                    <dd className="truncate">{selectedAgent.registered_at.slice(0, 19)}</dd>
+              {selectedAgent ? (
+                <dl className="space-y-1 text-sm">
+                  <div className="flex justify-between">
+                    <dt className="text-muted-foreground">status</dt>
+                    <dd>{selectedAgent.status}</dd>
                   </div>
-                )}
-              </dl>
+                  <div className="flex justify-between">
+                    <dt className="text-muted-foreground">context</dt>
+                    <dd>{(Number(selectedAgent.context_pct) || 0).toFixed(1)}%</dd>
+                  </div>
+                  {selectedAgent.registered_at && (
+                    <div className="flex justify-between gap-2">
+                      <dt className="text-muted-foreground">registered</dt>
+                      <dd className="truncate">{selectedAgent.registered_at.slice(0, 19)}</dd>
+                    </div>
+                  )}
+                </dl>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  Not in the warden roster — known only from executions.
+                </p>
+              )}
               <h3 className="mt-4 mb-1 text-sm font-medium">Recent executions</h3>
               {selectedExecs.length === 0 ? (
                 <p className="text-sm text-muted-foreground">None observed.</p>
@@ -374,6 +387,17 @@ export function FleetPage() {
                       </div>
                       {e.task_summary && (
                         <p className="mt-1 line-clamp-3 text-muted-foreground">{e.task_summary}</p>
+                      )}
+                      {(e.model || execTokenCount(e) != null) && (
+                        <div className="mt-1 flex flex-wrap gap-x-3 text-muted-foreground">
+                          {e.model && <span className="font-mono">{e.model}</span>}
+                          {execTokenCount(e) != null && <span>{execTokenCount(e)!.toLocaleString()} tok</span>}
+                        </div>
+                      )}
+                      {execErrorText(e) && (
+                        <p className="mt-1 whitespace-pre-wrap break-words text-destructive">
+                          {execErrorText(e)}
+                        </p>
                       )}
                     </li>
                   ))}
