@@ -4,8 +4,13 @@
  * Roles on the left, providers on the right, curves showing who routes
  * where; line and dot color carry provider health. A banner leads the
  * page whenever a routed provider isn't online. Costs and endpoints
- * live in the provider cards below the diagram. Read-only until the
- * bridge grows a reviewed write whitelist.
+ * live in the provider cards below the diagram.
+ *
+ * Editing (P3.1): click a role node → provider picker → PUT
+ * role-mappings through the bridge's write table → diagram refetches.
+ * AMS validates the provider against its registry; its errors are
+ * shown verbatim. No optimistic redraw — the diagram only ever shows
+ * what AMS confirmed.
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -14,7 +19,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { PageShell } from "@/components/PageShell";
 import { Spinner } from "@/components/ui/spinner";
-import { fetchProviders, fetchRoleMappings, type LlmProvider } from "@/lib/ams";
+import { fetchProviders, fetchRoleMappings, putRoleMappings, type LlmProvider } from "@/lib/ams";
 
 const ROW_H = 44;
 const PAD = 24;
@@ -34,6 +39,23 @@ export function ModelsPage() {
   const [activeProvider, setActiveProvider] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const [selectedRole, setSelectedRole] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  const assignRole = async (role: string, providerType: string) => {
+    setSaving(true);
+    setSaveError(null);
+    try {
+      await putRoleMappings({ [role]: providerType });
+      setSelectedRole(null);
+      setRefreshKey((k) => k + 1); // redraw only from AMS-confirmed state
+    } catch (err: unknown) {
+      setSaveError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSaving(false);
+    }
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -99,7 +121,7 @@ export function ModelsPage() {
   return (
     <PageShell
       title="Models"
-      subtitle="Who thinks with what — each role routes to a provider. Read-only for now."
+      subtitle="Who thinks with what — click a role to reroute it to a provider."
       actions={
         <Button variant="outline" size="sm" onClick={() => setRefreshKey((k) => k + 1)}>
           Refresh
@@ -157,19 +179,34 @@ export function ModelsPage() {
                   />
                 );
               })}
-              {/* role nodes */}
+              {/* role nodes — click to reroute */}
               {diagram.roleNames.map((role, i) => {
                 const y = PAD + i * ROW_H + ROW_H / 2;
+                const selected = role === selectedRole;
                 return (
-                  <g key={role}>
+                  <g
+                    key={role}
+                    data-testid={`role-node-${role}`}
+                    role="button"
+                    aria-label={`Reroute ${role}`}
+                    className="cursor-pointer"
+                    onClick={() => {
+                      setSaveError(null);
+                      setSelectedRole(selected ? null : role);
+                    }}
+                  >
                     <rect
                       x={16}
                       y={y - 15}
                       width={LEFT_X - 16}
                       height={30}
                       rx={15}
-                      className="fill-primary/10 stroke-primary/50"
-                      strokeWidth={1.2}
+                      className={
+                        selected
+                          ? "fill-primary/25 stroke-primary"
+                          : "fill-primary/10 stroke-primary/50"
+                      }
+                      strokeWidth={selected ? 1.8 : 1.2}
                     />
                     <text
                       x={(16 + LEFT_X) / 2}
@@ -220,6 +257,59 @@ export function ModelsPage() {
               })}
             </svg>
           </div>
+
+          {selectedRole && (
+            <div
+              data-testid="role-picker"
+              className="rounded-xl border border-primary/40 bg-primary/5 p-4"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-sm font-medium">
+                  Route <span className="font-mono">{selectedRole}</span> to:
+                </p>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={saving}
+                  onClick={() => setSelectedRole(null)}
+                >
+                  Cancel
+                </Button>
+              </div>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {diagram.providerTypes.map((type) => {
+                  const p = providerByType.get(type);
+                  const current = roles[selectedRole] === type;
+                  return (
+                    <Button
+                      key={type}
+                      variant={current ? "secondary" : "outline"}
+                      size="sm"
+                      disabled={saving || current}
+                      className="gap-1.5 font-mono text-xs"
+                      onClick={() => void assignRole(selectedRole, type)}
+                    >
+                      <span
+                        className={`size-2 rounded-full ${
+                          p?.status === "online" ? "bg-emerald-500" : "bg-destructive"
+                        }`}
+                      />
+                      {type}
+                      {current ? " (current)" : ""}
+                    </Button>
+                  );
+                })}
+              </div>
+              <p className="mt-2 text-xs text-muted-foreground">
+                {saving
+                  ? "Saving — waiting for AMS to confirm…"
+                  : "Applies immediately via PUT role-mappings; the diagram redraws from AMS-confirmed state only."}
+              </p>
+              {saveError && (
+                <p className="mt-2 text-xs text-destructive">Couldn&apos;t save: {saveError}</p>
+              )}
+            </div>
+          )}
 
           <div className="grid gap-3 md:grid-cols-3">
             {providers.map((p) => (

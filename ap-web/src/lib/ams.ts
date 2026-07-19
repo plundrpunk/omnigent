@@ -137,6 +137,33 @@ export async function fetchRoleMappings(): Promise<Record<string, string>> {
   return amsGet<Record<string, string>>("api/v1/llm-providers/role-mappings");
 }
 
+/** PUT a write-table AMS path via the bridge (see routes/ams.py P1). */
+export async function amsPut<T = unknown>(path: string, body: unknown): Promise<T> {
+  const resp = await hostFetch(`/v1/ams/${path}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const payload: unknown = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    const detail =
+      payload && typeof payload === "object" && "detail" in payload
+        ? JSON.stringify((payload as { detail: unknown }).detail).slice(0, 300)
+        : `HTTP ${resp.status}`;
+    throw new AmsError(detail, resp.status);
+  }
+  return payload as T;
+}
+
+/**
+ * Update role → provider routing. Partial by design: send only the
+ * roles being changed; AMS merges and validates the provider against
+ * its registry (400 on unknown — surfaced verbatim).
+ */
+export async function putRoleMappings(update: Record<string, string>): Promise<unknown> {
+  return amsPut("api/v1/llm-providers/role-mappings", update);
+}
+
 // ── Automata stats (training / eval gate window) ─────────────
 
 export interface BayesianCategory {
