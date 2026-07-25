@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   AlertTriangleIcon,
   BotIcon,
@@ -18,6 +18,8 @@ import { checkpointResumeCommand, type GoalRun } from "@/lib/goal";
 import { Link } from "@/lib/routing";
 import type { SessionStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { GoalRunEvents } from "@/shell/GoalRunEvents";
+import { useGoalEvents } from "@/hooks/useGoalEvents";
 import { useGoalRuns } from "@/hooks/useGoalRuns";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { useChatStore } from "@/store/chatStore";
@@ -225,7 +227,7 @@ export function deriveWorkLoopSnapshot(input: DeriveWorkLoopInput): WorkLoopSnap
   }, 0);
   const observedArtifactCount =
     input.changedCount + input.blocks.filter((block) => block.type === "file").length;
-  const receiptArtifactCount = receipt ? Math.max(1, receipt.artifact.changed_files.length) : 0;
+  const receiptArtifactCount = receipt ? receipt.artifact.changed_files.length : 0;
   const artifactCount = Math.max(observedArtifactCount, receiptArtifactCount);
 
   let runState: LoopStageState = "pending";
@@ -241,7 +243,7 @@ export function deriveWorkLoopSnapshot(input: DeriveWorkLoopInput): WorkLoopSnap
     runDetail = latestError?.message || latestError?.code || "The latest run failed.";
   } else if (executionActive) {
     runState = "active";
-    runDetail = `${Math.max(input.agentsWorking, 1)} agent${Math.max(input.agentsWorking, 1) === 1 ? " is" : "s are"} working.`;
+    runDetail = `${input.agentsWorking} agent${input.agentsWorking === 1 ? " is" : "s are"} working.`;
   } else if (responseEnd) {
     runState = "complete";
     runDetail = `Run ended with status: ${responseEnd.status}.`;
@@ -409,15 +411,32 @@ export function GoalRunsSection({ runs }: { runs: GoalRun[] }) {
         </span>
       </div>
       <div className="flex flex-col gap-3">
-        {runs.map((run) => {
-          const meta = GOAL_STATUS_META[run.status] ?? {
-            label: run.status,
-            tone: "bg-muted text-muted-foreground",
-          };
-          const resume = checkpointResumeCommand(run.checkpoint);
-          return (
+        {runs.map((run) => (
+          <GoalRunCard key={run.run_id} run={run} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/**
+ * One goal run, with an expandable live feed of what the harness did.
+ *
+ * Kept separate from {@link GoalRunsSection} so each card owns its expand
+ * state and its own event subscription -- hooks cannot live inside a map
+ * callback, and only an opened card should poll.
+ */
+function GoalRunCard({ run }: { run: GoalRun }) {
+  const [showDetail, setShowDetail] = useState(false);
+  const events = useGoalEvents(run.run_id, run.status, showDetail);
+  const meta = GOAL_STATUS_META[run.status] ?? {
+    label: run.status,
+    tone: "bg-muted text-muted-foreground",
+  };
+  const resume = checkpointResumeCommand(run.checkpoint);
+  return (
+    <>
             <div
-              key={run.run_id}
               data-testid="goal-run-card"
               className="rounded-md border border-border/70 p-2.5"
             >
@@ -473,11 +492,21 @@ export function GoalRunsSection({ runs }: { runs: GoalRun[] }) {
                   </pre>
                 </details>
               )}
+              <button
+                type="button"
+                data-testid="goal-run-detail-toggle"
+                onClick={() => setShowDetail((open) => !open)}
+                className="mt-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground"
+              >
+                {showDetail ? "Hide run detail" : "Show run detail"}
+              </button>
+              {showDetail && (
+                <div className="mt-1.5">
+                  <GoalRunEvents events={events} />
+                </div>
+              )}
             </div>
-          );
-        })}
-      </div>
-    </section>
+    </>
   );
 }
 
