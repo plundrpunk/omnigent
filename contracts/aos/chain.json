@@ -5,12 +5,13 @@
   "workspace": "/Users/drfoundryos/Documents/DevFolder/Omnigent",
   "branch": "aos-simplify",
   "defaults": {
-    "provider": "codex",
-    "model": "gpt-5.5",
+    "provider": "subprocess",
+    "model": "gpt-5.6-sol:medium",
     "exec": {
       "workspace": "/Users/drfoundryos/Documents/DevFolder/Omnigent",
       "sandbox": "subprocess",
-      "allow_write": true
+      "allow_write": true,
+      "command": "/Users/drfoundryos/Documents/DevFolder/Omnigent/scripts/aos-codex-shim"
     },
     "limits": {
       "max_revisions": 6,
@@ -18,20 +19,49 @@
       "max_replans": 4,
       "max_tool_calls": 400,
       "timeout": 3600
+    },
+    "role_models": {
+      "planner": "subprocess:gpt-5.6-sol:high",
+      "critic": "subprocess:gpt-5.6-sol:high",
+      "verifier": "subprocess:gpt-5.6-sol:high",
+      "executor": "subprocess:gpt-5.6-sol:medium",
+      "revisor": "subprocess:gpt-5.6-sol:medium",
+      "optimizer": "subprocess:gpt-5.6-sol:medium",
+      "synthesizer": "subprocess:gpt-5.6-sol:medium",
+      "quarantine_parser": "subprocess:gpt-5.6-sol:medium"
     }
   },
   "phases": [
-    { "contract": "contracts/aos/phase0.contract.json", "commit_on_pass": true },
-    { "contract": "contracts/aos/phase1.contract.json", "commit_on_pass": true },
-    { "contract": "contracts/aos/phase2.contract.json", "commit_on_pass": true },
-    { "contract": "contracts/aos/phase3.contract.json", "commit_on_pass": true },
-    { "contract": "contracts/aos/phase4.contract.json", "commit_on_pass": true }
+    {
+      "contract": "contracts/aos/phase0.contract.json",
+      "commit_on_pass": true
+    },
+    {
+      "contract": "contracts/aos/phase1.contract.json",
+      "commit_on_pass": true
+    },
+    {
+      "contract": "contracts/aos/phase2.contract.json",
+      "commit_on_pass": true
+    },
+    {
+      "contract": "contracts/aos/phase3.contract.json",
+      "commit_on_pass": true
+    },
+    {
+      "contract": "contracts/aos/phase4.contract.json",
+      "commit_on_pass": true
+    }
   ],
   "on_blocked": {
     "author_remediation": true,
     "max_remediations_per_phase": 2,
     "then": "stop"
   },
-  "on_paused": { "then": "stop" },
-  "on_setup_error": { "then": "stop" }
+  "on_paused": {
+    "then": "stop"
+  },
+  "on_setup_error": {
+    "then": "stop"
+  }
 }

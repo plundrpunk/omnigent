@@ -42,7 +42,26 @@ from pathlib import Path
 # Models that the ChatGPT-account codex actually accepts. Anything else
 # 400s with "requires a newer version of Codex" / "not supported when
 # using Codex with a ChatGPT account".
-DEFAULT_MODEL = os.environ.get("AOS_SHIM_MODEL", "gpt-5.5")
+DEFAULT_MODEL = os.environ.get("AOS_SHIM_MODEL", "gpt-5.6-sol")
+DEFAULT_EFFORT = os.environ.get("AOS_SHIM_EFFORT", "medium")
+VALID_EFFORTS = ("minimal", "low", "medium", "high")
+
+
+def split_model(raw: str) -> tuple[str, str]:
+    """Read the harness's model string as ``model[:effort]``.
+
+    The harness passes ``--role-model planner=subprocess:gpt-5.6-sol:high``
+    straight through as the payload's ``model``, which lets one shim serve
+    every role at a different reasoning effort. Unknown or missing effort
+    falls back to the default rather than guessing.
+    """
+    raw = (raw or "").strip()
+    if not raw or raw == "subprocess":
+        return DEFAULT_MODEL, DEFAULT_EFFORT
+    model, sep, effort = raw.rpartition(":")
+    if sep and effort in VALID_EFFORTS:
+        return (model or DEFAULT_MODEL), effort
+    return raw, DEFAULT_EFFORT
 TIMEOUT = float(os.environ.get("AOS_SHIM_TIMEOUT", "600"))
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
 
@@ -84,6 +103,7 @@ def main() -> int:
         return 2
 
     prompt = flatten(messages)
+    model, effort = split_model(str(payload.get("model", "")))
 
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
         out_path = fh.name
@@ -92,7 +112,9 @@ def main() -> int:
         CODEX_BIN,
         "exec",
         "--model",
-        DEFAULT_MODEL,
+        model,
+        "-c",
+        f"model_reasoning_effort={effort}",
         # read-only: this process answers questions. The harness's own
         # run_shell is what touches the workspace.
         "--sandbox",

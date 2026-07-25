@@ -108,6 +108,48 @@ _ENDPOINT_FIELDS: dict[str, str] = {
 
 _API_KEY_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 
+#: The harness's own role set (harness_automaton.roles.DEFAULT_ROLES).
+#: There is no "orchestrator" — ``planner`` is the role that decomposes the
+#: goal and drives the loop, so that is where orchestration effort belongs.
+_ROLE_NAMES = frozenset(
+    {
+        "quarantine_parser",
+        "planner",
+        "executor",
+        "critic",
+        "verifier",
+        "revisor",
+        "optimizer",
+        "synthesizer",
+    }
+)
+
+#: ``role=provider:model``. The model half may itself carry a colon (the
+#: shim reads ``model:effort``), so only the provider is split off here.
+_ROLE_BACKEND_RE = re.compile(r"^[A-Za-z0-9._-]+(:[A-Za-z0-9._:/-]+)?$")
+
+
+def _validate_role_models(spec: Any) -> list[str]:
+    """Validate an optional ``role_models`` map into ``--role-model`` args."""
+    if spec is None:
+        return []
+    if not isinstance(spec, dict):
+        raise HTTPException(status_code=422, detail="role_models must be a JSON object")
+    out: list[str] = []
+    for role, backend in spec.items():
+        if role not in _ROLE_NAMES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown role {role!r}; allowed: {', '.join(sorted(_ROLE_NAMES))}",
+            )
+        if not isinstance(backend, str) or not _ROLE_BACKEND_RE.match(backend):
+            raise HTTPException(
+                status_code=422,
+                detail=f"role_models.{role} must look like 'provider:model'",
+            )
+        out.append(f"{role}={backend}")
+    return out
+
 
 def _validate_endpoint(body: dict[str, Any]) -> dict[str, str]:
     """Validate optional ``base_url`` / ``api_key_env`` overrides."""
@@ -143,6 +185,7 @@ _LIMIT_FLAGS: dict[str, str] = {
     "max_replans": "--max-replans",
     "max_loop_iterations": "--max-loop-iterations",
     "max_tool_calls": "--max-tool-calls",
+    "max_reasoning_steps": "--max-reasoning-steps",
     "max_tokens": "--max-tokens",
     "timeout": "--timeout",
 }
@@ -154,6 +197,7 @@ _LIMIT_MAX: dict[str, int] = {
     "max_replans": 20,
     "max_loop_iterations": 200,
     "max_tool_calls": 2000,
+    "max_reasoning_steps": 600,
     "max_tokens": 4_000_000,
     "timeout": 7200,
 }
@@ -418,6 +462,8 @@ async def _execute_goal_run(run: dict[str, Any]) -> None:
         value = (run.get("endpoint") or {}).get(key)
         if value:
             argv += [flag, str(value)]
+    for pair in run.get("role_models") or []:
+        argv += ["--role-model", pair]
     # Execution is opt-in. ``exec_spec`` was allowlist-validated at request
     # time, so by here the workspace is already known-safe and resolved.
     exec_spec = run.get("exec")
@@ -540,6 +586,7 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
             raise HTTPException(status_code=422, detail="model must be a simple token")
         limits = _validate_limits(body.get("limits"))
         endpoint = _validate_endpoint(body)
+        role_models = _validate_role_models(body.get("role_models"))
         if registry.running_count() >= _MAX_CONCURRENT_RUNS:
             raise HTTPException(
                 status_code=429,
@@ -553,6 +600,7 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
             "model": model,
             "limits": limits or None,
             "endpoint": endpoint or None,
+            "role_models": role_models or None,
             # Recorded so the run record can never claim less access than
             # the subprocess actually got. ``None`` means reason-only.
             "exec": exec_spec,

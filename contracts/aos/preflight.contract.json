@@ -17,9 +17,9 @@
     "The run has no ability to write files in the workspace."
   ],
   "budget": {
-    "max_total_tokens": 40000,
-    "max_wallclock_s": 300,
-    "max_usd": 1.0
+    "max_total_tokens": 500000,
+    "max_wallclock_s": 2700,
+    "max_usd": 15.0
   },
   "metadata": {
     "source": "AOS bridge exec-path preflight",
