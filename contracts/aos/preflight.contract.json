@@ -1,0 +1,28 @@
+{
+  "goal_id": "aos-exec-preflight-v2",
+  "end_state": "Prove the AOS goal bridge can execute and write inside the allowlisted workspace. Step 1: run the shell command `git rev-parse --abbrev-ref HEAD`. Step 2: write its output as the single line of a new file EXEC_PREFLIGHT.txt at the workspace root. Step 3: YOU MUST then run the exact shell command `test -s EXEC_PREFLIGHT.txt` as a tool call and observe it succeed \u2014 the finalization gate only accepts a recorded run_shell result for that exact command, so writing the file is not sufficient on its own. Do not mark the subgoal done until that verification command has actually been run and passed. Change nothing else.",
+  "evidence_criteria": {
+    "required_files": [
+      "EXEC_PREFLIGHT.txt"
+    ],
+    "syntax_command": "test -s EXEC_PREFLIGHT.txt",
+    "evidence_artifact_required": true
+  },
+  "inspection_criteria": [
+    "EXEC_PREFLIGHT.txt exists at the workspace root and is non-empty.",
+    "No other file in the workspace was created, modified or deleted."
+  ],
+  "blocked_conditions": [
+    "The run has no ability to execute commands.",
+    "The run has no ability to write files in the workspace."
+  ],
+  "budget": {
+    "max_total_tokens": 40000,
+    "max_wallclock_s": 300,
+    "max_usd": 1.0
+  },
+  "metadata": {
+    "source": "AOS bridge exec-path preflight",
+    "note": "Throwaway. Delete EXEC_PREFLIGHT.txt after it passes."
+  }
+}

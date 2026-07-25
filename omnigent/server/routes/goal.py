@@ -20,6 +20,18 @@ Configuration comes from the server environment:
   harness-automaton checkout). Unset ⇒ 503.
 - ``HA_GOAL_WORKDIR`` — ``--workdir`` passed to the CLI (default
   ``runs-goal``); artifacts land in ``<workdir>/goal/<goal_id>/``.
+- ``HA_GOAL_EXEC_ROOTS`` — ``os.pathsep``-separated absolute directories
+  a run is permitted to execute in and write to. **Unset ⇒ every exec
+  request is refused with 422.** A run can only ever touch a path that
+  resolves (symlinks included) inside one of these roots.
+
+Execution is opt-in per request and fail-closed by construction. Without
+an ``exec`` block the CLI is invoked exactly as before — reason-only, no
+shell, no writes. With one, the caller must name a workspace, and that
+workspace must sit inside ``HA_GOAL_EXEC_ROOTS``; anything else is a 422
+before a process is ever spawned. The resolved settings are recorded on
+the run and returned by ``GET /v1/goal``, so a run can never write
+somewhere the record doesn't admit to.
 
 Truth rules (Drew's law): the run status comes *only* from the CLI exit
 code (0=completed / 3=blocked / 6=paused / 2=setup_error); outcome data
@@ -74,6 +86,102 @@ _MAX_CONCURRENT_RUNS = 3
 _ARTIFACT_CAP_BYTES = 64 * 1024
 _STDERR_TAIL_CHARS = 8 * 1024
 
+#: Sandbox modes forwarded to ``--exec-sandbox``. ``none`` is deliberately
+#: absent: a bridge-started run never gets an unsandboxed shell.
+_EXEC_SANDBOXES = ("subprocess", "docker")
+
+#: Default sandbox when an exec block omits one — the stricter of the two.
+_DEFAULT_EXEC_SANDBOX = "subprocess"
+
+#: ``--command`` is a completion endpoint (a CLI or shim). A bare name or
+#: an absolute path is allowed; no spaces, quotes, or shell metacharacters,
+#: so a request can never smuggle arguments into the argv the harness runs.
+_EXEC_COMMAND_RE = re.compile(r"^/?[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
+
+#: Endpoint knobs for openai-compatible / anthropic / ollama providers.
+#: ``api_key_env`` is the NAME of a server-side env var — a request can
+#: select which key the server uses but can never supply or read one.
+_ENDPOINT_FIELDS: dict[str, str] = {
+    "base_url": "--base-url",
+    "api_key_env": "--api-key-env",
+}
+
+_API_KEY_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+
+
+def _validate_endpoint(body: dict[str, Any]) -> dict[str, str]:
+    """Validate optional ``base_url`` / ``api_key_env`` overrides."""
+    out: dict[str, str] = {}
+    base_url = body.get("base_url")
+    if base_url is not None:
+        if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
+            raise HTTPException(
+                status_code=422, detail="base_url must be an http(s) URL"
+            )
+        out["base_url"] = base_url
+    api_key_env = body.get("api_key_env")
+    if api_key_env is not None:
+        if not isinstance(api_key_env, str) or not _API_KEY_ENV_RE.match(api_key_env):
+            raise HTTPException(
+                status_code=422,
+                detail="api_key_env must be an environment variable NAME, not a key",
+            )
+        if api_key_env not in os.environ:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{api_key_env} is not set in the server environment",
+            )
+        out["api_key_env"] = api_key_env
+    return out
+
+#: Loop budgets forwarded to the CLI. The harness defaults ``max_revisions``
+#: to 1 — a single failed verification ends the run — which is far too tight
+#: for multi-file work, so the caller must be able to raise it.
+_LIMIT_FLAGS: dict[str, str] = {
+    "max_revisions": "--max-revisions",
+    "max_subgoals": "--max-subgoals",
+    "max_replans": "--max-replans",
+    "max_loop_iterations": "--max-loop-iterations",
+    "max_tool_calls": "--max-tool-calls",
+    "max_tokens": "--max-tokens",
+    "timeout": "--timeout",
+}
+
+#: Ceilings. A request may tune a budget but never remove it.
+_LIMIT_MAX: dict[str, int] = {
+    "max_revisions": 20,
+    "max_subgoals": 40,
+    "max_replans": 20,
+    "max_loop_iterations": 200,
+    "max_tool_calls": 2000,
+    "max_tokens": 4_000_000,
+    "timeout": 7200,
+}
+
+
+def _validate_limits(spec: Any) -> dict[str, int]:
+    """Validate an optional ``limits`` block of positive ints under a ceiling."""
+    if spec is None:
+        return {}
+    if not isinstance(spec, dict):
+        raise HTTPException(status_code=422, detail="limits must be a JSON object")
+    out: dict[str, int] = {}
+    for key, value in spec.items():
+        if key not in _LIMIT_FLAGS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown limit {key!r}; allowed: {', '.join(sorted(_LIMIT_FLAGS))}",
+            )
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise HTTPException(status_code=422, detail=f"limits.{key} must be a positive integer")
+        ceiling = _LIMIT_MAX[key]
+        if value > ceiling:
+            raise HTTPException(
+                status_code=422, detail=f"limits.{key} exceeds the ceiling of {ceiling}"
+            )
+        out[key] = value
+    return out
+
 
 def _automaton_bin() -> str:
     return os.environ.get("HA_AUTOMATON_BIN") or ""
@@ -85,6 +193,102 @@ def _goal_cwd() -> str:
 
 def _goal_workdir() -> str:
     return os.environ.get("HA_GOAL_WORKDIR") or "runs-goal"
+
+
+def _exec_roots() -> list[Path]:
+    """Absolute, symlink-resolved roots a run may execute inside.
+
+    Empty when ``HA_GOAL_EXEC_ROOTS`` is unset — which is what makes the
+    exec path fail closed: no roots configured, no execution, ever.
+    """
+    raw = os.environ.get("HA_GOAL_EXEC_ROOTS") or ""
+    roots: list[Path] = []
+    for part in raw.split(os.pathsep):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            roots.append(Path(part).expanduser().resolve(strict=True))
+        except OSError:
+            continue  # a root that doesn't exist grants nothing
+    return roots
+
+
+def _validate_exec(spec: Any) -> dict[str, Any] | None:
+    """Validate an optional ``exec`` block; ``None`` means reason-only.
+
+    Refuses anything the allowlist doesn't cover *before* a process is
+    spawned. The returned dict carries the resolved workspace, so the
+    subprocess and the run record can never disagree about it.
+    """
+    if spec is None:
+        return None
+    if not isinstance(spec, dict):
+        raise HTTPException(status_code=422, detail="exec must be a JSON object")
+
+    roots = _exec_roots()
+    if not roots:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "execution is not enabled on this server — set HA_GOAL_EXEC_ROOTS "
+                "to the absolute directories a goal run may write to"
+            ),
+        )
+
+    workspace = spec.get("workspace")
+    if not isinstance(workspace, str) or not workspace.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="exec.workspace must be an absolute path inside an allowlisted root",
+        )
+    try:
+        resolved = Path(workspace).expanduser().resolve(strict=True)
+    except OSError:
+        raise HTTPException(
+            status_code=422, detail=f"exec.workspace does not exist: {workspace}"
+        ) from None
+    if not resolved.is_dir():
+        raise HTTPException(
+            status_code=422, detail=f"exec.workspace is not a directory: {workspace}"
+        )
+    if not any(resolved == root or root in resolved.parents for root in roots):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "exec.workspace is outside every allowlisted root — refusing to run. "
+                "Add it to HA_GOAL_EXEC_ROOTS if this is intended."
+            ),
+        )
+
+    sandbox = spec.get("sandbox", _DEFAULT_EXEC_SANDBOX)
+    if sandbox not in _EXEC_SANDBOXES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"exec.sandbox must be one of {', '.join(_EXEC_SANDBOXES)}",
+        )
+
+    allow_write = spec.get("allow_write", False)
+    if not isinstance(allow_write, bool):
+        raise HTTPException(status_code=422, detail="exec.allow_write must be a boolean")
+
+    command = spec.get("command")
+    if command is not None and (
+        not isinstance(command, str) or not _EXEC_COMMAND_RE.match(command)
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="exec.command must be a bare token (no arguments, no shell characters)",
+        )
+
+    resolved_spec: dict[str, Any] = {
+        "workspace": str(resolved),
+        "sandbox": sandbox,
+        "allow_write": allow_write,
+    }
+    if command is not None:
+        resolved_spec["command"] = command
+    return resolved_spec
 
 
 def _now_iso() -> str:
@@ -203,6 +407,32 @@ async def _execute_goal_run(run: dict[str, Any]) -> None:
     provider = run.get("provider")
     if provider:
         argv += ["--provider", provider]
+    model = run.get("model")
+    if model:
+        argv += ["--model", model]
+    for key, flag in _LIMIT_FLAGS.items():
+        value = (run.get("limits") or {}).get(key)
+        if value:
+            argv += [flag, str(value)]
+    for key, flag in _ENDPOINT_FIELDS.items():
+        value = (run.get("endpoint") or {}).get(key)
+        if value:
+            argv += [flag, str(value)]
+    # Execution is opt-in. ``exec_spec`` was allowlist-validated at request
+    # time, so by here the workspace is already known-safe and resolved.
+    exec_spec = run.get("exec")
+    if exec_spec:
+        argv += [
+            "--allow-exec",
+            "--exec-sandbox",
+            exec_spec["sandbox"],
+            "--exec-workspace",
+            exec_spec["workspace"],
+        ]
+        if exec_spec["allow_write"]:
+            argv.append("--exec-allow-write")
+        if exec_spec.get("command"):
+            argv += ["--command", exec_spec["command"]]
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
@@ -302,6 +532,14 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
             not isinstance(provider, str) or not re.match(r"^[A-Za-z0-9._-]+$", provider)
         ):
             raise HTTPException(status_code=422, detail="provider must be a simple token")
+        exec_spec = _validate_exec(body.get("exec"))
+        model = body.get("model")
+        if model is not None and (
+            not isinstance(model, str) or not re.match(r"^[A-Za-z0-9./:_-]+$", model)
+        ):
+            raise HTTPException(status_code=422, detail="model must be a simple token")
+        limits = _validate_limits(body.get("limits"))
+        endpoint = _validate_endpoint(body)
         if registry.running_count() >= _MAX_CONCURRENT_RUNS:
             raise HTTPException(
                 status_code=429,
@@ -312,6 +550,12 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
             "goal_id": contract["goal_id"],
             "conversation_id": conversation_id,
             "provider": provider,
+            "model": model,
+            "limits": limits or None,
+            "endpoint": endpoint or None,
+            # Recorded so the run record can never claim less access than
+            # the subprocess actually got. ``None`` means reason-only.
+            "exec": exec_spec,
             "contract": contract,
             "status": "running",
             "exit_code": None,

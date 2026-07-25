@@ -1,0 +1,37 @@
+{
+  "chain_id": "aos-simplify",
+  "description": "Self-evolving execution of the AOS simplification plan, phases 0 through 4.",
+  "server": "http://127.0.0.1:6767",
+  "workspace": "/Users/drfoundryos/Documents/DevFolder/Omnigent",
+  "branch": "aos-simplify",
+  "defaults": {
+    "provider": "codex",
+    "model": "gpt-5.5",
+    "exec": {
+      "workspace": "/Users/drfoundryos/Documents/DevFolder/Omnigent",
+      "sandbox": "subprocess",
+      "allow_write": true
+    },
+    "limits": {
+      "max_revisions": 6,
+      "max_subgoals": 12,
+      "max_replans": 4,
+      "max_tool_calls": 400,
+      "timeout": 3600
+    }
+  },
+  "phases": [
+    { "contract": "contracts/aos/phase0.contract.json", "commit_on_pass": true },
+    { "contract": "contracts/aos/phase1.contract.json", "commit_on_pass": true },
+    { "contract": "contracts/aos/phase2.contract.json", "commit_on_pass": true },
+    { "contract": "contracts/aos/phase3.contract.json", "commit_on_pass": true },
+    { "contract": "contracts/aos/phase4.contract.json", "commit_on_pass": true }
+  ],
+  "on_blocked": {
+    "author_remediation": true,
+    "max_remediations_per_phase": 2,
+    "then": "stop"
+  },
+  "on_paused": { "then": "stop" },
+  "on_setup_error": { "then": "stop" }
+}

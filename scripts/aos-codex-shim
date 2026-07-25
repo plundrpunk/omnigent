@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Completion shim: harness-automaton `subprocess` provider -> codex CLI.
+
+Why this exists
+---------------
+The harness has two ways to use a coding CLI, and only one of them works
+with a run_shell-based gate:
+
+- ``--provider codex`` hands the whole agentic loop to codex. Codex edits
+  files inside *its own* sandbox, so the harness never records a
+  ``run_shell`` result — and the finalization gate, which asks for exactly
+  that evidence, correctly refuses to certify the run. Verified: the file
+  gets written, the gate still blocks.
+- ``--provider subprocess --command <this script>`` uses the CLI purely as
+  a **completion endpoint**. The harness keeps its own tool loop, runs its
+  own ``run_shell``, and records the evidence the gate wants.
+
+This script is the second one. Read a chat payload on stdin, return the
+assistant's text on stdout. No tools, no file edits, no agentic loop —
+codex is asked to answer, not to act.
+
+Billing: ``codex exec`` authenticates with the ChatGPT account in
+~/.codex/auth.json, so this bills against the subscription, not the
+metered OpenAI API.
+
+Protocol
+--------
+stdin : {"model": str, "messages": [{"role","content"}], "temperature": …}
+stdout: the assistant's reply as plain text
+exit  : 0 on success; non-zero with a reason on stderr
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# Models that the ChatGPT-account codex actually accepts. Anything else
+# 400s with "requires a newer version of Codex" / "not supported when
+# using Codex with a ChatGPT account".
+DEFAULT_MODEL = os.environ.get("AOS_SHIM_MODEL", "gpt-5.5")
+TIMEOUT = float(os.environ.get("AOS_SHIM_TIMEOUT", "600"))
+CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
+
+
+def flatten(messages: list[dict]) -> str:
+    """Render the chat transcript as one prompt.
+
+    System turns are hoisted to the top so instructions survive; the rest
+    keeps its order. Codex exec takes a single prompt string, so this is
+    the whole conversation, not just the last turn.
+    """
+    system = [m for m in messages if m.get("role") == "system"]
+    rest = [m for m in messages if m.get("role") != "system"]
+    parts: list[str] = []
+    for m in system:
+        parts.append(str(m.get("content", "")).strip())
+    for m in rest:
+        role = str(m.get("role", "user")).upper()
+        content = str(m.get("content", "")).strip()
+        if content:
+            parts.append(f"[{role}]\n{content}")
+    parts.append(
+        "[INSTRUCTION]\nRespond with the answer only. Do not edit files, do "
+        "not run commands, do not describe what you are about to do."
+    )
+    return "\n\n".join(p for p in parts if p)
+
+
+def main() -> int:
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        print(f"shim: stdin was not JSON: {exc}", file=sys.stderr)
+        return 2
+
+    messages = payload.get("messages") or []
+    if not isinstance(messages, list) or not messages:
+        print("shim: payload had no messages", file=sys.stderr)
+        return 2
+
+    prompt = flatten(messages)
+
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+        out_path = fh.name
+
+    argv = [
+        CODEX_BIN,
+        "exec",
+        "--model",
+        DEFAULT_MODEL,
+        # read-only: this process answers questions. The harness's own
+        # run_shell is what touches the workspace.
+        "--sandbox",
+        "read-only",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        out_path,
+        prompt,
+    ]
+
+    try:
+        completed = subprocess.run(
+            argv, capture_output=True, text=True, timeout=TIMEOUT, check=False
+        )
+    except subprocess.TimeoutExpired:
+        print(f"shim: codex timed out after {TIMEOUT}s", file=sys.stderr)
+        return 3
+    except OSError as exc:
+        print(f"shim: could not start codex: {exc}", file=sys.stderr)
+        return 3
+
+    text = ""
+    try:
+        text = Path(out_path).read_text(encoding="utf-8").strip()
+    except OSError:
+        pass
+    finally:
+        try:
+            os.unlink(out_path)
+        except OSError:
+            pass
+
+    if not text:
+        # Never fabricate a completion. An empty answer is an error, and
+        # the harness must see it as one.
+        tail = (completed.stderr or completed.stdout or "").strip()[-800:]
+        print(f"shim: codex produced no message (rc={completed.returncode})\n{tail}",
+              file=sys.stderr)
+        return 4
+
+    sys.stdout.write(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

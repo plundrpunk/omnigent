@@ -1,0 +1,36 @@
+{
+  "goal_id": "aos-phase0-truth-fixes",
+  "end_state": "The Automaton OS web UI no longer reports state it cannot evidence. Specifically, in ap-web/src: (1) WorkLoopPanel no longer renders a 'Definition of done' percentage that cannot reach 100% — the progress model is reduced to stages the app can actually observe, and the copy 'Completion stops short of 100% until the execution contract reports verifier evidence' is gone; (2) the two fabricated counts in WorkLoopPanel are removed — Math.max(1, receipt.artifact.changed_files.length) reports the true length including zero, and Math.max(input.agentsWorking, 1) reports the true observed count including zero; (3) PatternsPage's Discover fetch uses the trailing-slash path 'api/v1/memories/?tag=discover-candidate&limit=50', and loading, empty and failed are three visually distinct states — a failed fetch shows a plain error line plus a Retry control and never shows the string about the scout automaton not having shipped; (4) TrainingPage's Details table reports the empirical pair from the payload (total_successes and total_executions) rather than presenting the smoothed avg_success_rate in a column headed 'success'; (5) lib/ams.ts preserves the server's authoritative parent link — parent_execution_id falls back to the top-level field when the task blob omits it, instead of overwriting it with null; (6) FleetPage shows all dispatch edges by default and its toggle is labelled for what it does, and a failed poll marks data stale rather than continuing to animate liveness dots from cached state; (7) SystemPage's formatCell coerces numeric strings before rounding so context_pct renders as 32.5 rather than 32.507000000000005. Every change is confined to ap-web/src. The TypeScript build and the existing vitest suite both pass, and existing tests are updated rather than deleted or skipped when a change legitimately alters expected output.",
+  "evidence_criteria": {
+    "syntax_command": "npm --prefix ap-web run type-check",
+    "test_command": "npm --prefix ap-web test",
+    "evidence_artifact_required": true
+  },
+  "inspection_criteria": [
+    "No file outside ap-web/src was modified.",
+    "No test was deleted, renamed away, or marked skip/todo/only to make the suite pass.",
+    "WorkLoopPanel.tsx contains no percentage-of-done progress bar and no 'evidenced' copy.",
+    "No Math.max(..., 1) remains in WorkLoopPanel.tsx for artifact or agent counts.",
+    "PatternsPage.tsx renders distinct loading, empty and error branches, and the error branch offers a retry.",
+    "TrainingPage.tsx surfaces total_successes and total_executions from the payload.",
+    "ams.ts uses a nullish fallback to the top-level parent_execution_id.",
+    "Each change is small, local, and independently reviewable in a diff."
+  ],
+  "blocked_conditions": [
+    "The vitest suite cannot be made to pass without deleting or skipping a test that is asserting correct behaviour.",
+    "A required change would need edits outside ap-web/src.",
+    "The TypeScript build fails for a reason unrelated to these changes.",
+    "npm install / dependency resolution fails in the workspace."
+  ],
+  "budget": {
+    "max_total_tokens": 900000,
+    "max_wallclock_s": 5400,
+    "max_usd": 25.0
+  },
+  "metadata": {
+    "source": "AOS rebrand test report — Phase 0 (truth fixes)",
+    "workspace": "Omnigent repo, branch aos-simplify",
+    "scope": "ap-web/src only",
+    "note": "Phase 0 of 4. Every item removes a claim the UI cannot evidence."
+  }
+}

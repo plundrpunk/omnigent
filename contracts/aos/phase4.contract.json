@@ -1,0 +1,29 @@
+{
+  "goal_id": "aos-phase4-earn-back-dashboards",
+  "end_state": "The operator surfaces become useful rather than merely present. In ap-web/src: (1) System, Fleet, Models and Training are folded into the single Advanced tab with three sub-tabs \u2014 connections, helpers and health \u2014 written in the plain vocabulary established in phase 1; (2) Training gains a drill-down from a category to the individual routines failing within it, and an action on each, so a number on that page can be acted upon; (3) Fleet gains a legend explaining every edge and node style, a fit-to-view control, and a default view that answers 'who is working on my request right now'; (4) any list that can exceed fifty rows gains a search field, including the routines list; (5) every panel that polls displays the time its data is from, and stale data is visually distinct from live data. Changes are confined to ap-web/src. The TypeScript build and the vitest suite both pass.",
+  "evidence_criteria": {
+    "syntax_command": "npm --prefix ap-web run type-check",
+    "test_command": "npm --prefix ap-web test",
+    "evidence_artifact_required": true
+  },
+  "inspection_criteria": [
+    "Every statistic shown can be acted upon or drilled into.",
+    "No list over fifty rows lacks a search field.",
+    "Stale data is visually distinguishable from live data.",
+    "Fleet has a legend for every visual encoding it uses.",
+    "The brand identity (wolf, wordmark, theme, slogan) remains unchanged."
+  ],
+  "blocked_conditions": [
+    "A drill-down requires an endpoint that does not exist.",
+    "The vitest suite cannot pass without removing a test asserting correct behaviour."
+  ],
+  "budget": {
+    "max_total_tokens": 1400000,
+    "max_wallclock_s": 10800,
+    "max_usd": 40.0
+  },
+  "metadata": {
+    "source": "AOS rebrand report \u2014 Phase 4",
+    "depends_on": "aos-phase3-one-place-for-results"
+  }
+}

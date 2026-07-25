@@ -1,0 +1,22 @@
+{
+  "goal_id": "aos-phase2-runnable",
+  "end_state": "Patterns and Loops stop being documents and become things that run. In ap-web/src: (1) each pattern card's primary button is relabelled 'Run this' and opens a small dialog with at most three plain-English fields (the goal, and a thoroughness choice), which on submit creates a session and starts it with the pattern's prompt template filled in from those fields — it no longer copies to the clipboard and no longer navigates to an empty chat; (2) the loop builder gains a 'Save as recipe' action that persists the loop locally and surfaces it alongside the built-in patterns, and the page no longer claims the loop executes unless it actually can — if no execution path exists the subtitle states plainly that the loop is a draft to run by hand; (3) the chat landing surface shows a recipe row beneath the composer listing the built-in patterns plus any saved recipes, each one click from starting; (4) pattern honesty badges are either derived from real evidence or the claim 'badges are earned, never claimed' is removed — the page must not assert provenance it does not check. Changes are confined to ap-web/src. The TypeScript build and the vitest suite both pass, and new behaviour is covered by tests.",
+  "evidence_criteria": {
+    "syntax_command": "npm --prefix ap-web run type-check",
+    "test_command": "npm --prefix ap-web test",
+    "evidence_artifact_required": true
+  },
+  "inspection_criteria": [
+    "Clicking a pattern's primary button results in a started session, not a clipboard write.",
+    "The recipe row appears beneath the composer on the chat landing surface.",
+    "No page claims a capability it does not have.",
+    "New behaviour has test coverage."
+  ],
+  "blocked_conditions": [
+    "Starting a session from the pattern dialog requires a server endpoint that does not exist.",
+    "Persisting a saved recipe requires storage that is not available client-side.",
+    "The vitest suite cannot pass without removing a test asserting correct behaviour."
+  ],
+  "budget": { "max_total_tokens": 1600000, "max_wallclock_s": 10800, "max_usd": 45.0 },
+  "metadata": { "source": "AOS rebrand report — Phase 2", "depends_on": "aos-phase1-plain-english" }
+}

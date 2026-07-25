@@ -1,0 +1,21 @@
+{
+  "goal_id": "aos-phase3-one-place-for-results",
+  "end_state": "There is one place a user looks to find out whether their work is done. In ap-web/src: (1) the Work Loop panel is replaced by a three-state component — working, done, or stuck — where working shows one live line of what is happening with no percentage, done lists the named outputs the run produced, and stuck states in one sentence what is blocked and offers one control that unblocks it; (2) the inbox route becomes the Work page, listing everything running, everything waiting on the user, and everything finished, with each finished item showing its outputs; (3) verification is rendered as a small pass or attention marker beside a result, never as a progress bar and never as a red 'Not reported' on work that completed; (4) a first-run experience exists for a user with no sessions: four plain-English starting choices, then one running example, so the first minute produces a result rather than an empty box. Changes are confined to ap-web/src. The TypeScript build and the vitest suite both pass, and the three-state component is covered by tests including the case where no receipt is ever emitted.",
+  "evidence_criteria": {
+    "syntax_command": "npm --prefix ap-web run type-check",
+    "test_command": "npm --prefix ap-web test",
+    "evidence_artifact_required": true
+  },
+  "inspection_criteria": [
+    "A completed session with no receipt renders as done, not as unverified.",
+    "No progress percentage appears anywhere in the run status surface.",
+    "The Work page lists running, waiting and finished work.",
+    "A user with zero sessions is offered a concrete starting choice."
+  ],
+  "blocked_conditions": [
+    "Determining that a run finished requires server data the client cannot obtain.",
+    "The vitest suite cannot pass without removing a test asserting correct behaviour."
+  ],
+  "budget": { "max_total_tokens": 1600000, "max_wallclock_s": 10800, "max_usd": 45.0 },
+  "metadata": { "source": "AOS rebrand report — Phase 3", "depends_on": "aos-phase2-runnable" }
+}

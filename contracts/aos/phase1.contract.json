@@ -1,0 +1,36 @@
+{
+  "goal_id": "aos-phase1-plain-english",
+  "end_state": "Automaton OS speaks plain English and stops leading with operator dashboards. In ap-web/src: (1) a new module src/lib/copy.ts exports a single mapping from internal vocabulary to user-facing wording and every user-visible string in the six AOS pages (SystemPage, FleetPage, PatternsPage, ModelsPage, LoopsPage, TrainingPage), PageShell, Sidebar and WorkLoopPanel is routed through it \u2014 at minimum: warden is removed entirely, automaton/automata become 'saved routine'/'routines', execution becomes 'run', 'MCP servers' becomes 'connected apps', ghost dispatch becomes 'never started', last_heartbeat becomes 'last seen' with a relative time, context_pct becomes 'memory used' as a whole percent, run-weighted/unweighted become 'across all runs'/'average per routine', fail-closed becomes 'stops if a check fails', receipt becomes 'proof of what was done', gate becomes 'needs your OK', exit codes 0/3/6 become 'finished'/'paused for input'/'failed a check', and Mtok becomes 'per million words'; (2) no raw error detail from the AMS bridge reaches a user \u2014 lib/ams.ts stops JSON.stringify-ing the detail field, and every page that catches an AmsError renders a plain sentence plus a Retry control that re-runs the fetch; (3) the sidebar's primary navigation is reduced to three destinations \u2014 Do (the chat route), Work (the inbox route) and Advanced \u2014 with System, Fleet, Patterns, Models, Loops and Training reachable from inside the Advanced tab rather than as top-level items, and the existing routes continuing to work so no deep link breaks; (4) the Models role picker becomes keyboard operable \u2014 the role node gets tabIndex and an onKeyDown handler that activates on Enter and Space. Changes are confined to ap-web/src. The TypeScript build and the vitest suite both pass. THE BRAND IDENTITY IS PRESERVED EXACTLY: the Automaton OS wordmark, the wolf mascot, the gold-on-dark theme and the 'Let's do this thing!' hero remain untouched on the landing surface. This phase changes wording and navigation placement only, never the visual identity.",
+  "evidence_criteria": {
+    "required_files": [
+      "ap-web/src/lib/copy.ts"
+    ],
+    "syntax_command": "npm --prefix ap-web run type-check",
+    "test_command": "npm --prefix ap-web test",
+    "evidence_artifact_required": true
+  },
+  "inspection_criteria": [
+    "No file outside ap-web/src was modified.",
+    "No test was deleted or skipped to make the suite pass.",
+    "Every deep link that worked before still resolves.",
+    "The word 'warden' appears in no user-visible string.",
+    "Each error state offers a retry.",
+    "The wolf mascot, wordmark, gold-on-dark theme and hero slogan are unchanged.",
+    "All six operator pages are reachable from the Advanced tab."
+  ],
+  "blocked_conditions": [
+    "The nav reduction would break an existing route or test that cannot be legitimately updated.",
+    "A required change would need edits outside ap-web/src.",
+    "The vitest suite cannot pass without removing a test asserting correct behaviour.",
+    "Preserving the brand identity conflicts with a required navigation change."
+  ],
+  "budget": {
+    "max_total_tokens": 1400000,
+    "max_wallclock_s": 9000,
+    "max_usd": 40.0
+  },
+  "metadata": {
+    "source": "AOS rebrand report \u2014 Phase 1",
+    "depends_on": "aos-phase0-truth-fixes"
+  }
+}
