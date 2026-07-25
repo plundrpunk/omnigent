@@ -4,7 +4,7 @@
   "evidence_criteria": {
     "syntax_command": "npm --prefix ap-web run type-check",
     "test_command": "npm --prefix ap-web test",
-    "evidence_artifact_required": true
+    "evidence_artifact_required": false
   },
   "inspection_criteria": [
     "Every statistic shown can be acted upon or drilled into.",

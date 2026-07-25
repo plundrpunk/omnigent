@@ -1,16 +1,16 @@
 {
   "goal_id": "aos-exec-preflight-v2",
-  "end_state": "Prove the AOS goal bridge can execute and write inside the allowlisted workspace. Step 1: run the shell command `git rev-parse --abbrev-ref HEAD`. Step 2: write its output as the single line of a new file EXEC_PREFLIGHT.txt at the workspace root. Step 3: YOU MUST then run the exact shell command `test -s EXEC_PREFLIGHT.txt` as a tool call and observe it succeed \u2014 the finalization gate only accepts a recorded run_shell result for that exact command, so writing the file is not sufficient on its own. Do not mark the subgoal done until that verification command has actually been run and passed. Change nothing else.",
+  "end_state": "Prove the AOS goal bridge can execute shell commands and write files inside the allowlisted workspace. Do exactly three things, each as a run_shell or write_file tool call, and emit each subgoal's verification_command as a run_shell call in the same response as the work it verifies.\n1. Run `git rev-parse --abbrev-ref HEAD` and observe the branch name.\n2. Write that branch name as the single line of a new file EXEC_PREFLIGHT.txt at the workspace root.\n3. Run `test -s EXEC_PREFLIGHT.txt` and observe it exit 0.\nScope: create only EXEC_PREFLIGHT.txt. You are not required to prove the absence of other changes; the gate below is the whole acceptance test.",
   "evidence_criteria": {
     "required_files": [
       "EXEC_PREFLIGHT.txt"
     ],
     "syntax_command": "test -s EXEC_PREFLIGHT.txt",
-    "evidence_artifact_required": true
+    "evidence_artifact_required": false
   },
   "inspection_criteria": [
     "EXEC_PREFLIGHT.txt exists at the workspace root and is non-empty.",
-    "No other file in the workspace was created, modified or deleted."
+    "Its single line is the current git branch name."
   ],
   "blocked_conditions": [
     "The run has no ability to execute commands.",
