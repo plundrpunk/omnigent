@@ -77,7 +77,12 @@ describe("deriveWorkLoopSnapshot", () => {
     });
 
     expect(snapshot.objective).toBe("Implement the session receipt");
-    expect(snapshot.progress).toBe(75);
+    expect(snapshot.stages.map(({ label, state }) => ({ label, state }))).toEqual([
+      { label: "Intake", state: "complete" },
+      { label: "Run", state: "complete" },
+      { label: "Verify", state: "attention" },
+      { label: "Receipt", state: "complete" },
+    ]);
     expect(snapshot.overallLabel).toBe("Needs verification");
     expect(snapshot.verifierStatus).toBe("Not reported");
     expect(snapshot.latestResponseId).toBe("resp_123");
@@ -122,7 +127,12 @@ describe("deriveWorkLoopSnapshot", () => {
       fallbackObjective: "Inspect the historical run",
     });
 
-    expect(snapshot.progress).toBe(75);
+    expect(snapshot.stages.map(({ label, state }) => ({ label, state }))).toEqual([
+      { label: "Intake", state: "complete" },
+      { label: "Run", state: "attention" },
+      { label: "Verify", state: "attention" },
+      { label: "Receipt", state: "attention" },
+    ]);
     expect(snapshot.latestResponseId).toBe("resp_123");
     expect(snapshot.resultStatus).toBe("settled · status unavailable");
     expect(snapshot.overallLabel).toBe("Needs verification");
@@ -175,7 +185,12 @@ describe("deriveWorkLoopSnapshot", () => {
       agentsWorking: 0,
     });
 
-    expect(snapshot.progress).toBe(100);
+    expect(snapshot.stages.map(({ label, state }) => ({ label, state }))).toEqual([
+      { label: "Intake", state: "complete" },
+      { label: "Run", state: "complete" },
+      { label: "Verify", state: "complete" },
+      { label: "Receipt", state: "complete" },
+    ]);
     expect(snapshot.overallLabel).toBe("Verified");
     expect(snapshot.verifierStatus).toBe("Passed");
     expect(snapshot.resultStatus).toBe("completed");

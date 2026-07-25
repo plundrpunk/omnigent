@@ -152,7 +152,10 @@ for i, fx in enumerate(FIXES):
             fx["check"],
             f"Only {fx['file']} and, if needed, its co-located test were modified.",
             "No test was deleted, renamed away, or marked skip/todo/only to make the "
-            "suite pass.",
+            "suite pass. BASELINE: this repo already skips 1 test file "
+            "(src/loadtest/streamRenderBench.run.test.ts) and 2 tests before any "
+            "change. Those inherited skips are expected and are NOT a failure "
+            "condition; only an increase above that baseline is.",
             "The change is small, local, and reviewable in a diff.",
         ],
         "blocked_conditions": SRC.get("blocked_conditions", []),
