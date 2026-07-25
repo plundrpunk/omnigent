@@ -31,7 +31,12 @@ COMMON_TAIL = (
     "    Run them exactly as written. A scoped variant (adding a filename) does "
     "not satisfy the gate.\n"
     "  - Set done=true once the edit is written and both commands have been run.\n"
-    "  - Change nothing outside the single file named above."
+    "  - You MAY also update that file's co-located *.test.tsx when your change "
+    "alters an exported type or prop the test consumes — a type-check failure in "
+    "the sibling test is part of this change, not a reason to revert it. Never "
+    "delete a test, rename it away, or mark it skip/todo/only to make the gate "
+    "pass; update it to match the new contract.\n"
+    "  - Change nothing else."
 )
 
 FIXES = [
@@ -132,13 +137,13 @@ for i, fx in enumerate(FIXES):
         "end_state": (
             f"In the single file {fx['file']}, make exactly this change:\n\n"
             f"{fx['what']}\n\n"
-            f"Change nothing else, in this or any other file."
+            f"Keep the change minimal and confined to that file and its test."
             f"{COMMON_TAIL}"
         ),
         "evidence_criteria": {**GATE, "required_files": [fx["file"]]},
         "inspection_criteria": [
             fx["check"],
-            f"Only {fx['file']} was modified.",
+            f"Only {fx['file']} and, if needed, its co-located test were modified.",
             "No test was deleted, renamed away, or marked skip/todo/only to make the "
             "suite pass.",
             "The change is small, local, and reviewable in a diff.",
