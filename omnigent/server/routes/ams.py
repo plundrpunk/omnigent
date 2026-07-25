@@ -50,6 +50,12 @@ _ALLOWED_GET_PREFIXES: tuple[str, ...] = (
     "api/v1/memories",
     "api/v1/llm-providers",
     "api/v1/mcp-servers",
+    # Local coding-agent discovery: which CLI agents are installed on the
+    # host running AMS, and the model catalog each one reports.
+    # Read-only; see app/automaton_os/agent_discovery.py in agent-memory-backend.
+    "api/cli/discover",
+    "api/cli/models",
+    "api/cli/health",
     "api/warden",
     "observatory",
     "health",
