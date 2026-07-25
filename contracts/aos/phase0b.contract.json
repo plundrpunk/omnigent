@@ -1,0 +1,29 @@
+{
+  "goal_id": "aos-p0b-workloop-counts",
+  "end_state": "In the single file ap-web/src/shell/WorkLoopPanel.tsx, make exactly this change:\n\nRemove the two fabricated minimum counts. Math.max(1, receipt.artifact.changed_files.length) must report the true length including zero. Math.max(input.agentsWorking, 1) must report the true observed count including zero.\n\nChange nothing else, in this or any other file.\n\nHOW TO WORK:\n  - Read the file with read_file before changing it. Never edit a file you have not successfully read, and never invent its contents.\n  - Make the change with a write_file call containing the complete new file contents.\n  - Then run BOTH gate commands verbatim as run_shell calls:\n      npm --prefix ap-web run type-check\n      npm --prefix ap-web test\n    Run them exactly as written. A scoped variant (adding a filename) does not satisfy the gate.\n  - Set done=true once the edit is written and both commands have been run.\n  - Change nothing outside the single file named above.",
+  "evidence_criteria": {
+    "syntax_command": "npm --prefix ap-web run type-check",
+    "test_command": "npm --prefix ap-web test",
+    "evidence_artifact_required": false,
+    "required_files": [
+      "ap-web/src/shell/WorkLoopPanel.tsx"
+    ]
+  },
+  "inspection_criteria": [
+    "No Math.max(..., 1) remains in WorkLoopPanel.tsx for artifact or agent counts.",
+    "Only ap-web/src/shell/WorkLoopPanel.tsx was modified.",
+    "No test was deleted, renamed away, or marked skip/todo/only to make the suite pass.",
+    "The change is small, local, and reviewable in a diff."
+  ],
+  "blocked_conditions": [
+    "The vitest suite cannot be made to pass without deleting or skipping a test that is asserting correct behaviour.",
+    "A required change would need edits outside ap-web/src.",
+    "The TypeScript build fails for a reason unrelated to these changes.",
+    "npm install / dependency resolution fails in the workspace."
+  ],
+  "budget": {
+    "max_total_tokens": 250000,
+    "max_wallclock_s": 1800,
+    "max_usd": 8.0
+  }
+}
