@@ -36,7 +36,14 @@ COMMON_TAIL = (
     "the sibling test is part of this change, not a reason to revert it. Never "
     "delete a test, rename it away, or mark it skip/todo/only to make the gate "
     "pass; update it to match the new contract.\n"
-    "  - Change nothing else."
+    "  - Change nothing else.\n"
+    "  - Write ONE file per response. If both the source and its test need "
+    "changing, do them as two separate write_file calls in two separate turns "
+    "— never both in a single response.\n"
+    "  - If you are challenged and asked to try again, RE-EMIT the complete "
+    "write_file tool_call. A response containing only {\"done\": true}, with no "
+    "tool_calls, is never sufficient: the previous turn's proposal is not "
+    "carried forward for you. State the full call again every time."
 )
 
 FIXES = [

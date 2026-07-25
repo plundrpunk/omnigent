@@ -13,7 +13,6 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
 import type { AnyBlock } from "@/lib/blocks";
 import { checkpointResumeCommand, type GoalRun } from "@/lib/goal";
 import { Link } from "@/lib/routing";
@@ -53,7 +52,6 @@ export interface WorkLoopSnapshot {
   };
   overallLabel: string;
   overallTone: "ready" | "active" | "attention" | "blocked" | "muted";
-  progress: number;
   stages: LoopStage[];
   pendingApprovals: number;
   toolCount: number;
@@ -304,11 +302,6 @@ export function deriveWorkLoopSnapshot(input: DeriveWorkLoopInput): WorkLoopSnap
   ];
 
   const verifierPassed = receipt?.verifier.status === "passed";
-  const progress =
-    (objective ? 25 : 0) +
-    (executionStarted ? 25 : 0) +
-    (executionSettled ? 25 : 0) +
-    (verifierPassed ? 25 : 0);
 
   let overallLabel = objective ? "Ready" : "Draft";
   let overallTone: WorkLoopSnapshot["overallTone"] = objective ? "ready" : "muted";
@@ -340,7 +333,6 @@ export function deriveWorkLoopSnapshot(input: DeriveWorkLoopInput): WorkLoopSnap
     readiness,
     overallLabel,
     overallTone,
-    progress,
     stages,
     pendingApprovals,
     toolCount,
@@ -593,18 +585,21 @@ export function WorkLoopPanel({
         </section>
 
         <section className="rounded-lg border border-border bg-card p-3">
-          <div className="mb-2 flex items-center justify-between gap-2 text-xs">
-            <span className="font-medium text-foreground">Definition of done</span>
-            <span className="font-mono text-[10px] text-muted-foreground">
-              {snapshot.progress}% evidenced
-            </span>
+          <div className="mb-2 text-xs font-medium text-foreground">Observed stages</div>
+          <div className="grid grid-cols-2 gap-2">
+            {snapshot.stages.map((stage) => (
+              <div
+                key={stage.id}
+                className={cn(
+                  "flex items-center gap-2 rounded-md border px-2 py-1.5 text-xs",
+                  STAGE_TONE[stage.state],
+                )}
+              >
+                <StageIcon state={stage.state} />
+                <span className="font-medium">{stage.label}</span>
+              </div>
+            ))}
           </div>
-          <Progress value={snapshot.progress} className="h-1.5" />
-          <p className="mt-2 text-[11px] leading-4 text-muted-foreground">
-            {snapshot.progress === 100
-              ? "Harness verifier evidence is present in the versioned receipt."
-              : "Completion stops short of 100% until the execution contract reports verifier evidence."}
-          </p>
         </section>
 
         <section className="rounded-lg border border-border bg-card p-3">
