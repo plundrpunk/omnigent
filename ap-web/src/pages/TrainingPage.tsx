@@ -18,6 +18,15 @@ import { Button } from "@/components/ui/button";
 import { PageShell } from "@/components/PageShell";
 import { Spinner } from "@/components/ui/spinner";
 import { fetchBayesianStats, type BayesianStats } from "@/lib/ams";
+import {
+  acrossAllRuns,
+  averagePerRoutine,
+  needsYourOK,
+  proofOfWhatWasDone,
+  routines,
+  run,
+  stopsIfCheckFails,
+} from "@/lib/copy";
 
 const pct = (x: number | undefined) => (x == null ? "—" : `${(x * 100).toFixed(1)}%`);
 
@@ -35,8 +44,8 @@ export function TrainingPage() {
       .then((s) => {
         if (!cancelled) setStats(s);
       })
-      .catch((err: unknown) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      .catch(() => {
+        if (!cancelled) setError("Training data couldn’t be loaded; please try again.");
       });
     return () => {
       cancelled = true;
@@ -72,8 +81,11 @@ export function TrainingPage() {
       }
     >
       {error && (
-        <div className="mb-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          Couldn&apos;t load: {error}
+        <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <span>{error}</span>
+          <Button variant="outline" size="sm" onClick={() => setRefreshKey((k) => k + 1)}>
+            Retry
+          </Button>
         </div>
       )}
 
@@ -87,15 +99,15 @@ export function TrainingPage() {
             <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
               {[
                 {
-                  label: "success rate (run-weighted)",
+                  label: `success rate (${acrossAllRuns})`,
                   value: runWeightedOk ? pct(runWeighted) : "—",
                 },
                 {
-                  label: "avg per automaton (unweighted)",
+                  label: averagePerRoutine,
                   value: pct(summary.overall_success_rate),
                 },
-                { label: "runs recorded", value: summary.total_executions.toLocaleString() },
-                { label: "automata", value: String(summary.total_automata) },
+                { label: `${run}s recorded`, value: summary.total_executions.toLocaleString() },
+                { label: routines, value: String(summary.total_automata) },
               ].map((c) => (
                 <div key={c.label} className="rounded-xl border border-border bg-card p-5 text-center">
                   <div className="text-3xl font-semibold tabular-nums">{c.value}</div>
@@ -174,7 +186,7 @@ export function TrainingPage() {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-border bg-card text-left">
-                      {["category", "automata", "successes", "executions", "avg duration", ""].map((h) => (
+                      {["category", routines, "successes", `${run}s`, "avg duration", ""].map((h) => (
                         <th key={h} className="px-3 py-2 font-medium text-muted-foreground">
                           {h}
                         </th>
@@ -201,7 +213,7 @@ export function TrainingPage() {
               </div>
             )}
             <p className="mt-3 text-xs text-muted-foreground">
-              Promotions stay fail-closed behind the eval deploy gate — receipts, not vibes.
+              Each promotion {stopsIfCheckFails} and {needsYourOK} — {proofOfWhatWasDone}, not vibes.
             </p>
           </div>
         </div>
