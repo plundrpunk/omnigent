@@ -69,3 +69,5 @@ omnigent/server/static/web-ui/
 # and the install would error with "No such file or directory".
 # DAB local state directory (created by `databricks bundle deploy`).
 deploy/databricks/.databricks/
+contracts/aos/review/
+contracts/aos/*.chain.json
