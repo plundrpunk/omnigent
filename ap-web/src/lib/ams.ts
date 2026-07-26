@@ -10,11 +10,13 @@ import { hostFetch } from "@/lib/host";
 
 export class AmsError extends Error {
   readonly status?: number;
+  readonly detail?: unknown;
 
-  constructor(message: string, status?: number) {
+  constructor(message: string, status?: number, detail?: unknown) {
     super(message);
     this.name = "AmsError";
     this.status = status;
+    this.detail = detail;
   }
 }
 
@@ -25,9 +27,9 @@ export async function amsGet<T = unknown>(path: string): Promise<T> {
   if (!resp.ok) {
     const detail =
       body && typeof body === "object" && "detail" in body
-        ? JSON.stringify((body as { detail: unknown }).detail).slice(0, 300)
-        : `HTTP ${resp.status}`;
-    throw new AmsError(detail, resp.status);
+        ? (body as { detail: unknown }).detail
+        : undefined;
+    throw new AmsError("The AMS request failed. Please try again.", resp.status, detail);
   }
   return body as T;
 }
@@ -150,9 +152,9 @@ export async function amsPut<T = unknown>(path: string, body: unknown): Promise<
   if (!resp.ok) {
     const detail =
       payload && typeof payload === "object" && "detail" in payload
-        ? JSON.stringify((payload as { detail: unknown }).detail).slice(0, 300)
-        : `HTTP ${resp.status}`;
-    throw new AmsError(detail, resp.status);
+        ? (payload as { detail: unknown }).detail
+        : undefined;
+    throw new AmsError("The AMS request failed. Please try again.", resp.status, detail);
   }
   return payload as T;
 }
