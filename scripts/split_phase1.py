@@ -70,7 +70,7 @@ TAIL = (
     "      npm --prefix ap-web run type-check\n"
     "      npm --prefix ap-web test\n"
     "    Run them exactly as written; a scoped variant does not satisfy the "
-    "gate. Also run git diff --stat and confirm only the named files (and "
+    "gate. Also run git status --porcelain as a run_shell call - it shows new untracked files, which git diff does not - and confirm only the named files (and "
     "their co-located tests) changed.\n"
     "  - Set done=true once the edits are written and both gate commands have "
     "run. done is not a claim that the patch is committed - staging and "

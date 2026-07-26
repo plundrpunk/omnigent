@@ -1,0 +1,14 @@
+[
+  {
+    "letter": "a",
+    "goal_id": "aos-p1a-copy-module",
+    "run_id": "d187fd19-97a7-46c3-9ae7-e36094c2474d",
+    "status": "blocked",
+    "exit_code": 3,
+    "files": [
+      "ap-web/src/lib/copy.ts"
+    ],
+    "gates": "type-check + suite green",
+    "outcome": "parked-for-review"
+  }
+]
