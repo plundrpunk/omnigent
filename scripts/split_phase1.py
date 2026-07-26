@@ -150,7 +150,12 @@ FIXES = [
         "what": (
             PAGE_COMMON + " On this page in particular: context_pct is "
             "labelled 'memory used' and shown as a whole percent, and 'MCP "
-            "servers' becomes 'connected apps'." + VOCAB
+            "servers' becomes 'connected apps'. DESIGN CONSTRAINT: the status "
+            "tiles on this page are themselves <button> elements, and nesting "
+            "an interactive Retry inside one is invalid HTML. In the failed "
+            "state a tile must STOP being a button: render a plain non-"
+            "interactive container holding the error sentence, with Retry as "
+            "its only interactive child." + VOCAB
         ),
         "check": "SystemPage uses the plain vocabulary and a Retry error state.",
     },
