@@ -162,9 +162,10 @@ export function FleetPage() {
   const [agents, setAgents] = useState<WardenAgent[] | null>(null);
   const [executions, setExecutions] = useState<ObservatoryExecution[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [stale, setStale] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [paused, setPaused] = useState(false);
-  const [showHistory, setShowHistory] = useState(false);
+  const [showHistory, setShowHistory] = useState(true);
   const timerRef = useRef<number | null>(null);
 
   const poll = useCallback(async () => {
@@ -173,8 +174,10 @@ export function FleetPage() {
       setAgents(a);
       setExecutions(e);
       setError(null);
+      setStale(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
+      setStale(true);
     }
   }, []);
 
@@ -198,8 +201,7 @@ export function FleetPage() {
       isRoot: /prime/i.test(a.agent_name),
     }));
     const { edges: allEdges, execsByAgent } = deriveEdges(agents, executions);
-    // Default view: the living fleet + active/ghost dispatches only.
-    // "Show history" adds completed dispatch targets back in.
+    // Default view: all dispatches. The filtered view keeps active/ghost dispatches only.
     const edges = showHistory
       ? allEdges
       : allEdges.filter((e) => e.kind === "running" || e.kind === "ghost");
@@ -238,7 +240,7 @@ export function FleetPage() {
           <Badge variant="secondary">{runningCount} running</Badge>
           {ghostCount > 0 && <Badge variant="destructive">{ghostCount} ghost dispatches</Badge>}
           <Button variant="outline" size="sm" onClick={() => setShowHistory((v) => !v)}>
-            {showHistory ? "Hide history" : "Show history"}
+            {showHistory ? "Show active only" : "Show all dispatches"}
           </Button>
           <Button variant="outline" size="sm" onClick={() => setPaused((p) => !p)}>
             {paused ? "Resume" : "Pause"}
@@ -311,7 +313,9 @@ export function FleetPage() {
                   />
                   {n.alive && (
                     <circle cx={12} cy={NODE_H / 2} r={4} className="fill-emerald-500">
-                      <animate attributeName="opacity" values="1;0.3;1" dur="2s" repeatCount="indefinite" />
+                      {!stale && (
+                        <animate attributeName="opacity" values="1;0.3;1" dur="2s" repeatCount="indefinite" />
+                      )}
                     </circle>
                   )}
                   <text
