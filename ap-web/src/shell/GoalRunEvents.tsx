@@ -1,3 +1,5 @@
+import { useEffect, useRef } from "react";
+
 import { cn } from "@/lib/utils";
 import type { GoalEvent } from "@/lib/goalEvents";
 
@@ -8,6 +10,33 @@ import type { GoalEvent } from "@/lib/goalEvents";
  * decided, and every tool call with its exit code -- so a blocked run can
  * be understood from the panel instead of by reading the artifact JSON.
  */
+
+/**
+ * Keep a scroll container pinned to its newest content.
+ *
+ * A live run appends constantly, so the feed follows the tail by default.
+ * It stops following the moment the reader scrolls up — reading back through
+ * a blocked run should not be yanked away by the next event — and resumes
+ * once they return to the bottom.
+ */
+function useStickToBottom(dep: number) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const stuck = useRef(true);
+
+  const onScroll = () => {
+    const el = ref.current;
+    if (!el) return;
+    // A few px of slack: fractional scroll heights never land exactly.
+    stuck.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  };
+
+  useEffect(() => {
+    const el = ref.current;
+    if (el && stuck.current) el.scrollTop = el.scrollHeight;
+  }, [dep]);
+
+  return { ref, onScroll };
+}
 
 const ROLE_TONE: Record<string, string> = {
   planner: "text-purple-400",
@@ -108,6 +137,8 @@ function EventRow({ event }: { event: GoalEvent }) {
 }
 
 export function GoalRunEvents({ events }: { events: GoalEvent[] | null }) {
+  const { ref, onScroll } = useStickToBottom(events?.length ?? 0);
+
   if (events === null) {
     return (
       <div className="px-2 py-1.5 text-[10px] text-muted-foreground">
@@ -124,6 +155,8 @@ export function GoalRunEvents({ events }: { events: GoalEvent[] | null }) {
   }
   return (
     <div
+      ref={ref}
+      onScroll={onScroll}
       data-testid="goal-run-events"
       className="max-h-80 overflow-y-auto rounded border border-border/50 bg-background/40 px-1.5 py-1"
     >
