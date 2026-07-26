@@ -280,22 +280,26 @@ interface CandidateMemory {
 
 function DiscoverFeed() {
   const [candidates, setCandidates] = useState<CandidateMemory[] | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [retryKey, setRetryKey] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
+    setCandidates(null);
+    setFailed(false);
     void amsGet<{ memories?: CandidateMemory[]; results?: CandidateMemory[] }>(
-      "api/v1/memories?tag=discover-candidate&limit=50",
+      "api/v1/memories/?tag=discover-candidate&limit=50",
     )
       .then((body) => {
         if (!cancelled) setCandidates(body.memories ?? body.results ?? []);
       })
       .catch(() => {
-        if (!cancelled) setCandidates([]);
+        if (!cancelled) setFailed(true);
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [retryKey]);
 
   return (
     <div className="space-y-3">
@@ -303,7 +307,22 @@ function DiscoverFeed() {
         Scouted candidates land here weekly and wait for defenseclaw vetting — nothing
         joins the library without a receipt.
       </p>
-      {candidates && candidates.length > 0 ? (
+      {failed ? (
+        <div className="space-y-2">
+          <p className="text-sm text-destructive">Could not load Discover candidates.</p>
+          <Button variant="outline" size="sm" onClick={() => setRetryKey((key) => key + 1)}>
+            Retry
+          </Button>
+        </div>
+      ) : candidates === null ? (
+        <div className="rounded-xl border border-border p-8 text-center text-sm text-muted-foreground">
+          Loading Discover candidates…
+        </div>
+      ) : candidates.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
+          No candidates are awaiting vetting.
+        </div>
+      ) : (
         <ul className="space-y-2">
           {candidates.map((c, i) => (
             <li key={c.memory_id ?? i} className="rounded-lg border border-border bg-card p-3">
@@ -317,11 +336,6 @@ function DiscoverFeed() {
             </li>
           ))}
         </ul>
-      ) : (
-        <div className="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
-          Quiet for now — the scout automaton hasn&apos;t shipped yet. Its weekly finds will
-          appear here.
-        </div>
       )}
     </div>
   );
