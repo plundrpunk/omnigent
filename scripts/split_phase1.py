@@ -229,13 +229,21 @@ FIXES = [
             "Create the NEW page ap-web/src/pages/AdvancedPage.tsx: a plain "
             "page that presents the six operator destinations (System, "
             "Fleet, Patterns, Models, Loops, Training) as links or tabs, "
-            "described in the plain vocabulary. Then register a route for "
+            "described in the plain vocabulary, PLUS an Agents section that "
+            "lists the locally discovered coding agents from the existing "
+            "GET /coding-agents discovery endpoint - read "
+            "omnigent/server/routes/coding_agents.py first for the exact "
+            "mounted path and response shape; a simple name/kind/status "
+            "list is enough. This gives the ACP-discovered agents their "
+            "first visible home in the product. Then register a route for "
             "it in ap-web/src/App.tsx at path '/advanced'. This step is "
             "purely ADDITIVE: no existing route is removed or renamed, so "
             "every deep link keeps working. Two files - write them in two "
             "separate turns." + VOCAB
         ),
-        "check": "AdvancedPage exists, /advanced routes to it, no route removed.",
+        "check": "AdvancedPage exists with the six destinations and an "
+        "Agents section fed by coding-agent discovery; /advanced routes to it; "
+        "no route removed.",
     },
     {
         "letter": "l",
