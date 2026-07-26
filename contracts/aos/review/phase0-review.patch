@@ -1,0 +1,338 @@
+commit 15d2ef05d803dd5da4b285ee5809227cc4f363a3
+Author: Drew <andrewrutledge1@gmail.com>
+Date:   Sat Jul 25 19:33:18 2026 -0400
+
+    fix(phase0): one file per response; re-emit write on challenge
+
+diff --git a/ap-web/src/shell/WorkLoopPanel.tsx b/ap-web/src/shell/WorkLoopPanel.tsx
+index b2ca3e4e..a22e8b12 100644
+--- a/ap-web/src/shell/WorkLoopPanel.tsx
++++ b/ap-web/src/shell/WorkLoopPanel.tsx
+@@ -13,7 +13,6 @@ import {
+ } from "lucide-react";
+ 
+ import { Button } from "@/components/ui/button";
+-import { Progress } from "@/components/ui/progress";
+ import type { AnyBlock } from "@/lib/blocks";
+ import { checkpointResumeCommand, type GoalRun } from "@/lib/goal";
+ import { Link } from "@/lib/routing";
+@@ -53,7 +52,6 @@ export interface WorkLoopSnapshot {
+   };
+   overallLabel: string;
+   overallTone: "ready" | "active" | "attention" | "blocked" | "muted";
+-  progress: number;
+   stages: LoopStage[];
+   pendingApprovals: number;
+   toolCount: number;
+@@ -304,11 +302,6 @@ export function deriveWorkLoopSnapshot(input: DeriveWorkLoopInput): WorkLoopSnap
+   ];
+ 
+   const verifierPassed = receipt?.verifier.status === "passed";
+-  const progress =
+-    (objective ? 25 : 0) +
+-    (executionStarted ? 25 : 0) +
+-    (executionSettled ? 25 : 0) +
+-    (verifierPassed ? 25 : 0);
+ 
+   let overallLabel = objective ? "Ready" : "Draft";
+   let overallTone: WorkLoopSnapshot["overallTone"] = objective ? "ready" : "muted";
+@@ -340,7 +333,6 @@ export function deriveWorkLoopSnapshot(input: DeriveWorkLoopInput): WorkLoopSnap
+     readiness,
+     overallLabel,
+     overallTone,
+-    progress,
+     stages,
+     pendingApprovals,
+     toolCount,
+@@ -593,18 +585,21 @@ export function WorkLoopPanel({
+         </section>
+ 
+         <section className="rounded-lg border border-border bg-card p-3">
+-          <div className="mb-2 flex items-center justify-between gap-2 text-xs">
+-            <span className="font-medium text-foreground">Definition of done</span>
+-            <span className="font-mono text-[10px] text-muted-foreground">
+-              {snapshot.progress}% evidenced
+-            </span>
++          <div className="mb-2 text-xs font-medium text-foreground">Observed stages</div>
++          <div className="grid grid-cols-2 gap-2">
++            {snapshot.stages.map((stage) => (
++              <div
++                key={stage.id}
++                className={cn(
++                  "flex items-center gap-2 rounded-md border px-2 py-1.5 text-xs",
++                  STAGE_TONE[stage.state],
++                )}
++              >
++                <StageIcon state={stage.state} />
++                <span className="font-medium">{stage.label}</span>
++              </div>
++            ))}
+           </div>
+-          <Progress value={snapshot.progress} className="h-1.5" />
+-          <p className="mt-2 text-[11px] leading-4 text-muted-foreground">
+-            {snapshot.progress === 100
+-              ? "Harness verifier evidence is present in the versioned receipt."
+-              : "Completion stops short of 100% until the execution contract reports verifier evidence."}
+-          </p>
+         </section>
+ 
+         <section className="rounded-lg border border-border bg-card p-3">
+commit 51bf68fe63dd9636df0dd7625d856998a6c8b12b
+Author: Drew <andrewrutledge1@gmail.com>
+Date:   Sat Jul 25 19:44:22 2026 -0400
+
+    feat(ap-web): replace unreachable progress percentage with observable stages (authored by AOS p0a)
+
+diff --git a/ap-web/src/shell/WorkLoopPanel.test.tsx b/ap-web/src/shell/WorkLoopPanel.test.tsx
+index 31164ca8..2215b140 100644
+--- a/ap-web/src/shell/WorkLoopPanel.test.tsx
++++ b/ap-web/src/shell/WorkLoopPanel.test.tsx
+@@ -77,7 +77,12 @@ describe("deriveWorkLoopSnapshot", () => {
+     });
+ 
+     expect(snapshot.objective).toBe("Implement the session receipt");
+-    expect(snapshot.progress).toBe(75);
++    expect(snapshot.stages.map(({ label, state }) => ({ label, state }))).toEqual([
++      { label: "Intake", state: "complete" },
++      { label: "Run", state: "complete" },
++      { label: "Verify", state: "attention" },
++      { label: "Receipt", state: "complete" },
++    ]);
+     expect(snapshot.overallLabel).toBe("Needs verification");
+     expect(snapshot.verifierStatus).toBe("Not reported");
+     expect(snapshot.latestResponseId).toBe("resp_123");
+@@ -122,7 +127,12 @@ describe("deriveWorkLoopSnapshot", () => {
+       fallbackObjective: "Inspect the historical run",
+     });
+ 
+-    expect(snapshot.progress).toBe(75);
++    expect(snapshot.stages.map(({ label, state }) => ({ label, state }))).toEqual([
++      { label: "Intake", state: "complete" },
++      { label: "Run", state: "attention" },
++      { label: "Verify", state: "attention" },
++      { label: "Receipt", state: "attention" },
++    ]);
+     expect(snapshot.latestResponseId).toBe("resp_123");
+     expect(snapshot.resultStatus).toBe("settled · status unavailable");
+     expect(snapshot.overallLabel).toBe("Needs verification");
+@@ -175,7 +185,12 @@ describe("deriveWorkLoopSnapshot", () => {
+       agentsWorking: 0,
+     });
+ 
+-    expect(snapshot.progress).toBe(100);
++    expect(snapshot.stages.map(({ label, state }) => ({ label, state }))).toEqual([
++      { label: "Intake", state: "complete" },
++      { label: "Run", state: "complete" },
++      { label: "Verify", state: "complete" },
++      { label: "Receipt", state: "complete" },
++    ]);
+     expect(snapshot.overallLabel).toBe("Verified");
+     expect(snapshot.verifierStatus).toBe("Passed");
+     expect(snapshot.resultStatus).toBe("completed");
+commit 3f66a96869cb09a3997dab7ef928730b57a52c5f
+Author: Drew <andrewrutledge1@gmail.com>
+Date:   Sat Jul 25 20:06:40 2026 -0400
+
+    feat(ap-web): aos-p0c-patterns-discover
+    
+    Authored by AOS. Gates verified locally: type-check + suite green.
+    Harness status: completed (exit 0).
+
+diff --git a/ap-web/src/pages/PatternsPage.tsx b/ap-web/src/pages/PatternsPage.tsx
+index 2f822617..cb325f5a 100644
+--- a/ap-web/src/pages/PatternsPage.tsx
++++ b/ap-web/src/pages/PatternsPage.tsx
+@@ -280,22 +280,26 @@ interface CandidateMemory {
+ 
+ function DiscoverFeed() {
+   const [candidates, setCandidates] = useState<CandidateMemory[] | null>(null);
++  const [failed, setFailed] = useState(false);
++  const [retryKey, setRetryKey] = useState(0);
+ 
+   useEffect(() => {
+     let cancelled = false;
++    setCandidates(null);
++    setFailed(false);
+     void amsGet<{ memories?: CandidateMemory[]; results?: CandidateMemory[] }>(
+-      "api/v1/memories?tag=discover-candidate&limit=50",
++      "api/v1/memories/?tag=discover-candidate&limit=50",
+     )
+       .then((body) => {
+         if (!cancelled) setCandidates(body.memories ?? body.results ?? []);
+       })
+       .catch(() => {
+-        if (!cancelled) setCandidates([]);
++        if (!cancelled) setFailed(true);
+       });
+     return () => {
+       cancelled = true;
+     };
+-  }, []);
++  }, [retryKey]);
+ 
+   return (
+     <div className="space-y-3">
+@@ -303,7 +307,22 @@ function DiscoverFeed() {
+         Scouted candidates land here weekly and wait for defenseclaw vetting — nothing
+         joins the library without a receipt.
+       </p>
+-      {candidates && candidates.length > 0 ? (
++      {failed ? (
++        <div className="space-y-2">
++          <p className="text-sm text-destructive">Could not load Discover candidates.</p>
++          <Button variant="outline" size="sm" onClick={() => setRetryKey((key) => key + 1)}>
++            Retry
++          </Button>
++        </div>
++      ) : candidates === null ? (
++        <div className="rounded-xl border border-border p-8 text-center text-sm text-muted-foreground">
++          Loading Discover candidates…
++        </div>
++      ) : candidates.length === 0 ? (
++        <div className="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
++          No candidates are awaiting vetting.
++        </div>
++      ) : (
+         <ul className="space-y-2">
+           {candidates.map((c, i) => (
+             <li key={c.memory_id ?? i} className="rounded-lg border border-border bg-card p-3">
+@@ -317,11 +336,6 @@ function DiscoverFeed() {
+             </li>
+           ))}
+         </ul>
+-      ) : (
+-        <div className="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted-foreground">
+-          Quiet for now — the scout automaton hasn&apos;t shipped yet. Its weekly finds will
+-          appear here.
+-        </div>
+       )}
+     </div>
+   );
+commit 3c6b9e955b9f6831548d4268c8153f12880e85fd
+Author: Drew <andrewrutledge1@gmail.com>
+Date:   Sat Jul 25 20:17:30 2026 -0400
+
+    feat(ap-web): aos-p0d-training-empirical
+    
+    Authored by AOS. Gates verified locally: type-check + suite green.
+    Harness status: completed (exit 0).
+
+diff --git a/ap-web/src/pages/TrainingPage.tsx b/ap-web/src/pages/TrainingPage.tsx
+index 0543ff6b..1d86bb19 100644
+--- a/ap-web/src/pages/TrainingPage.tsx
++++ b/ap-web/src/pages/TrainingPage.tsx
+@@ -174,7 +174,7 @@ export function TrainingPage() {
+                 <table className="w-full text-sm">
+                   <thead>
+                     <tr className="border-b border-border bg-card text-left">
+-                      {["category", "automata", "executions", "success", "avg duration", ""].map((h) => (
++                      {["category", "automata", "successes", "executions", "avg duration", ""].map((h) => (
+                         <th key={h} className="px-3 py-2 font-medium text-muted-foreground">
+                           {h}
+                         </th>
+@@ -186,8 +186,8 @@ export function TrainingPage() {
+                       <tr key={c.category} className="border-b border-border/50 last:border-0">
+                         <td className="px-3 py-2 font-medium">{c.category}</td>
+                         <td className="px-3 py-2 tabular-nums">{c.automata_count}</td>
++                        <td className="px-3 py-2 tabular-nums">{c.total_successes.toLocaleString()}</td>
+                         <td className="px-3 py-2 tabular-nums">{c.total_executions.toLocaleString()}</td>
+-                        <td className="px-3 py-2 tabular-nums">{pct(c.avg_success_rate)}</td>
+                         <td className="px-3 py-2 tabular-nums">
+                           {c.avg_duration_ms != null ? `${Math.round(c.avg_duration_ms)}ms` : "—"}
+                         </td>
+commit 9be59cf5f9de4c95476671c40453a1d4202f3b2a
+Author: Drew <andrewrutledge1@gmail.com>
+Date:   Sat Jul 25 20:34:50 2026 -0400
+
+    feat(ap-web): aos-p0f-fleet-edges
+    
+    Authored by AOS. Gates verified locally: type-check + suite green.
+    Harness status: blocked (exit 3).
+
+diff --git a/ap-web/src/pages/FleetPage.tsx b/ap-web/src/pages/FleetPage.tsx
+index 2a4fdd85..37194641 100644
+--- a/ap-web/src/pages/FleetPage.tsx
++++ b/ap-web/src/pages/FleetPage.tsx
+@@ -162,9 +162,10 @@ export function FleetPage() {
+   const [agents, setAgents] = useState<WardenAgent[] | null>(null);
+   const [executions, setExecutions] = useState<ObservatoryExecution[]>([]);
+   const [error, setError] = useState<string | null>(null);
++  const [stale, setStale] = useState(false);
+   const [selected, setSelected] = useState<string | null>(null);
+   const [paused, setPaused] = useState(false);
+-  const [showHistory, setShowHistory] = useState(false);
++  const [showHistory, setShowHistory] = useState(true);
+   const timerRef = useRef<number | null>(null);
+ 
+   const poll = useCallback(async () => {
+@@ -173,8 +174,10 @@ export function FleetPage() {
+       setAgents(a);
+       setExecutions(e);
+       setError(null);
++      setStale(false);
+     } catch (err) {
+       setError(err instanceof Error ? err.message : String(err));
++      setStale(true);
+     }
+   }, []);
+ 
+@@ -198,8 +201,7 @@ export function FleetPage() {
+       isRoot: /prime/i.test(a.agent_name),
+     }));
+     const { edges: allEdges, execsByAgent } = deriveEdges(agents, executions);
+-    // Default view: the living fleet + active/ghost dispatches only.
+-    // "Show history" adds completed dispatch targets back in.
++    // Default view: all dispatches. The filtered view keeps active/ghost dispatches only.
+     const edges = showHistory
+       ? allEdges
+       : allEdges.filter((e) => e.kind === "running" || e.kind === "ghost");
+@@ -238,7 +240,7 @@ export function FleetPage() {
+           <Badge variant="secondary">{runningCount} running</Badge>
+           {ghostCount > 0 && <Badge variant="destructive">{ghostCount} ghost dispatches</Badge>}
+           <Button variant="outline" size="sm" onClick={() => setShowHistory((v) => !v)}>
+-            {showHistory ? "Hide history" : "Show history"}
++            {showHistory ? "Show active only" : "Show all dispatches"}
+           </Button>
+           <Button variant="outline" size="sm" onClick={() => setPaused((p) => !p)}>
+             {paused ? "Resume" : "Pause"}
+@@ -311,7 +313,9 @@ export function FleetPage() {
+                   />
+                   {n.alive && (
+                     <circle cx={12} cy={NODE_H / 2} r={4} className="fill-emerald-500">
+-                      <animate attributeName="opacity" values="1;0.3;1" dur="2s" repeatCount="indefinite" />
++                      {!stale && (
++                        <animate attributeName="opacity" values="1;0.3;1" dur="2s" repeatCount="indefinite" />
++                      )}
+                     </circle>
+                   )}
+                   <text
+commit 97dc2c7f1299791c21d5914dadb83b084f34367b
+Author: Drew <andrewrutledge1@gmail.com>
+Date:   Sat Jul 25 20:39:54 2026 -0400
+
+    feat(ap-web): aos-p0g-system-numeric
+    
+    Authored by AOS. Gates verified locally: type-check + suite green.
+    Harness status: completed (exit 0).
+
+diff --git a/ap-web/src/pages/SystemPage.tsx b/ap-web/src/pages/SystemPage.tsx
+index df8fa0e8..4bbaa74b 100644
+--- a/ap-web/src/pages/SystemPage.tsx
++++ b/ap-web/src/pages/SystemPage.tsx
+@@ -68,7 +68,15 @@ function chooseColumns(rows: Record<string, unknown>[], max = 5): string[] {
+ function formatCell(value: unknown): string {
+   if (value == null) return "";
+   if (typeof value === "boolean") return value ? "yes" : "no";
+-  if (typeof value === "number") return Number.isInteger(value) ? String(value) : value.toFixed(2);
++  const numericValue =
++    typeof value === "number"
++      ? value
++      : typeof value === "string" && value.trim() !== ""
++        ? Number(value)
++        : Number.NaN;
++  if (Number.isFinite(numericValue)) {
++    return Number.isInteger(numericValue) ? String(numericValue) : String(Math.round(numericValue * 10) / 10);
++  }
+   const s = String(value);
+   return s.length > 100 ? `${s.slice(0, 97)}…` : s;
+ }

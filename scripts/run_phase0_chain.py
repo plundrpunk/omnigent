@@ -109,7 +109,7 @@ def main():
         else:
             ok, why = gates_green()
             entry["gates"] = why
-            if ok:
+            if ok and status == "completed":
                 sh("git", "add", "-A", "ap-web")
                 msg = (f"feat(ap-web): {gid}\n\n"
                        f"Authored by AOS. Gates verified locally: {why}.\n"
@@ -117,9 +117,20 @@ def main():
                 sh("git", "-c", "user.name=Drew",
                    "-c", "user.email=andrewrutledge1@gmail.com",
                    "commit", "-q", "-m", msg, "--no-verify")
-                entry["outcome"] = "committed" if status == "completed" \
-                    else "committed-despite-block"
+                entry["outcome"] = "committed"
                 print(f"[{letter}] COMMITTED ({why})", flush=True)
+            elif ok:
+                # Green gates prove the change compiles and passes tests,
+                # not that it satisfies the contract. Park a blocked
+                # run's diff for human review instead of committing it.
+                review_dir = REPO / "contracts/aos/review"
+                review_dir.mkdir(parents=True, exist_ok=True)
+                (review_dir / f"{gid}.patch").write_text(
+                    sh("git", "diff", "ap-web").stdout
+                )
+                sh("git", "checkout", "--", "ap-web")
+                entry["outcome"] = "parked-for-review"
+                print(f"[{letter}] parked for review: {why}", flush=True)
             else:
                 sh("git", "checkout", "--", "ap-web")
                 entry["outcome"] = "reverted"
