@@ -95,7 +95,9 @@ export function parseExecutionTask(exec: ObservatoryExecution): ObservatoryExecu
       return {
         ...exec,
         parent_execution_id:
-          typeof obj.parent_execution_id === "string" ? obj.parent_execution_id : null,
+          typeof obj.parent_execution_id === "string"
+            ? obj.parent_execution_id
+            : exec.parent_execution_id,
         task_summary: typeof obj.task === "string" ? obj.task : exec.task,
       };
     }
