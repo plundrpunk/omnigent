@@ -68,7 +68,15 @@ function chooseColumns(rows: Record<string, unknown>[], max = 5): string[] {
 function formatCell(value: unknown): string {
   if (value == null) return "";
   if (typeof value === "boolean") return value ? "yes" : "no";
-  if (typeof value === "number") return Number.isInteger(value) ? String(value) : value.toFixed(2);
+  const numericValue =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim() !== ""
+        ? Number(value)
+        : Number.NaN;
+  if (Number.isFinite(numericValue)) {
+    return Number.isInteger(numericValue) ? String(numericValue) : String(Math.round(numericValue * 10) / 10);
+  }
   const s = String(value);
   return s.length > 100 ? `${s.slice(0, 97)}…` : s;
 }
