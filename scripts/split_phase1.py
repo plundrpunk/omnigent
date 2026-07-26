@@ -95,6 +95,15 @@ TAIL = (
     "  - BASELINE: the suite already skips 1 test file "
     "(src/loadtest/streamRenderBench.run.test.ts) and 2 tests. Inherited "
     "skips are expected; only an increase above that baseline is a failure.\n"
+    "  - LARGE FILES - SURGICAL EDIT OPTION: when a named file is too large to "
+    "rewrite faithfully in one response (roughly 25KB or more), do NOT escalate "
+    "and do NOT attempt the full-file write. Instead perform the change as a "
+    "run_shell call executing a python3 heredoc that does exact-string "
+    "replacement on the file (read the file first so your match strings are "
+    "exact; assert each old string occurs exactly once; write the file back). "
+    "Then run git diff -- <file> as a run_shell call and inspect that the "
+    "diff is precisely the intended change. A verified surgical edit fully "
+    "satisfies a write requirement.\n"
     "  - Change nothing else."
 )
 

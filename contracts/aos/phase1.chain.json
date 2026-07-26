@@ -1,26 +1,41 @@
 [
   {
-    "letter": "a",
-    "goal_id": "aos-p1a-copy-module",
-    "run_id": "d187fd19-97a7-46c3-9ae7-e36094c2474d",
+    "letter": "h",
+    "goal_id": "aos-p1h-training-copy",
+    "run_id": "c3ec1304-263e-45c4-8501-aec633fd02a2",
     "status": "blocked",
     "exit_code": 3,
     "files": [
-      "ap-web/src/lib/copy.ts"
+      "p-web/src/pages/TrainingPage.tsx"
     ],
     "gates": "type-check + suite green",
     "outcome": "parked-for-review"
   },
   {
-    "letter": "b",
-    "goal_id": "aos-p1b-ams-error-detail",
-    "run_id": "36df0552-57b5-451b-8b40-a19dd92c0ef3",
+    "letter": "i",
+    "goal_id": "aos-p1i-pageshell-copy",
+    "run_id": "b78bb157-907b-46e8-984f-56abe0a3c75a",
     "status": "completed",
     "exit_code": 0,
-    "files": [
-      "p-web/src/lib/ams.ts"
-    ],
-    "gates": "type-check + suite green",
-    "outcome": "committed"
+    "files": [],
+    "outcome": "no-op"
+  },
+  {
+    "letter": "j",
+    "goal_id": "aos-p1j-workloop-copy",
+    "run_id": "d6a16112-af63-4b40-8d38-f83839cb93a6",
+    "status": "blocked",
+    "exit_code": 3,
+    "files": [],
+    "outcome": "no-op"
+  },
+  {
+    "letter": "k",
+    "goal_id": "aos-p1k-advanced-page",
+    "run_id": "2990bf5b-2553-4c38-b18a-589cfe700113",
+    "status": "error",
+    "exit_code": -15,
+    "files": [],
+    "outcome": "no-op"
   }
 ]
