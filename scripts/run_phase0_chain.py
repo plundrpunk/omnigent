@@ -74,12 +74,19 @@ def dirty() -> list[str]:
 
 
 def main():
-    letters = sys.argv[1:] or list("bcdefg")
+    args = sys.argv[1:]
+    prefix = next((a for a in args if a.startswith("phase")), "phase0")
+    letters = [a for a in args if not a.startswith("phase")]
+    if not letters:
+        letters = sorted(
+            p.stem[len(prefix)]
+            for p in (REPO / "contracts/aos").glob(f"{prefix}?.contract.json")
+        )
     template = json.loads(BODY.read_text())
     results = []
 
     for letter in letters:
-        cpath = REPO / f"contracts/aos/phase0{letter}.contract.json"
+        cpath = REPO / f"contracts/aos/{prefix}{letter}.contract.json"
         if not cpath.exists():
             print(f"[{letter}] no contract at {cpath}, skipping")
             continue
@@ -137,7 +144,9 @@ def main():
                 print(f"[{letter}] reverted: {why}", flush=True)
 
         results.append(entry)
-        JOURNAL.write_text(json.dumps(results, indent=2))
+        (REPO / f"contracts/aos/{prefix}.chain.json").write_text(
+            json.dumps(results, indent=2)
+        )
 
     print("\n=== chain summary ===")
     for r in results:
