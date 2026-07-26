@@ -174,7 +174,7 @@ export function TrainingPage() {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-border bg-card text-left">
-                      {["category", "automata", "executions", "success", "avg duration", ""].map((h) => (
+                      {["category", "automata", "successes", "executions", "avg duration", ""].map((h) => (
                         <th key={h} className="px-3 py-2 font-medium text-muted-foreground">
                           {h}
                         </th>
@@ -186,8 +186,8 @@ export function TrainingPage() {
                       <tr key={c.category} className="border-b border-border/50 last:border-0">
                         <td className="px-3 py-2 font-medium">{c.category}</td>
                         <td className="px-3 py-2 tabular-nums">{c.automata_count}</td>
+                        <td className="px-3 py-2 tabular-nums">{c.total_successes.toLocaleString()}</td>
                         <td className="px-3 py-2 tabular-nums">{c.total_executions.toLocaleString()}</td>
-                        <td className="px-3 py-2 tabular-nums">{pct(c.avg_success_rate)}</td>
                         <td className="px-3 py-2 tabular-nums">
                           {c.avg_duration_ms != null ? `${Math.round(c.avg_duration_ms)}ms` : "—"}
                         </td>
