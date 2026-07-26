@@ -10,5 +10,17 @@
     ],
     "gates": "type-check + suite green",
     "outcome": "parked-for-review"
+  },
+  {
+    "letter": "b",
+    "goal_id": "aos-p1b-ams-error-detail",
+    "run_id": "36df0552-57b5-451b-8b40-a19dd92c0ef3",
+    "status": "completed",
+    "exit_code": 0,
+    "files": [
+      "p-web/src/lib/ams.ts"
+    ],
+    "gates": "type-check + suite green",
+    "outcome": "committed"
   }
 ]

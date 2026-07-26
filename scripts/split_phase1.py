@@ -60,6 +60,13 @@ VOCAB = (
 
 TAIL = (
     "\n\nHOW TO WORK:\n"
+    "  - FIRST RESPONSE: propose, in ONE turn, every provenance tool call this "
+    "contract needs - a read_file for each named file, plus a run_shell "
+    "find <dir> -maxdepth 1 -name <Stem>*.test.tsx -print for each named "
+    "file's co-located test - and set done=true on that same turn. Never "
+    "split discovery across turns: a turn that requests only part of the "
+    "evidence strands the run, because follow-up revisions cannot execute "
+    "tool calls.\n"
     "  - Read every named file with read_file before changing it. Never edit "
     "a file you have not successfully read, and never invent its contents.\n"
     "  - Make each change with a write_file call containing the complete new "
