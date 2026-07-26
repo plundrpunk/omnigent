@@ -1,0 +1,68 @@
+[
+  {
+    "letter": "b",
+    "goal_id": "aos-p0b-workloop-counts",
+    "run_id": "f0e4133b-6fc2-4370-ab21-fbb046c3c840",
+    "status": "completed",
+    "exit_code": 0,
+    "files": [],
+    "outcome": "no-op"
+  },
+  {
+    "letter": "c",
+    "goal_id": "aos-p0c-patterns-discover",
+    "run_id": "7ff9d459-45a6-45db-9b4c-ef2c67321481",
+    "status": "completed",
+    "exit_code": 0,
+    "files": [
+      "p-web/src/pages/PatternsPage.tsx"
+    ],
+    "gates": "type-check + suite green",
+    "outcome": "committed"
+  },
+  {
+    "letter": "d",
+    "goal_id": "aos-p0d-training-empirical",
+    "run_id": "2774e91c-1116-4169-b48b-650c4b935146",
+    "status": "completed",
+    "exit_code": 0,
+    "files": [
+      "p-web/src/pages/TrainingPage.tsx"
+    ],
+    "gates": "type-check + suite green",
+    "outcome": "committed"
+  },
+  {
+    "letter": "e",
+    "goal_id": "aos-p0e-ams-parent-link",
+    "run_id": "625c7065-5af3-4281-8987-0b7400102f9c",
+    "status": "blocked",
+    "exit_code": 3,
+    "files": [],
+    "outcome": "no-op"
+  },
+  {
+    "letter": "f",
+    "goal_id": "aos-p0f-fleet-edges",
+    "run_id": "b726afca-cef5-4740-8a8e-2fd9d02f7e00",
+    "status": "blocked",
+    "exit_code": 3,
+    "files": [
+      "p-web/src/pages/FleetPage.tsx"
+    ],
+    "gates": "type-check + suite green",
+    "outcome": "committed-despite-block"
+  },
+  {
+    "letter": "g",
+    "goal_id": "aos-p0g-system-numeric",
+    "run_id": "fe6f2b79-0ee2-4955-b14d-a161e2ad586c",
+    "status": "completed",
+    "exit_code": 0,
+    "files": [
+      "p-web/src/pages/SystemPage.tsx"
+    ],
+    "gates": "type-check + suite green",
+    "outcome": "committed"
+  }
+]
