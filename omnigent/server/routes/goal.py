@@ -188,6 +188,7 @@ _LIMIT_FLAGS: dict[str, str] = {
     "max_tool_calls": "--max-tool-calls",
     "max_reasoning_steps": "--max-reasoning-steps",
     "max_tokens": "--max-tokens",
+    "max_trace_backs": "--max-trace-backs",
     "exec_max_output_bytes": "--exec-max-output-bytes",
     "timeout": "--timeout",
 }
@@ -201,6 +202,7 @@ _LIMIT_MAX: dict[str, int] = {
     "max_tool_calls": 2000,
     "max_reasoning_steps": 600,
     "max_tokens": 4_000_000,
+    "max_trace_backs": 100,
     "exec_max_output_bytes": 2_000_000,
     "timeout": 7200,
 }
