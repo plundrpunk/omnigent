@@ -16,13 +16,9 @@ import {
   ChevronRightIcon,
   CircleStopIcon,
   GitBranchIcon,
-  BookOpenIcon,
-  CpuIcon,
-  GraduationCapIcon,
   InboxIcon,
   LayersIcon,
   Loader2Icon,
-  NetworkIcon,
   MoreHorizontalIcon,
   PanelRightOpenIcon,
   PencilIcon,
@@ -31,7 +27,6 @@ import {
   SearchIcon,
   ShareIcon,
   Trash2Icon,
-  WorkflowIcon,
   XIcon,
 } from "lucide-react";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
@@ -109,7 +104,7 @@ interface SidebarProps {
  * which is `inbox` in both standalone and embedded modes. Conversation ids are
  * `conv_…`-prefixed, so a chat route's leaf can never collide with `inbox`.
  */
-const AOS_NAV_LEAVES = ["inbox", "system", "fleet", "patterns", "models", "loops", "training"] as const;
+const AOS_NAV_LEAVES = ["inbox", "advanced"] as const;
 
 function useActiveNavItem(): {
   isNewChatPage: boolean;
@@ -312,7 +307,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
         >
           <Link to="/" onClick={onNavClick}>
             <PencilIcon className="size-4 text-muted-foreground" />
-            New session
+            Do
           </Link>
         </Button>
         <Button
@@ -326,7 +321,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
         >
           <Link to="/inbox" onClick={onNavClick}>
             <InboxIcon className="size-4" />
-            Inbox
+            Work
             {inboxCount > 0 && (
               <span
                 aria-label={
@@ -339,32 +334,20 @@ export function Sidebar({ open, onClose }: SidebarProps) {
             )}
           </Link>
         </Button>
-        {(
-          [
-            { leaf: "system", label: "System", Icon: LayersIcon },
-            { leaf: "fleet", label: "Fleet", Icon: NetworkIcon },
-            { leaf: "patterns", label: "Patterns", Icon: BookOpenIcon },
-            { leaf: "models", label: "Models", Icon: CpuIcon },
-            { leaf: "loops", label: "Loops", Icon: WorkflowIcon },
-            { leaf: "training", label: "Training", Icon: GraduationCapIcon },
-          ] as const
-        ).map(({ leaf, label, Icon }) => (
-          <Button
-            key={leaf}
-            asChild
-            className={cn(
-              "w-full justify-start gap-2 text-sm",
-              activeLeaf === leaf && "bg-muted font-semibold",
-            )}
-            variant="ghost"
-            data-testid={`${leaf}-button`}
-          >
-            <Link to={`/${leaf}`} onClick={onNavClick}>
-              <Icon className="size-4" />
-              {label}
-            </Link>
-          </Button>
-        ))}
+        <Button
+          asChild
+          className={cn(
+            "w-full justify-start gap-2 text-sm",
+            activeLeaf === "advanced" && "bg-muted font-semibold",
+          )}
+          variant="ghost"
+          data-testid="advanced-button"
+        >
+          <Link to="/advanced" onClick={onNavClick}>
+            <LayersIcon className="size-4" />
+            Advanced
+          </Link>
+        </Button>
         <div className="relative mt-3">
           <SearchIcon className="-translate-y-1/2 pointer-events-none absolute top-1/2 left-2.5 size-3.5 text-muted-foreground" />
           <input
