@@ -10,5 +10,88 @@
     ],
     "gates": "type-check + suite green",
     "outcome": "parked-for-review"
+  },
+  {
+    "letter": "d",
+    "goal_id": "aos-p1d-fleet-copy",
+    "run_id": "432f38f9-26ab-4c4a-a4b3-42ee25c3a1b6",
+    "status": "blocked",
+    "exit_code": 3,
+    "files": [
+      "p-web/src/pages/FleetPage.tsx"
+    ],
+    "gates": "type-check failed:  | src/pages/FleetPage.tsx(368,34): error TS2339: Property 'last_heartbeat' does not exist on type 'WardenAgent'. | src/pages/FleetPage.tsx(371,55): error TS2339: Property 'last_heartbeat' does not exist on type 'WardenAgent'.",
+    "outcome": "reverted"
+  },
+  {
+    "letter": "e",
+    "goal_id": "aos-p1e-patterns-copy",
+    "run_id": "da00f260-d1ed-4412-b1c4-f81b44ed01e4",
+    "status": "blocked",
+    "exit_code": 3,
+    "files": [
+      "p-web/src/pages/PatternsPage.tsx"
+    ],
+    "gates": "type-check + suite green",
+    "outcome": "parked-for-review"
+  },
+  {
+    "letter": "f",
+    "goal_id": "aos-p1f-models-copy-keyboard",
+    "run_id": "2aaae764-0f99-460f-8549-474e5db16fcf",
+    "status": "blocked",
+    "exit_code": 3,
+    "files": [
+      "p-web/src/pages/ModelsPage.test.tsx",
+      "ap-web/src/pages/ModelsPage.tsx"
+    ],
+    "gates": "type-check + suite green",
+    "outcome": "parked-for-review"
+  },
+  {
+    "letter": "g",
+    "goal_id": "aos-p1g-loops-copy",
+    "run_id": "b736d1c2-8963-4b80-86be-81a3b28c8f14",
+    "status": "blocked",
+    "exit_code": 3,
+    "files": [
+      "p-web/src/pages/LoopsPage.tsx"
+    ],
+    "gates": "type-check + suite green",
+    "outcome": "parked-for-review"
+  },
+  {
+    "letter": "j",
+    "goal_id": "aos-p1j-workloop-copy",
+    "run_id": "c891a69d-c4f4-4607-a4de-ebe8b4391c75",
+    "status": "blocked",
+    "exit_code": 3,
+    "files": [],
+    "outcome": "no-op"
+  },
+  {
+    "letter": "k",
+    "goal_id": "aos-p1k-advanced-page",
+    "run_id": "616f5193-7474-49a7-ab8f-74b654a9ee28",
+    "status": "blocked",
+    "exit_code": 3,
+    "files": [
+      "p-web/src/App.tsx",
+      "ap-web/src/pages/AdvancedPage.tsx"
+    ],
+    "gates": "type-check + suite green",
+    "outcome": "parked-for-review"
+  },
+  {
+    "letter": "l",
+    "goal_id": "aos-p1l-sidebar-three-nav",
+    "run_id": "fcfe3c6a-5766-4b92-b32f-9f5f5b2006be",
+    "status": "blocked",
+    "exit_code": 3,
+    "files": [
+      "ap-web/src/pages/AdvancedPage.tsx"
+    ],
+    "gates": "type-check + suite green",
+    "outcome": "parked-for-review"
   }
 ]
