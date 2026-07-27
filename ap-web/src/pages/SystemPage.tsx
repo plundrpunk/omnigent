@@ -6,7 +6,7 @@
  * hatch). Data comes read-only through the server's `/v1/ams/*` bridge.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   BotIcon,
   CalendarClockIcon,
@@ -20,6 +20,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { PageShell } from "@/components/PageShell";
 import { Spinner } from "@/components/ui/spinner";
+import { connectedApps, lastSeen, memoryUsed, relativeTime, routines } from "@/lib/copy";
 import { hostFetch } from "@/lib/host";
 
 interface Registry {
@@ -34,9 +35,9 @@ const REGISTRIES: Registry[] = [
   { id: "agents", label: "Agents", blurb: "who's in the fleet", path: "/v1/ams/api/warden/agents", Icon: BotIcon },
   { id: "skills", label: "Skills", blurb: "what they know how to do", path: "/v1/ams/api/v1/skills", Icon: SparklesIcon },
   { id: "schedules", label: "Schedules", blurb: "what runs on its own", path: "/v1/ams/api/v1/schedules", Icon: CalendarClockIcon },
-  { id: "automata", label: "Automata", blurb: "reusable building blocks", path: "/v1/ams/api/v1/automata/", Icon: CogIcon },
+  { id: "automata", label: routines, blurb: "reusable building blocks", path: "/v1/ams/api/v1/automata/", Icon: CogIcon },
   { id: "goals", label: "Goals", blurb: "what we're working toward", path: "/v1/ams/api/v1/goals/dashboard", Icon: TargetIcon },
-  { id: "mcp", label: "MCP servers", blurb: "connected tools", path: "/v1/ams/api/v1/mcp-servers", Icon: PlugIcon },
+  { id: "mcp", label: connectedApps, blurb: "connected tools", path: "/v1/ams/api/v1/mcp-servers", Icon: PlugIcon },
 ];
 
 function extractRows(payload: unknown): Record<string, unknown>[] {
@@ -65,8 +66,19 @@ function chooseColumns(rows: Record<string, unknown>[], max = 5): string[] {
   return [...preferred.filter((k) => seen.has(k)), ...[...seen].filter((k) => !preferred.includes(k))].slice(0, max);
 }
 
-function formatCell(value: unknown): string {
+function columnLabel(column: string): string {
+  if (column === "last_heartbeat") return lastSeen;
+  if (column === "context_pct") return memoryUsed;
+  return column;
+}
+
+function formatCell(value: unknown, column: string): string {
   if (value == null) return "";
+  if (column === "last_heartbeat") return relativeTime(String(value));
+  if (column === "context_pct") {
+    const percentage = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(percentage) ? `${Math.round(percentage)}%` : "";
+  }
   if (typeof value === "boolean") return value ? "yes" : "no";
   const numericValue =
     typeof value === "number"
@@ -83,8 +95,13 @@ function formatCell(value: unknown): string {
 
 type Fetched =
   | { rows: Record<string, unknown>[]; raw: unknown; total: number }
-  | { error: string }
+  | { error: true }
   | null;
+
+type RegistryResult = {
+  data: Fetched;
+  retry: () => void;
+};
 
 /** True count: prefer the API's `total`/`count` field over returned-page length (endpoints paginate, default 50). */
 function extractTotal(payload: unknown, rows: unknown[]): number {
@@ -98,9 +115,13 @@ function extractTotal(payload: unknown, rows: unknown[]): number {
 }
 
 const PAGE_SIZE = 50;
+const LOAD_ERROR = "We couldn't load this right now.";
 
-function useRegistry(path: string, page = 0): Fetched {
+function useRegistry(path: string, page = 0): RegistryResult {
   const [state, setState] = useState<Fetched>(null);
+  const [attempt, setAttempt] = useState(0);
+  const retry = useCallback(() => setAttempt((value) => value + 1), []);
+
   useEffect(() => {
     let cancelled = false;
     setState(null);
@@ -111,25 +132,41 @@ function useRegistry(path: string, page = 0): Fetched {
         const body: unknown = await resp.json().catch(() => null);
         if (cancelled) return;
         if (!resp.ok) {
-          setState({ error: `HTTP ${resp.status}` });
+          setState({ error: true });
           return;
         }
         const rows = extractRows(body);
         setState({ rows, raw: body, total: extractTotal(body, rows) });
       })
-      .catch((err: unknown) => {
-        if (!cancelled) setState({ error: err instanceof Error ? err.message : String(err) });
+      .catch(() => {
+        if (!cancelled) setState({ error: true });
       });
     return () => {
       cancelled = true;
     };
-  }, [path, page]);
-  return state;
+  }, [attempt, path, page]);
+
+  return { data: state, retry };
 }
 
 function Tile({ registry, onOpen }: { registry: Registry; onOpen: () => void }) {
-  const data = useRegistry(registry.path);
+  const { data, retry } = useRegistry(registry.path);
   const count = data && "rows" in data ? data.total : null;
+
+  if (data && "error" in data) {
+    return (
+      <div className="rounded-xl border border-border bg-card p-5 text-left">
+        <registry.Icon className="size-5 text-muted-foreground" />
+        <div className="mt-3 text-sm text-destructive">{LOAD_ERROR}</div>
+        <Button variant="outline" size="sm" className="mt-3" onClick={retry}>
+          Retry
+        </Button>
+        <div className="mt-3 text-sm font-medium">{registry.label}</div>
+        <div className="text-xs text-muted-foreground">{registry.blurb}</div>
+      </div>
+    );
+  }
+
   return (
     <button
       onClick={onOpen}
@@ -137,7 +174,7 @@ function Tile({ registry, onOpen }: { registry: Registry; onOpen: () => void }) 
     >
       <registry.Icon className="size-5 text-muted-foreground group-hover:text-primary" />
       <div className="mt-3 text-2xl font-semibold tabular-nums">
-        {data === null ? <Spinner className="size-5" /> : "error" in data ? "—" : count}
+        {data === null ? <Spinner className="size-5" /> : count}
       </div>
       <div className="mt-0.5 text-sm font-medium">{registry.label}</div>
       <div className="text-xs text-muted-foreground">{registry.blurb}</div>
@@ -147,7 +184,7 @@ function Tile({ registry, onOpen }: { registry: Registry; onOpen: () => void }) 
 
 function DrillIn({ registry, onBack }: { registry: Registry; onBack: () => void }) {
   const [page, setPage] = useState(0);
-  const data = useRegistry(registry.path, page);
+  const { data, retry } = useRegistry(registry.path, page);
   const [showRaw, setShowRaw] = useState(false);
   const rows = data && "rows" in data ? data.rows : [];
   const columns = useMemo(() => chooseColumns(rows), [rows]);
@@ -202,7 +239,12 @@ function DrillIn({ registry, onBack }: { registry: Registry; onBack: () => void 
           <Spinner /> Loading…
         </div>
       ) : "error" in data ? (
-        <div className="py-10 text-sm text-destructive">Couldn&apos;t load: {data.error}</div>
+        <div className="py-10 text-sm text-destructive">
+          <p>{LOAD_ERROR}</p>
+          <Button variant="outline" size="sm" className="mt-3" onClick={retry}>
+            Retry
+          </Button>
+        </div>
       ) : showRaw ? (
         <pre className="max-h-[65vh] overflow-auto rounded-xl border border-border bg-card p-3 text-xs">
           {JSON.stringify(data.raw, null, 2)}
@@ -218,7 +260,7 @@ function DrillIn({ registry, onBack }: { registry: Registry; onBack: () => void 
               <tr className="border-b border-border bg-card text-left">
                 {columns.map((col) => (
                   <th key={col} className="whitespace-nowrap px-3 py-2 font-medium text-muted-foreground">
-                    {col}
+                    {columnLabel(col)}
                   </th>
                 ))}
               </tr>
@@ -228,7 +270,7 @@ function DrillIn({ registry, onBack }: { registry: Registry; onBack: () => void 
                 <tr key={i} className="border-b border-border/50 last:border-0 hover:bg-muted/40">
                   {columns.map((col) => (
                     <td key={col} className="max-w-[26rem] truncate px-3 py-2">
-                      {formatCell(row[col])}
+                      {formatCell(row[col], col)}
                     </td>
                   ))}
                 </tr>
