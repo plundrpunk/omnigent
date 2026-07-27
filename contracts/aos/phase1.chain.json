@@ -2,82 +2,49 @@
   {
     "letter": "c",
     "goal_id": "aos-p1c-system-copy",
-    "run_id": "0b36dec2-d8e5-4a18-a7aa-f1611d86b034",
-    "status": "blocked",
-    "exit_code": 3,
+    "run_id": "d6c08314-6501-4751-8154-0b9d22ad6e2b",
+    "status": "completed",
+    "exit_code": 0,
     "files": [
       "p-web/src/pages/SystemPage.tsx"
     ],
     "gates": "type-check + suite green",
-    "outcome": "parked-for-review"
+    "outcome": "committed"
   },
   {
     "letter": "d",
     "goal_id": "aos-p1d-fleet-copy",
-    "run_id": "432f38f9-26ab-4c4a-a4b3-42ee25c3a1b6",
+    "run_id": "0c43e9d1-1923-4c00-b449-bce68a75fac1",
     "status": "blocked",
     "exit_code": 3,
     "files": [
       "p-web/src/pages/FleetPage.tsx"
     ],
-    "gates": "type-check failed:  | src/pages/FleetPage.tsx(368,34): error TS2339: Property 'last_heartbeat' does not exist on type 'WardenAgent'. | src/pages/FleetPage.tsx(371,55): error TS2339: Property 'last_heartbeat' does not exist on type 'WardenAgent'.",
+    "gates": "type-check failed:  | src/pages/FleetPage.tsx(369,40): error TS2339: Property 'last_heartbeat' does not exist on type 'WardenAgent'. | src/pages/FleetPage.tsx(369,84): error TS2339: Property 'last_heartbeat' does not exist on type 'WardenAgent'.",
     "outcome": "reverted"
-  },
-  {
-    "letter": "e",
-    "goal_id": "aos-p1e-patterns-copy",
-    "run_id": "da00f260-d1ed-4412-b1c4-f81b44ed01e4",
-    "status": "blocked",
-    "exit_code": 3,
-    "files": [
-      "p-web/src/pages/PatternsPage.tsx"
-    ],
-    "gates": "type-check + suite green",
-    "outcome": "parked-for-review"
   },
   {
     "letter": "f",
     "goal_id": "aos-p1f-models-copy-keyboard",
-    "run_id": "2aaae764-0f99-460f-8549-474e5db16fcf",
+    "run_id": "e05b849b-f0c3-4ea1-8ece-0b06340e76ec",
     "status": "blocked",
     "exit_code": 3,
     "files": [
       "p-web/src/pages/ModelsPage.test.tsx",
       "ap-web/src/pages/ModelsPage.tsx"
     ],
-    "gates": "type-check + suite green",
-    "outcome": "parked-for-review"
-  },
-  {
-    "letter": "g",
-    "goal_id": "aos-p1g-loops-copy",
-    "run_id": "b736d1c2-8963-4b80-86be-81a3b28c8f14",
-    "status": "blocked",
-    "exit_code": 3,
-    "files": [
-      "p-web/src/pages/LoopsPage.tsx"
-    ],
-    "gates": "type-check + suite green",
-    "outcome": "parked-for-review"
+    "gates": "tests failed: \u001b[22m\u001b[39m[nativeBridge] electron setBadgeCount failed: Error: ipc down | \u001b[31m\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u001b[39m\u001b[1m\u001b[41m Failed Tests 2 \u001b[49m\u001b[22m\u001b[31m\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u001b[39m",
+    "outcome": "reverted"
   },
   {
     "letter": "j",
     "goal_id": "aos-p1j-workloop-copy",
-    "run_id": "c891a69d-c4f4-4607-a4de-ebe8b4391c75",
-    "status": "blocked",
-    "exit_code": 3,
-    "files": [],
-    "outcome": "no-op"
-  },
-  {
-    "letter": "k",
-    "goal_id": "aos-p1k-advanced-page",
-    "run_id": "616f5193-7474-49a7-ab8f-74b654a9ee28",
+    "run_id": "5acebb5e-0a70-4d47-b5b9-5517bf1fe4ea",
     "status": "blocked",
     "exit_code": 3,
     "files": [
-      "p-web/src/App.tsx",
-      "ap-web/src/pages/AdvancedPage.tsx"
+      "p-web/src/shell/WorkLoopPanel.test.tsx",
+      "ap-web/src/shell/WorkLoopPanel.tsx"
     ],
     "gates": "type-check + suite green",
     "outcome": "parked-for-review"
@@ -85,11 +52,11 @@
   {
     "letter": "l",
     "goal_id": "aos-p1l-sidebar-three-nav",
-    "run_id": "fcfe3c6a-5766-4b92-b32f-9f5f5b2006be",
+    "run_id": "9a6eabce-6e3f-4a6d-9b95-371c0c828acb",
     "status": "blocked",
     "exit_code": 3,
     "files": [
-      "ap-web/src/pages/AdvancedPage.tsx"
+      "p-web/src/shell/Sidebar.tsx"
     ],
     "gates": "type-check + suite green",
     "outcome": "parked-for-review"

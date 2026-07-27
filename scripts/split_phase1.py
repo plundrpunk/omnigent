@@ -169,13 +169,12 @@ FIXES = [
         "files": ["ap-web/src/pages/FleetPage.tsx"],
         "what": (
             PAGE_COMMON + " On this page in particular: 'ghost dispatch' "
-            "becomes 'never started', last_heartbeat becomes 'last seen' "
-            "with a relative time (use the helper from '@/lib/copy'), the "
-            "word 'warden' disappears from user-visible copy, and "
-            "execution becomes 'run'. IMPORTANT: last_heartbeat is a DATA "
-            "FIELD on the WardenAgent type — every property access like "
-            "agent.last_heartbeat stays exactly as it is; only the visible "
-            "label and rendered value change." + VOCAB
+            "becomes 'never started', the word 'warden' disappears from "
+            "user-visible copy, and execution becomes 'run'. NOTE: the "
+            "WardenAgent type has NO heartbeat field — do not invent one or "
+            "render last-seen times; that requirement is withdrawn. Change "
+            "wording only; never add a property access the type does not "
+            "declare." + VOCAB
         ),
         "check": "FleetPage uses the plain vocabulary and a Retry error state.",
     },
