@@ -14,6 +14,7 @@ import {
 
 import { Button } from "@/components/ui/button";
 import type { AnyBlock } from "@/lib/blocks";
+import { failedACheck, finished, needsYourOK, pausedForInput, proofOfWhatWasDone } from "@/lib/copy";
 import { checkpointResumeCommand, type GoalRun } from "@/lib/goal";
 import { Link } from "@/lib/routing";
 import type { SessionStatus } from "@/lib/types";
@@ -272,7 +273,7 @@ export function deriveWorkLoopSnapshot(input: DeriveWorkLoopInput): WorkLoopSnap
     verifyDetail = "Verification cannot complete while the run is failed.";
   } else if (pendingApprovals > 0) {
     verifyState = "attention";
-    verifyDetail = `${pendingApprovals} human gate${pendingApprovals === 1 ? " is" : "s are"} waiting in Inbox.`;
+    verifyDetail = `${needsYourOK}: ${pendingApprovals} item${pendingApprovals === 1 ? "" : "s"} waiting in Inbox.`;
   } else if (executionSettled) {
     verifyState = "attention";
     verifyDetail = "Verifier evidence is not reported by the current session contract.";
@@ -291,14 +292,14 @@ export function deriveWorkLoopSnapshot(input: DeriveWorkLoopInput): WorkLoopSnap
     { id: "verify", label: "Verify", detail: verifyDetail, state: verifyState },
     {
       id: "receipt",
-      label: "Receipt",
+      label: proofOfWhatWasDone,
       detail: receipt
-        ? `Versioned ${receipt.schema_version} receipt is persisted and available below.`
+        ? `Versioned ${receipt.schema_version} ${proofOfWhatWasDone} is persisted and available below.`
         : responseEnd
           ? "Trace and outcome fields are available below."
           : executionSettled
             ? "Trace recovered from history; terminal outcome is unavailable."
-            : "A receipt appears when the run reaches a terminal response.",
+            : `A ${proofOfWhatWasDone} appears when the run reaches a terminal response.`,
       state: receipt || responseEnd ? "complete" : executionSettled ? "attention" : "pending",
     },
   ];
@@ -378,8 +379,8 @@ const GOAL_STATUS_META: Record<
   { label: string; tone: string; spinning?: boolean }
 > = {
   running: { label: "Running", tone: "bg-primary/15 text-primary", spinning: true },
-  completed: { label: "Gate passed", tone: "bg-success/15 text-success" },
-  blocked: { label: "Blocked by gate", tone: "bg-destructive/15 text-destructive" },
+  completed: { label: `${needsYourOK}: passed`, tone: "bg-success/15 text-success" },
+  blocked: { label: `Blocked: ${needsYourOK}`, tone: "bg-destructive/15 text-destructive" },
   paused: { label: "Paused", tone: "bg-warning/15 text-warning" },
   setup_error: { label: "Setup error", tone: "bg-destructive/15 text-destructive" },
   error: { label: "Error", tone: "bg-destructive/15 text-destructive" },
@@ -387,6 +388,14 @@ const GOAL_STATUS_META: Record<
 
 function clipArtifact(text: string, max = 600): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`;
+}
+
+function goalExitLabel(exitCode: number | null): string {
+  if (exitCode === null) return "exit —";
+  if (exitCode === 0) return finished;
+  if (exitCode === 3) return pausedForInput;
+  if (exitCode === 6) return failedACheck;
+  return `exit ${exitCode}`;
 }
 
 /**
@@ -455,7 +464,7 @@ function GoalRunCard({ run }: { run: GoalRun }) {
                 </span>
               </div>
               <p className="mt-1 font-mono text-[10px] text-muted-foreground">
-                {run.exit_code === null ? "exit —" : `exit ${run.exit_code}`}
+                {goalExitLabel(run.exit_code)}
                 {run.provider ? ` · ${run.provider}` : ""}
                 {run.finished_at ? ` · finished ${run.finished_at}` : ""}
               </p>
@@ -586,7 +595,7 @@ export function WorkLoopPanel({
             </span>
             <div className="min-w-0">
               <h2 className="text-sm font-semibold text-foreground">Work Loop</h2>
-              <p className="text-xs text-muted-foreground">Objective → run → verify → receipt</p>
+              <p className="text-xs text-muted-foreground">Objective → run → verify → {proofOfWhatWasDone}</p>
             </div>
           </div>
           <span
@@ -675,7 +684,7 @@ export function WorkLoopPanel({
         <section className="rounded-lg border border-border bg-card p-3">
           <div className="mb-3 flex items-center gap-2 text-xs font-medium text-foreground">
             <FileCheck2Icon className="size-3.5 text-muted-foreground" />
-            Receipt
+            {proofOfWhatWasDone}
           </div>
           <dl className="grid grid-cols-[88px_minmax(0,1fr)] gap-x-3 gap-y-2 text-[11px]">
             <dt className="text-muted-foreground">Session</dt>
@@ -707,7 +716,7 @@ export function WorkLoopPanel({
             </dd>
             {snapshot.receiptEventId && (
               <>
-                <dt className="text-muted-foreground">Receipt event</dt>
+                <dt className="text-muted-foreground">{proofOfWhatWasDone} event</dt>
                 <dd className="truncate font-mono text-foreground" title={snapshot.receiptEventId}>
                   {snapshot.receiptEventId}
                 </dd>
@@ -768,7 +777,7 @@ export function WorkLoopPanel({
             <Link to="/inbox">
               <ShieldAlertIcon className="size-3.5" />
               {snapshot.pendingApprovals > 0
-                ? `Review ${snapshot.pendingApprovals} waiting gate${snapshot.pendingApprovals === 1 ? "" : "s"}`
+                ? `Review ${snapshot.pendingApprovals} · ${needsYourOK}`
                 : "Open Inbox"}
             </Link>
           </Button>

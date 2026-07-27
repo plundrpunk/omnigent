@@ -81,7 +81,7 @@ describe("deriveWorkLoopSnapshot", () => {
       { label: "Intake", state: "complete" },
       { label: "Run", state: "complete" },
       { label: "Verify", state: "attention" },
-      { label: "Receipt", state: "complete" },
+      { label: "proof of what was done", state: "complete" },
     ]);
     expect(snapshot.overallLabel).toBe("Needs verification");
     expect(snapshot.verifierStatus).toBe("Not reported");
@@ -131,7 +131,7 @@ describe("deriveWorkLoopSnapshot", () => {
       { label: "Intake", state: "complete" },
       { label: "Run", state: "attention" },
       { label: "Verify", state: "attention" },
-      { label: "Receipt", state: "attention" },
+      { label: "proof of what was done", state: "attention" },
     ]);
     expect(snapshot.latestResponseId).toBe("resp_123");
     expect(snapshot.resultStatus).toBe("settled · status unavailable");
@@ -189,7 +189,7 @@ describe("deriveWorkLoopSnapshot", () => {
       { label: "Intake", state: "complete" },
       { label: "Run", state: "complete" },
       { label: "Verify", state: "complete" },
-      { label: "Receipt", state: "complete" },
+      { label: "proof of what was done", state: "complete" },
     ]);
     expect(snapshot.overallLabel).toBe("Verified");
     expect(snapshot.verifierStatus).toBe("Passed");
@@ -228,7 +228,7 @@ describe("WorkLoopPanel", () => {
     expect(screen.getByRole("heading", { name: "Work Loop" })).toBeInTheDocument();
     expect(screen.getByText("Not reported")).toBeInTheDocument();
     expect(screen.getByText("$0.0042")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /Review 1 waiting gate/i })).toHaveAttribute(
+    expect(screen.getByRole("link", { name: /Review 1 · needs your OK/i })).toHaveAttribute(
       "href",
       "/inbox",
     );
@@ -257,15 +257,15 @@ describe("GoalRunsSection", () => {
     expect(container.querySelector("[data-testid=goal-runs-section]")).toBeNull();
   });
 
-  it("shows a gate-passed run with its exit code and outcome verbatim", () => {
+  it("shows a completed run with its finished label and outcome verbatim", () => {
     render(<GoalRunsSection runs={[baseRun]} />);
     expect(screen.getByText("fix-tests")).toBeInTheDocument();
-    expect(screen.getByText("Gate passed")).toBeInTheDocument();
-    expect(screen.getByText(/exit 0 · codex/)).toBeInTheDocument();
+    expect(screen.getByText("needs your OK: passed")).toBeInTheDocument();
+    expect(screen.getByText(/finished · codex/)).toBeInTheDocument();
     expect(screen.getByText("goal-outcome.json")).toBeInTheDocument();
   });
 
-  it("labels exit 3 as blocked and quotes blocker.md verbatim", () => {
+  it("labels exit 3 as paused for input and quotes blocker.md verbatim", () => {
     render(
       <GoalRunsSection
         runs={[
@@ -279,11 +279,12 @@ describe("GoalRunsSection", () => {
         ]}
       />,
     );
-    expect(screen.getByText("Blocked by gate")).toBeInTheDocument();
+    expect(screen.getByText("Blocked: needs your OK")).toBeInTheDocument();
+    expect(screen.getByText(/paused for input · codex/)).toBeInTheDocument();
     expect(screen.getByText(/the gate failed honestly/)).toBeInTheDocument();
   });
 
-  it("surfaces the checkpoint resume command for a paused run", () => {
+  it("labels exit 6 as failed a check and surfaces the checkpoint resume command", () => {
     render(
       <GoalRunsSection
         runs={[
@@ -298,15 +299,17 @@ describe("GoalRunsSection", () => {
       />,
     );
     expect(screen.getByText("Paused")).toBeInTheDocument();
+    expect(screen.getByText(/failed a check · codex/)).toBeInTheDocument();
     expect(screen.getByText("automaton goal --resume r-3")).toBeInTheDocument();
   });
 
-  it("shows the raw checkpoint when no resume command is parseable", () => {
+  it("preserves the null exit label and shows the raw checkpoint when no resume command is parseable", () => {
     render(
       <GoalRunsSection
-        runs={[{ ...baseRun, run_id: "r-4", status: "paused", exit_code: 6, checkpoint: "raw text" }]}
+        runs={[{ ...baseRun, run_id: "r-4", status: "paused", exit_code: null, checkpoint: "raw text" }]}
       />,
     );
+    expect(screen.getByText(/exit — · codex/)).toBeInTheDocument();
     expect(screen.getByText("raw text")).toBeInTheDocument();
   });
 });
