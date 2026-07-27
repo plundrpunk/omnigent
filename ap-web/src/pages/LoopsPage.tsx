@@ -20,6 +20,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { needsYourOK, savedRoutine, stopsIfCheckFails } from "@/lib/copy";
 import { cn } from "@/lib/utils";
 
 const STAGE_TYPES = ["plan", "execute", "verify", "gate", "consolidate"] as const;
@@ -35,10 +36,18 @@ interface LoopStage {
 
 const STAGE_HINTS: Record<StageType, string> = {
   plan: "decompose the goal into next actions",
-  execute: "do the work (agent / automaton / skill)",
+  execute: `do the work (agent / ${savedRoutine} / skill)`,
   verify: "check the artifact against reality",
-  gate: "fail-closed check — no success past a failing gate",
+  gate: `${stopsIfCheckFails} — no success past a check that ${needsYourOK}`,
   consolidate: "write results + lessons back to AMS memory",
+};
+
+const STAGE_LABELS: Record<StageType, string> = {
+  plan: "plan",
+  execute: "execute",
+  verify: "verify",
+  gate: needsYourOK,
+  consolidate: "consolidate",
 };
 
 const STAGE_COLOR: Record<StageType, string> = {
@@ -52,7 +61,7 @@ const STAGE_COLOR: Record<StageType, string> = {
 let nextId = 100;
 const newStage = (type: StageType, name?: string): LoopStage => ({
   id: nextId++,
-  name: name ?? type,
+  name: name ?? STAGE_LABELS[type],
   type,
   actor: "",
   exitCondition: "",
@@ -62,7 +71,7 @@ const DEFAULT_STAGES: LoopStage[] = [
   newStage("plan"),
   newStage("execute"),
   newStage("verify"),
-  newStage("gate", "finalization gate"),
+  newStage("gate", `finalization ${needsYourOK}`),
   newStage("consolidate", "consolidate"),
 ];
 
@@ -104,6 +113,24 @@ export function LoopsPage() {
     [loopName, goal, maxIterations, stages],
   );
   const configJson = JSON.stringify(config, null, 2);
+  const displayConfig = useMemo(
+    () => ({
+      name: config.name,
+      goal: config.goal,
+      max_iterations: config.max_iterations,
+      deterministic: config.deterministic,
+      stages: config.stages.map((stage) => ({
+        ...stage,
+        type: stage.type === "gate" ? needsYourOK : stage.type,
+      })),
+      invariants: {
+        runtime_ai_mutation: config.invariants.runtime_ai_mutation,
+        [stopsIfCheckFails]: config.invariants.gates_fail_closed,
+      },
+    }),
+    [config],
+  );
+  const displayConfigJson = JSON.stringify(displayConfig, null, 2);
 
   const update = (id: number, patch: Partial<LoopStage>) =>
     setStages((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
@@ -244,7 +271,7 @@ export function LoopsPage() {
                     textAnchor="middle"
                     className="fill-muted-foreground text-[10px]"
                   >
-                    {s.type}
+                    {STAGE_LABELS[s.type]}
                     {s.actor ? ` · ${s.actor.slice(0, 20)}` : ""}
                   </text>
                 </g>
@@ -260,7 +287,7 @@ export function LoopsPage() {
 
           {!hasGate && (
             <p className="mt-3 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-center text-xs text-warning">
-              No gate in this loop — it could claim success it hasn&apos;t earned.
+              No {needsYourOK} step in this loop — it could claim success it hasn&apos;t earned.
             </p>
           )}
         </div>
@@ -308,7 +335,7 @@ export function LoopsPage() {
                     <SelectContent>
                       {STAGE_TYPES.map((t) => (
                         <SelectItem key={t} value={t}>
-                          {t}
+                          {STAGE_LABELS[t]}
                         </SelectItem>
                       ))}
                     </SelectContent>
@@ -316,7 +343,7 @@ export function LoopsPage() {
                 </div>
                 <p className="text-xs text-muted-foreground">{STAGE_HINTS[selected.type]}</p>
                 <Input
-                  placeholder="actor — agent, automaton, or skill (optional)"
+                  placeholder={`actor — agent, ${savedRoutine}, or skill (optional)`}
                   value={selected.actor}
                   onChange={(e) => update(selected.id, { actor: e.target.value })}
                 />
@@ -351,11 +378,11 @@ export function LoopsPage() {
 
           <div>
             <Button variant="ghost" size="sm" onClick={() => setShowAdvanced((v) => !v)}>
-              {showAdvanced ? "Hide" : "Advanced"} — aos.loop.v1 JSON
+              {showAdvanced ? "Hide" : "Advanced"} — display-only view
             </Button>
             {showAdvanced && (
               <pre className="mt-2 max-h-80 overflow-auto rounded-lg border border-border bg-card p-3 text-xs">
-                {configJson}
+                {displayConfigJson}
               </pre>
             )}
           </div>
