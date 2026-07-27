@@ -44,6 +44,9 @@ const LoopsPage = lazy(() =>
 const TrainingPage = lazy(() =>
   import("@/pages/TrainingPage").then((m) => ({ default: m.TrainingPage })),
 );
+const AdvancedPage = lazy(() =>
+  import("@/pages/AdvancedPage").then((m) => ({ default: m.AdvancedPage })),
+);
 
 interface AppProps {
   /**
@@ -144,6 +147,7 @@ function App({ basename }: AppProps = {}) {
           <Route path={`${prefix}/models`} element={<ModelsPage />} />
           <Route path={`${prefix}/loops`} element={<LoopsPage />} />
           <Route path={`${prefix}/training`} element={<TrainingPage />} />
+          <Route path={`${prefix}/advanced`} element={<AdvancedPage />} />
           {info.accounts_enabled && (
             <>
               <Route path={`${prefix}/members`} element={<MembersPage />} />
