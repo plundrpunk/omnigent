@@ -14,6 +14,16 @@ import { Button } from "@/components/ui/button";
 import { PageShell } from "@/components/PageShell";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { amsGet } from "@/lib/ams";
+import {
+  failedACheck,
+  finished,
+  needsYourOK,
+  neverStarted,
+  pausedForInput,
+  proofOfWhatWasDone,
+  run,
+  stopsIfCheckFails,
+} from "@/lib/copy";
 import { useNavigate } from "@/lib/routing";
 
 type Honesty = "proven-here" | "vetted" | "scouted";
@@ -49,10 +59,10 @@ const PATTERNS: Pattern[] = [
     name: "Team-lead dispatch",
     honesty: "vetted",
     oneLiner: "Route a goal to the domain team-lead, who delegates.",
-    how: "dispatch_to_tl hands the task to a TL agent; the TL plans, spawns workers via the warden, and reports upward.",
-    evidence: "tl-marketing dispatches verified end-to-end; TL fleet registered in warden.",
+    how: "dispatch_to_tl hands the task to a TL agent; the TL plans, spawns workers, and reports upward.",
+    evidence: "tl-marketing dispatches verified end-to-end; TL fleet registered.",
     caveats:
-      "Known gap (memory 45ea10b3): dispatches can queue without spawning — watch for ghost edges on Fleet.",
+      `Known gap (memory 45ea10b3): dispatches can queue without spawning — watch for work that ${neverStarted} on Fleet.`,
     setupPrompt:
       "Dispatch this to the appropriate team lead via dispatch_to_tl, have them decompose it across their team, and report the rollup: <YOUR GOAL>",
   },
@@ -63,7 +73,7 @@ const PATTERNS: Pattern[] = [
     honesty: "vetted",
     oneLiner: "Stages in sequence — each output feeds the next.",
     how: "swarm_chain runs agents in order (draft → critique → revise → finalize); state rides in the chain payload.",
-    evidence: "swarm_chain executions recorded in AMS; stats visible in Training.",
+    evidence: `swarm_chain ${run}s recorded in AMS; stats visible in Training.`,
     setupPrompt:
       "Run a swarm chain over these stages (each stage consumes the previous output): 1) draft, 2) critique, 3) revise, 4) finalize. Subject: <YOUR SUBJECT>",
   },
@@ -74,7 +84,7 @@ const PATTERNS: Pattern[] = [
     honesty: "scouted",
     oneLiner: "Two models argue opposing sides; a judge rules.",
     how: "Two agents on different models argue assigned positions for N rounds; a third summarizes and rules with reasons.",
-    evidence: "No local receipts yet — claim from external literature only.",
+    evidence: `No local ${proofOfWhatWasDone} yet — claim from external literature only.`,
     setupPrompt:
       "Set up a model debate: assign two different models opposing positions on the question below, run 2 argument rounds, then have a judge model rule with reasons. Question: <YOUR QUESTION>",
   },
@@ -83,22 +93,22 @@ const PATTERNS: Pattern[] = [
     glyph: "gate",
     name: "Goal-contract run",
     honesty: "proven-here",
-    oneLiner: "Autonomous work that can't lie — gates + honest exits.",
-    how: "A goal contract declares deliverables + finalization gates; headless runs exit 0/3/6 with blocker.md / checkpoint.json artifacts.",
-    evidence: "Harness+AMS 10x WS2/WS3 recorded gate-proof and exit-code-proof runs (2026-07-17).",
+    oneLiner: `Autonomous work that can't lie — ${needsYourOK} + honest outcomes.`,
+    how: `A goal contract declares deliverables and final checks that ${needsYourOK}; headless runs report ${finished}, ${pausedForInput}, or ${failedACheck} with blocker.md / checkpoint.json artifacts.`,
+    evidence: `Harness+AMS 10x WS2/WS3 recorded ${proofOfWhatWasDone} for checks and outcomes (2026-07-17).`,
     setupPrompt:
-      "Create a goal contract for the following outcome with explicit deliverables and finalization gates, then run it headless with honest exit codes: <YOUR OUTCOME>",
+      `Create a goal contract for the following outcome with explicit deliverables and final checks that ${needsYourOK}, then run it headless with honest outcomes: <YOUR OUTCOME>`,
   },
   {
     id: "eval-gated-promotion",
     glyph: "promotion",
-    name: "Eval-gated promotion",
+    name: `Promotion that ${needsYourOK}`,
     honesty: "proven-here",
     oneLiner: "Candidates replace incumbents only by beating them.",
-    how: "Candidate runs the eval suite; promotion requires a receipt; regressions are rejected with a diff. Fail-closed.",
-    evidence: "WS4 eval deploy gate: recorded promotion-rejection with diff (2026-07-17).",
+    how: `Candidate runs the eval suite; promotion requires ${proofOfWhatWasDone}; regressions are rejected with a diff. It ${stopsIfCheckFails}.`,
+    evidence: "WS4 eval deploy check: recorded promotion rejection with a diff (2026-07-17).",
     setupPrompt:
-      "Propose an improved version of <TARGET>, run it through the eval deploy gate against the incumbent, and promote only on a passing receipt — reject with a diff otherwise.",
+      `Propose an improved version of <TARGET>, run it through the eval deploy check against the incumbent, and promote only with passing ${proofOfWhatWasDone} — reject with a diff otherwise.`,
   },
 ];
 
@@ -305,7 +315,7 @@ function DiscoverFeed() {
     <div className="space-y-3">
       <p className="text-sm text-muted-foreground">
         Scouted candidates land here weekly and wait for defenseclaw vetting — nothing
-        joins the library without a receipt.
+        joins the library without {proofOfWhatWasDone}.
       </p>
       {failed ? (
         <div className="space-y-2">
