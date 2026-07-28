@@ -6,11 +6,10 @@
  * page whenever a routed provider isn't online. Costs and endpoints
  * live in the provider cards below the diagram.
  *
- * Editing (P3.1): click a role node → provider picker → PUT
+ * Editing (P3.1): select a role node → provider picker → PUT
  * role-mappings through the bridge's write table → diagram refetches.
- * AMS validates the provider against its registry; its errors are
- * shown verbatim. No optimistic redraw — the diagram only ever shows
- * what AMS confirmed.
+ * AMS validates the provider against its registry. No optimistic redraw —
+ * the diagram only ever shows what AMS confirmed.
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -19,7 +18,14 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { PageShell } from "@/components/PageShell";
 import { Spinner } from "@/components/ui/spinner";
-import { fetchProviders, fetchRoleMappings, putRoleMappings, type LlmProvider } from "@/lib/ams";
+import {
+  AmsError,
+  fetchProviders,
+  fetchRoleMappings,
+  putRoleMappings,
+  type LlmProvider,
+} from "@/lib/ams";
+import { perMillionWords } from "@/lib/copy";
 
 const ROW_H = 44;
 const PAD = 24;
@@ -30,7 +36,7 @@ function costLabel(p: LlmProvider): string {
   const outC = p.cost_per_mtok_output;
   if (inC == null && outC == null) return "cost unknown";
   if ((inC ?? 0) === 0 && (outC ?? 0) === 0) return "Included in plan";
-  return `$${inC} in / $${outC} out per Mtok`;
+  return `$${inC} in / $${outC} out ${perMillionWords}`;
 }
 
 export function ModelsPage() {
@@ -43,6 +49,11 @@ export function ModelsPage() {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
+  const toggleRole = (role: string) => {
+    setSaveError(null);
+    setSelectedRole((current) => (current === role ? null : role));
+  };
+
   const assignRole = async (role: string, providerType: string) => {
     setSaving(true);
     setSaveError(null);
@@ -51,7 +62,13 @@ export function ModelsPage() {
       setSelectedRole(null);
       setRefreshKey((k) => k + 1); // redraw only from AMS-confirmed state
     } catch (err: unknown) {
-      setSaveError(err instanceof Error ? err.message : String(err));
+      setSaveError(
+        err instanceof AmsError
+          ? "AMS couldn't save this role assignment."
+          : err instanceof Error
+            ? err.message
+            : String(err),
+      );
     } finally {
       setSaving(false);
     }
@@ -69,7 +86,15 @@ export function ModelsPage() {
         }
       })
       .catch((err: unknown) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+        if (!cancelled) {
+          setError(
+            err instanceof AmsError
+              ? "AMS couldn't load the model routing information."
+              : err instanceof Error
+                ? err.message
+                : String(err),
+          );
+        }
       });
     return () => {
       cancelled = true;
@@ -121,7 +146,7 @@ export function ModelsPage() {
   return (
     <PageShell
       title="Models"
-      subtitle="Who thinks with what — click a role to reroute it to a provider."
+      subtitle="Who thinks with what — select a role to reroute it to a provider."
       actions={
         <Button variant="outline" size="sm" onClick={() => setRefreshKey((k) => k + 1)}>
           Refresh
@@ -129,8 +154,15 @@ export function ModelsPage() {
       }
     >
       {error && (
-        <div className="mb-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          Couldn&apos;t load: {error}
+        <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <span>{error}</span>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setRefreshKey((k) => k + 1)}
+          >
+            Retry
+          </Button>
         </div>
       )}
 
@@ -179,7 +211,7 @@ export function ModelsPage() {
                   />
                 );
               })}
-              {/* role nodes — click to reroute */}
+              {/* role nodes — select to reroute */}
               {diagram.roleNames.map((role, i) => {
                 const y = PAD + i * ROW_H + ROW_H / 2;
                 const selected = role === selectedRole;
@@ -188,11 +220,15 @@ export function ModelsPage() {
                     key={role}
                     data-testid={`role-node-${role}`}
                     role="button"
+                    tabIndex={0}
                     aria-label={`Reroute ${role}`}
                     className="cursor-pointer"
-                    onClick={() => {
-                      setSaveError(null);
-                      setSelectedRole(selected ? null : role);
+                    onClick={() => toggleRole(role)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        toggleRole(role);
+                      }
                     }}
                   >
                     <rect
@@ -306,7 +342,7 @@ export function ModelsPage() {
                   : "Applies immediately via PUT role-mappings; the diagram redraws from AMS-confirmed state only."}
               </p>
               {saveError && (
-                <p className="mt-2 text-xs text-destructive">Couldn&apos;t save: {saveError}</p>
+                <p className="mt-2 text-xs text-destructive">{saveError}</p>
               )}
             </div>
           )}
