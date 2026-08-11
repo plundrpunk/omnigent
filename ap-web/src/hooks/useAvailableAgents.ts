@@ -4,8 +4,7 @@ import { agentBaseName } from "@/lib/forkHarness";
 import { capitalizeAgentName } from "@/lib/agentLabels";
 import {
   nativeCodingAgentForAgentName,
-  nativeCodingAgentForAvailableAgent,
-  nativeCodingAgentForHarness,
+  nativeCodingAgentRowForName,
 } from "@/lib/nativeCodingAgents";
 
 export interface AvailableAgent {
@@ -32,13 +31,28 @@ const DISPLAY_NAMES: Record<string, string> = {
   debby: "Debby",
 };
 
-function displayNameForAgent(name: string, harness?: string | null): string {
+/**
+ * Label for a picker row. Resolved from the agent's NAME, not its
+ * harness: an agent merely built on `claude-native` (an AMS
+ * orchestrator, say) is not Claude Code and must not be labelled as it,
+ * or two unrelated rows read identically. Fork suffixes are stripped
+ * first so `claude-native-ui (fork abc)` still labels as Claude Code.
+ */
+function displayNameForAgent(name: string): string {
   return (
-    nativeCodingAgentForHarness(harness)?.displayName ??
+    nativeCodingAgentRowForName(agentBaseName(name))?.displayName ??
     nativeCodingAgentForAgentName(name)?.displayName ??
     DISPLAY_NAMES[name] ??
     capitalizeAgentName(name)
   );
+}
+
+/**
+ * The native coding agent a picker row IS, for collapse purposes.
+ * Name-based for the same reason as {@link displayNameForAgent}.
+ */
+function nativeRowIdentity(agent: Pick<AvailableAgent, "name">) {
+  return nativeCodingAgentRowForName(agentBaseName(agent.name));
 }
 
 /** Wire row of the built-in list, GET /v1/agents. */
@@ -68,7 +82,7 @@ async function fetchBuiltinAgents(): Promise<AvailableAgent[]> {
   return body.data.map((a) => ({
     id: a.id,
     name: a.name,
-    display_name: displayNameForAgent(a.name, a.harness),
+    display_name: displayNameForAgent(a.name),
     description: a.description ?? null,
     harness: a.harness ?? null,
     skills: a.skills ?? [],
@@ -149,7 +163,7 @@ async function enrichSessionAgent(scanned: ScannedSessionAgent): Promise<Availab
     const json = (await res.json()) as AgentObjectWire;
     return {
       ...fallback,
-      display_name: displayNameForAgent(json.name, json.harness),
+      display_name: displayNameForAgent(json.name),
       description: json.description ?? null,
       harness: json.harness ?? null,
       skills: json.skills ?? [],
@@ -215,13 +229,13 @@ async function fetchAvailableAgents(): Promise<AvailableAgent[]> {
   const all = [...builtins, ...enriched];
   const nativeRowByKey = new Map<string, AvailableAgent>();
   for (const agent of all) {
-    const spec = nativeCodingAgentForAvailableAgent(agent);
+    const spec = nativeRowIdentity(agent);
     if (!spec) continue;
     const existing = nativeRowByKey.get(spec.key);
     if (!existing || agent.name === spec.agentName) nativeRowByKey.set(spec.key, agent);
   }
   return all.filter((agent) => {
-    const spec = nativeCodingAgentForAvailableAgent(agent);
+    const spec = nativeRowIdentity(agent);
     return !spec || nativeRowByKey.get(spec.key) === agent;
   });
 }

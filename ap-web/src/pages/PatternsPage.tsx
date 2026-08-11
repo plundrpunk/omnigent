@@ -13,7 +13,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { PageShell } from "@/components/PageShell";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { amsGet } from "@/lib/ams";
+import { amsPost } from "@/lib/ams";
 import {
   failedACheck,
   finished,
@@ -282,10 +282,28 @@ function PatternCard({ pattern }: { pattern: Pattern }) {
   );
 }
 
+interface CandidateSearchResult {
+  memory?: { memory_id?: string; file_path?: string; tags?: string[] };
+  content_snippet?: string;
+}
+
 interface CandidateMemory {
   memory_id?: string;
   title?: string;
   content_snippet?: string;
+}
+
+/** "01_Semantic_Concepts/20260810233623_Pattern_SWE_Agent.md" -> "SWE Agent" */
+function candidateTitle(filePath: string | undefined): string | undefined {
+  if (!filePath) return undefined;
+  const base = filePath.split("/").pop() ?? "";
+  const cleaned = base
+    .replace(/^\d{14}_/, "")
+    .replace(/\.md$/, "")
+    .replace(/^Pattern_/, "")
+    .replace(/_+/g, " ")
+    .trim();
+  return cleaned.length > 0 ? cleaned : undefined;
 }
 
 function DiscoverFeed() {
@@ -297,11 +315,19 @@ function DiscoverFeed() {
     let cancelled = false;
     setCandidates(null);
     setFailed(false);
-    void amsGet<{ memories?: CandidateMemory[]; results?: CandidateMemory[] }>(
-      "api/v1/memories/?tag=discover-candidate&limit=50",
-    )
+    void amsPost<{ results?: CandidateSearchResult[] }>("api/v1/memories/search", {
+      query: "agent design pattern",
+      tags: ["discover-candidate"],
+      limit: 50,
+    })
       .then((body) => {
-        if (!cancelled) setCandidates(body.memories ?? body.results ?? []);
+        if (cancelled) return;
+        const mapped = (body.results ?? []).map((r) => ({
+          memory_id: r.memory?.memory_id,
+          title: candidateTitle(r.memory?.file_path),
+          content_snippet: r.content_snippet,
+        }));
+        setCandidates(mapped);
       })
       .catch(() => {
         if (!cancelled) setFailed(true);
@@ -314,8 +340,9 @@ function DiscoverFeed() {
   return (
     <div className="space-y-3">
       <p className="text-sm text-muted-foreground">
-        Scouted candidates land here weekly and wait for defenseclaw vetting — nothing
-        joins the library without {proofOfWhatWasDone}.
+        Scouted candidates land here and wait for evidence — nothing joins the
+        library without {proofOfWhatWasDone}. Defenseclaw guards executable
+        instantiations (skills, loops, automata), not prose cards.
       </p>
       {failed ? (
         <div className="space-y-2">
@@ -338,7 +365,7 @@ function DiscoverFeed() {
             <li key={c.memory_id ?? i} className="rounded-lg border border-border bg-card p-3">
               <div className="flex items-center justify-between gap-2">
                 <span className="text-sm font-medium">{c.title ?? "Untitled candidate"}</span>
-                <Badge variant="outline">awaiting vetting</Badge>
+                <Badge variant="outline">scouted — awaiting evidence</Badge>
               </div>
               {c.content_snippet && (
                 <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{c.content_snippet}</p>

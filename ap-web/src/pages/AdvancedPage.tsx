@@ -129,7 +129,7 @@ export function AdvancedPage() {
 
       <section aria-labelledby="agents-heading">
         <h2 id="agents-heading" className="text-lg font-semibold text-foreground">
-          Agents
+          CLI Agents
         </h2>
 
         {loading && <p className="mt-4 text-sm text-muted-foreground">Loading agents…</p>}

@@ -886,3 +886,24 @@ export async function approve(
     await readJsonOrThrow<{ queued: boolean; item_id?: string }>(res),
   );
 }
+
+/**
+ * Toggle blanket auto-approval for a session. While enabled the server
+ * answers every PermissionRequest hook with "allow" without parking a
+ * card, and the web UI auto-accepts any elicitation that still arrives
+ * (SDK-harness approvals ride a different path than the hook).
+ */
+export async function putAutoApprove(
+  sessionId: string,
+  enabled: boolean,
+): Promise<{ enabled: boolean }> {
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/auto-approve`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    },
+  );
+  return readJsonOrThrow<{ enabled: boolean }>(res);
+}

@@ -32,6 +32,8 @@
 //      on `POST /v1/sessions/{id}/elicitations/{eid}/resolve`,
 //   3. rolls back to "pending" on network error.
 
+import { useEffect } from "react";
+
 import {
   CheckIcon,
   ClipboardListIcon,
@@ -49,6 +51,7 @@ import {
   parseAskUserQuestionPreview,
 } from "@/lib/askUserQuestion";
 import { formatPreview } from "@/lib/previewFormat";
+import { useAutoApproveStore } from "@/store/autoApproveStore";
 import { useChatStore } from "@/store/chatStore";
 import { AskUserQuestionForm, type AskUserQuestionAnswers } from "./AskUserQuestionForm";
 import { ExitPlanModeReview } from "./ExitPlanModeReview";
@@ -166,6 +169,27 @@ export function ApprovalCard({
     ((id, action, content) => {
       void useChatStore.getState().submitApproval(id, action, content);
     });
+
+  // "Accept all" switch. The server label covers PermissionRequest-hook
+  // prompts before a card exists; this covers elicitations that still
+  // arrive (SDK harnesses). Auto-accept fires at most once per card via
+  // the responded-status guard, and never for external-URL elicitations
+  // (those are third-party auth pages a human must actually visit).
+  const sessionId = useChatStore((s) => s.conversationId);
+  const autoApprove = useAutoApproveStore((s) =>
+    sessionId ? (s.enabled[sessionId] ?? false) : false,
+  );
+  const autoApproveError = useAutoApproveStore((s) => s.error);
+  const setAutoApprove = useAutoApproveStore((s) => s.setEnabled);
+  const externalUrlPending =
+    typeof url === "string" && url.length > 0 && !url.startsWith("/approve/");
+  useEffect(() => {
+    if (autoApprove && status === "pending" && !externalUrlPending) {
+      submit(elicitationId, "accept");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- fire on arrival/toggle only
+  }, [autoApprove, status, elicitationId, externalUrlPending]);
+
   const submitBinary = (action: "accept" | "decline") => {
     submit(elicitationId, action);
   };
@@ -244,6 +268,21 @@ export function ApprovalCard({
     Array.isArray(response?.content?.execpolicy_amendment) &&
     response.content.execpolicy_amendment.every((entry) => typeof entry === "string");
   const acceptedAllEdits = response?.content?.allow_all_edits === true;
+  const autoApproveToggle = sessionId ? (
+    <label className="flex cursor-pointer items-center gap-2 pt-2 text-xs text-muted-foreground">
+      <input
+        type="checkbox"
+        data-testid="auto-approve-toggle"
+        checked={autoApprove}
+        onChange={(e) => void setAutoApprove(sessionId, e.target.checked)}
+        className="size-3.5 accent-primary"
+      />
+      Accept all future requests in this session
+      {autoApproveError ? (
+        <span className="text-destructive">({autoApproveError})</span>
+      ) : null}
+    </label>
+  ) : null;
   const binaryButtons = (
     <div className="flex flex-wrap gap-2 pt-1">
       <Button size="sm" onClick={() => submitBinary("accept")}>
@@ -260,6 +299,7 @@ export function ApprovalCard({
         <XIcon className="mr-1 size-3.5" />
         Reject
       </Button>
+      {autoApproveToggle}
     </div>
   );
   const codexCommandButtons = (

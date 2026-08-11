@@ -426,5 +426,50 @@ describe("useAvailableAgents", () => {
         skills: [],
       },
     ]);
+  });it("keeps a custom agent built on a native harness as its own picker row", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          // Canonical wrapper row and the legacy seeded row: one choice,
+          // so these two collapse into a single "Claude Code" entry.
+          { id: "ag_native", name: "claude-native-ui", harness: "claude-native" },
+          { id: "ag_seeded", name: "claude_code", harness: "claude-native" },
+          // A custom orchestrator that merely RUNS ON claude-native. It is
+          // not Claude Code: it must keep its own row and its own label.
+          // Collapsing it by harness made it unlaunchable from the picker.
+          {
+            id: "ag_prime",
+            name: "abot_prime",
+            harness: "claude-native",
+            description: "AMS fleet orchestrator.",
+          },
+        ],
+        has_more: false,
+      }),
+      [SCAN_URL]: EMPTY_SCAN,
+    });
+
+    const { result } = renderHook(() => useAvailableAgents(), { wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(result.current.data).toEqual([
+      {
+        id: "ag_native",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "ag_prime",
+        name: "abot_prime",
+        display_name: "Abot_prime",
+        description: "AMS fleet orchestrator.",
+        harness: "claude-native",
+        skills: [],
+      },
+    ]);
   });
 });

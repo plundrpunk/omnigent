@@ -1,62 +1,21 @@
 [
   {
-    "letter": "c",
-    "goal_id": "aos-p1c-system-copy",
-    "run_id": "d6c08314-6501-4751-8154-0b9d22ad6e2b",
-    "status": "completed",
-    "exit_code": 0,
-    "files": [
-      "p-web/src/pages/SystemPage.tsx"
-    ],
-    "gates": "type-check + suite green",
-    "outcome": "committed"
-  },
-  {
     "letter": "d",
     "goal_id": "aos-p1d-fleet-copy",
-    "run_id": "0c43e9d1-1923-4c00-b449-bce68a75fac1",
+    "run_id": "4151af93-ef2e-4f25-b545-e232676a3a10",
     "status": "blocked",
     "exit_code": 3,
-    "files": [
-      "p-web/src/pages/FleetPage.tsx"
-    ],
-    "gates": "type-check failed:  | src/pages/FleetPage.tsx(369,40): error TS2339: Property 'last_heartbeat' does not exist on type 'WardenAgent'. | src/pages/FleetPage.tsx(369,84): error TS2339: Property 'last_heartbeat' does not exist on type 'WardenAgent'.",
-    "outcome": "reverted"
+    "files": [],
+    "outcome": "no-op"
   },
   {
     "letter": "f",
     "goal_id": "aos-p1f-models-copy-keyboard",
-    "run_id": "e05b849b-f0c3-4ea1-8ece-0b06340e76ec",
+    "run_id": "fefc90d4-571d-4faa-b7a0-982bd5df3490",
     "status": "blocked",
     "exit_code": 3,
     "files": [
-      "p-web/src/pages/ModelsPage.test.tsx",
-      "ap-web/src/pages/ModelsPage.tsx"
-    ],
-    "gates": "tests failed: \u001b[22m\u001b[39m[nativeBridge] electron setBadgeCount failed: Error: ipc down | \u001b[31m\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u001b[39m\u001b[1m\u001b[41m Failed Tests 2 \u001b[49m\u001b[22m\u001b[31m\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u001b[39m",
-    "outcome": "reverted"
-  },
-  {
-    "letter": "j",
-    "goal_id": "aos-p1j-workloop-copy",
-    "run_id": "5acebb5e-0a70-4d47-b5b9-5517bf1fe4ea",
-    "status": "blocked",
-    "exit_code": 3,
-    "files": [
-      "p-web/src/shell/WorkLoopPanel.test.tsx",
-      "ap-web/src/shell/WorkLoopPanel.tsx"
-    ],
-    "gates": "type-check + suite green",
-    "outcome": "parked-for-review"
-  },
-  {
-    "letter": "l",
-    "goal_id": "aos-p1l-sidebar-three-nav",
-    "run_id": "9a6eabce-6e3f-4a6d-9b95-371c0c828acb",
-    "status": "blocked",
-    "exit_code": 3,
-    "files": [
-      "p-web/src/shell/Sidebar.tsx"
+      "p-web/src/pages/ModelsPage.tsx"
     ],
     "gates": "type-check + suite green",
     "outcome": "parked-for-review"

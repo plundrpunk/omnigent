@@ -419,6 +419,20 @@ _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
 _LAST_CONTEXT_TOKENS_LABEL_KEY: str = "omnigent.last_context_tokens"
 _LAST_CONTEXT_WINDOW_LABEL_KEY: str = "omnigent.last_context_window"
 
+# Durable reason for the most recent failed turn, written from the
+# runner's ``session.status: failed`` edge and read back by
+# ``_get_session_snapshot``. A setup-phase failure never persists a
+# ``response.failed`` item, so without this label the live SSE push is
+# the only carrier of the reason and a reload renders a bare "failed".
+_LAST_TASK_ERROR_LABEL_KEY: str = "omnigent.last_task_error"
+
+# Blanket approval switch. When a session carries this label with value
+# "true", the PermissionRequest hook answers "allow" immediately instead
+# of parking for a human verdict. Set via PUT /sessions/{id}/auto-approve;
+# cleared by writing any other value. Deliberately session-scoped -- there
+# is no global variant, so one reckless session can't disarm the rest.
+_AUTO_APPROVE_LABEL_KEY: str = "omnigent.auto_approve"
+
 # Todo-list update from the claude-native forwarder. Carries the raw
 # todo items captured from PostToolUse/TodoWrite hook events. Payload
 # shape: ``{"todos": [{"content": "...", "status": "...", "activeForm": ...}]}``.
@@ -7984,6 +7998,26 @@ async def _relay_runner_stream(
                             # — the PTY idle oscillates on mid-turn lulls and
                             # would deliver a premature, lock-out completion.
                             _publish_status(session_id, status, status_error)
+                            # Durability: this push carries the only copy of a
+                            # setup-phase failure's reason. A client that opens or
+                            # reloads after it is gone reads the snapshot instead,
+                            # which had no error source but the runner-exit report --
+                            # so the turn rendered as a silent "failed" with an empty
+                            # banner. Persist the reason where the snapshot can read
+                            # it; ``post_event`` clears it on the next user message.
+                            if status == "failed" and status_error is not None:
+                                await asyncio.to_thread(
+                                    conversation_store.set_labels,
+                                    session_id,
+                                    {
+                                        _LAST_TASK_ERROR_LABEL_KEY: json.dumps(
+                                            {
+                                                "code": status_error.code,
+                                                "message": status_error.message,
+                                            }
+                                        )
+                                    },
+                                )
                         if status == "running":
                             text_acc.clear()
                         continue
@@ -13400,6 +13434,35 @@ def create_sessions_router(
         # prompt was answered in the TUI. We pass ``tool_name`` /
         # ``tool_input`` below so that result can be correlated back to
         # THIS prompt (see _signal_terminal_resolved_harness_elicitation).
+        # Blanket auto-approve: the session owner opted into approving
+        # every request (the Models-of-trust equivalent of Claude Code's
+        # bypassPermissions), so answer allow without parking. Checked
+        # AFTER payload validation -- malformed hook bodies still fail
+        # loudly -- and logged per-decision so the transcript of what was
+        # auto-approved survives in the server log.
+        _conv_aa = await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if (
+            _conv_aa is not None
+            and _conv_aa.labels.get(_AUTO_APPROVE_LABEL_KEY) == "true"
+        ):
+            _logger.info(
+                "auto-approved permission request: session=%s tool=%s",
+                session_id,
+                tool_name,
+            )
+            return Response(
+                content=json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PermissionRequest",
+                            "decision": {"behavior": "allow"},
+                        }
+                    }
+                ),
+                media_type="application/json",
+            )
         cwd = payload.get("cwd")
         if cwd is not None and not isinstance(cwd, str):
             cwd = None
@@ -15273,6 +15336,35 @@ def create_sessions_router(
         path = f"/v1/sessions/{session_id}/resources/{resource_id}"
         return await _proxy_get_to_runner(session_id, path)
 
+    @router.put("/sessions/{session_id}/auto-approve")
+    async def set_auto_approve(request: Request, session_id: str) -> dict[str, bool]:
+        """Toggle blanket auto-approval of permission/auth requests.
+
+        Body: ``{"enabled": true|false}``. Sets/clears the
+        ``omnigent.auto_approve`` session label, which the
+        PermissionRequest hook consults before parking a prompt.
+        Owner-level edit access required -- approving everything is a
+        trust decision, not a viewer affordance.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access_and_level(
+            user_id, session_id, LEVEL_EDIT, permission_store, conversation_store
+        )
+        try:
+            body = await request.json()
+        except json.JSONDecodeError as exc:
+            raise OmnigentError(
+                "auto-approve body must be JSON",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        enabled = bool(isinstance(body, dict) and body.get("enabled") is True)
+        await asyncio.to_thread(
+            conversation_store.set_labels,
+            session_id,
+            {_AUTO_APPROVE_LABEL_KEY: "true" if enabled else ""},
+        )
+        return {"enabled": enabled}
+
     # ── POST /sessions/{session_id}/events ───────────────────────
 
     @router.post(
@@ -15495,6 +15587,18 @@ def create_sessions_router(
                 f"Unknown event type: {body.type!r}. "
                 f"Allowed types: {sorted(_ALLOWED_EVENT_TYPES)}",
                 code=ErrorCode.INVALID_INPUT,
+            )
+        # A new user turn supersedes the previous turn's failure: drop the
+        # durable error label so the snapshot stops replaying a stale banner.
+        # Cleared here rather than on a ``running`` status edge because
+        # claude-native / pi-native sessions never publish ``running`` through
+        # the runner relay (the PTY watcher owns that edge) -- a status-based
+        # clear would pin exactly those sessions to a resolved error.
+        if body.type == "message" and conv.labels.get(_LAST_TASK_ERROR_LABEL_KEY):
+            await asyncio.to_thread(
+                conversation_store.set_labels,
+                session_id,
+                {_LAST_TASK_ERROR_LABEL_KEY: ""},
             )
         # For item types, validate the data payload shape against
         # the item-type's discriminator class. The control types
@@ -17454,6 +17558,25 @@ async def _get_session_snapshot(
     raw_label = conv.labels.get(_LAST_CONTEXT_TOKENS_LABEL_KEY)
     if isinstance(raw_label, str) and raw_label.isdigit():
         last_total_tokens = int(raw_label)
+    # Durable failure reason from the last ``session.status: failed``
+    # edge. Without it the live push is the only carrier, so a reload
+    # -- or a client opening the session after the fact -- renders
+    # "failed" with no message. ``status`` is forced only when no turn
+    # is running: the label is cleared when the next message is posted,
+    # so a set label means nothing has superseded the failure yet.
+    raw_task_error = conv.labels.get(_LAST_TASK_ERROR_LABEL_KEY)
+    if isinstance(raw_task_error, str) and raw_task_error:
+        try:
+            parsed_task_error = json.loads(raw_task_error)
+        except json.JSONDecodeError:
+            parsed_task_error = None
+        if isinstance(parsed_task_error, dict):
+            err_code = parsed_task_error.get("code")
+            err_message = parsed_task_error.get("message")
+            if isinstance(err_code, str) and isinstance(err_message, str):
+                last_task_error = {"code": err_code, "message": err_message}
+                if status != "running":
+                    status = "failed"
     # Runner-crash durability: if the session's bound runner reported an
     # unexpected exit (host.runner_exited → RunnerExitReports), surface the
     # cause as last_task_error so a reload/late-open still renders the error

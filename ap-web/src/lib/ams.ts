@@ -142,6 +142,23 @@ export async function fetchRoleMappings(): Promise<Record<string, string>> {
 }
 
 /** PUT a write-table AMS path via the bridge (see routes/ams.py P1). */
+export async function amsPost<T = unknown>(path: string, body: unknown): Promise<T> {
+  const resp = await hostFetch(`/v1/ams/${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const payload: unknown = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    const detail =
+      payload && typeof payload === "object" && "detail" in payload
+        ? (payload as { detail: unknown }).detail
+        : undefined;
+    throw new AmsError("The AMS request failed. Please try again.", resp.status, detail);
+  }
+  return payload as T;
+}
+
 export async function amsPut<T = unknown>(path: string, body: unknown): Promise<T> {
   const resp = await hostFetch(`/v1/ams/${path}`, {
     method: "PUT",
@@ -166,6 +183,37 @@ export async function amsPut<T = unknown>(path: string, body: unknown): Promise<
  */
 export async function putRoleMappings(update: Record<string, string>): Promise<unknown> {
   return amsPut("api/v1/llm-providers/role-mappings", update);
+}
+
+// ── Fleet model assignment (Models page, P3.2) ───────────────
+
+export interface FleetModelResult {
+  ok: boolean;
+  agent_id: string;
+  model: string;
+  hand_toml_updated: boolean;
+  container: string;
+  restarted: boolean;
+  restart_error?: string | null;
+}
+
+/**
+ * Assign a fleet hand's default model. This is the load-bearing path:
+ * AMS edits the hand's HAND.toml (the only place the abot runtime reads
+ * a model from) and restarts its container so the change applies now.
+ * The hand re-registers on boot, refreshing warden metadata.
+ */
+export async function putFleetModel(agentId: string, model: string): Promise<FleetModelResult> {
+  return amsPut<FleetModelResult>(
+    `api/warden/agents/${encodeURIComponent(agentId)}/model`,
+    { model },
+  );
+}
+
+/** Current default model from a warden agent's metadata, if reported. */
+export function wardenDefaultModel(agent: WardenAgent): string | null {
+  const m = agent.metadata?.["default_model"];
+  return typeof m === "string" && m.length > 0 ? m : null;
 }
 
 // ── Automata stats (training / eval gate window) ─────────────

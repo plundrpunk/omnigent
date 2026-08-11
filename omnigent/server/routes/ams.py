@@ -6,16 +6,39 @@ data (skills, schedules, automata, agents, goals, warden fleet,
 observatory executions) without shipping the AMS API key to the
 browser.
 
-Writes (Models & Assignment plan, P1) are an *explicit table* of
-method + exact path shape — nothing generic rides through:
+Writes are an *explicit table* of method + exact path shape — nothing
+generic rides through. Models & Assignment (P1/P3.2):
 
 - ``PUT api/v1/llm-providers/role-mappings`` — role → provider edits
 - ``PUT api/v1/llm-providers/spawn-defaults`` — fresh-worker defaults
 - ``PATCH api/v1/agents/{agent_id}`` — per-agent config (model)
 - ``POST api/warden/agents/{agent_id}/directive`` — live reassign
+- ``PUT api/warden/agents/{agent_id}/model`` — fleet model assignment
+
+Loops (the ``aos.loop.v1`` builder saves and runs through AMS automata
+and schedules — see ``ap-web/src/pages/LoopsPage.tsx``):
+
+- ``POST api/v1/automata/`` — save a loop as an automaton
+- ``PUT api/v1/automata/{automaton_id}`` — edit a saved loop
+- ``POST api/v1/automata/execute`` — run one now
+- ``POST api/v1/schedules`` — put a loop on a cron
+- ``PUT api/v1/schedules/{schedule_id}`` — edit that schedule
+- ``POST api/v1/schedules/{schedule_id}/{enable,disable,run}``
+
+Note what is *not* here. Automata carry executable code, so only the
+create/update/execute trio is reachable: ``/suggest``,
+``/convert-procedure``, ``/ab-test``, ``/{id}/version``,
+``/{id}/rollback/{n}``, ``/compositions/*`` and every ``DELETE`` stay
+off the table until a feature actually needs them. Path parameters are
+matched as UUIDs (AMS's own key shape), not as ``.+``.
 
 Every forwarded write is logged (user, method, path). Anything not in
 the table answers 403.
+
+Two surfaces deliberately do *not* ride this bridge: the harness goal
+contract runner is a first-class Omnigent route
+(``POST /v1/goal`` — see ``routes/goal.py``), and session mutations go
+through ``routes/sessions.py``. Neither needs an entry here.
 
 Configuration comes from the server environment:
 
@@ -26,6 +49,7 @@ Configuration comes from the server environment:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -64,11 +88,36 @@ _ALLOWED_GET_PREFIXES: tuple[str, ...] = (
 #: The write table: (HTTP method, exact-path regex). Additions here are
 #: deliberate, reviewed acts — never widen a pattern to "save a row".
 _AGENT_ID = r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}"
+#: AMS keys automata and schedules by UUID (``automaton_id: UUID`` in
+#: ``app/api/automata.py``, ``UUID(schedule_id)`` in ``app/api/schedules.py``).
+#: Matching the real key shape — not ``[^/]+`` — keeps a stray segment from
+#: reaching AMS just because it sat in the right position.
+_UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 _ALLOWED_WRITE_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("PUT", re.compile(r"^api/v1/llm-providers/role-mappings$")),
     ("PUT", re.compile(r"^api/v1/llm-providers/spawn-defaults$")),
     ("PATCH", re.compile(rf"^api/v1/agents/{_AGENT_ID}$")),
     ("POST", re.compile(rf"^api/warden/agents/{_AGENT_ID}/directive$")),
+    # Fleet model assignment (Models page, P3.2): edits the hand's
+    # HAND.toml default_model and restarts its container — the only
+    # write path the abot runtime actually reads at startup.
+    ("PUT", re.compile(rf"^api/warden/agents/{_AGENT_ID}/model$")),
+    # Loops (Loops page): a loop is stored as an AMS automaton and run
+    # either on demand or on a schedule. AMS declares create as
+    # ``@router.post("/")``, so the trailing slash is the real path;
+    # both spellings are accepted here and forwarded verbatim.
+    ("POST", re.compile(r"^api/v1/automata/?$")),
+    ("PUT", re.compile(rf"^api/v1/automata/{_UUID}$")),
+    ("POST", re.compile(r"^api/v1/automata/execute$")),
+    # ...and the schedule that drives it. AMS declares create as
+    # ``@router.post("")`` — no trailing slash on that one.
+    ("POST", re.compile(r"^api/v1/schedules/?$")),
+    ("PUT", re.compile(rf"^api/v1/schedules/{_UUID}$")),
+    ("POST", re.compile(rf"^api/v1/schedules/{_UUID}/(?:enable|disable|run)$")),
+    # Patterns page (Discover tab): hybrid search is the only AMS route
+    # that filters by tag (GET /api/v1/memories/ ignores tag params).
+    # Read-shaped query behind a POST verb -- it mutates nothing.
+    ("POST", re.compile(r"^api/v1/memories/search$")),
 )
 
 _TIMEOUT_SECONDS = 20.0
@@ -180,18 +229,27 @@ def create_ams_router(auth_provider: AuthProvider | None = None) -> APIRouter:
                 status_code=403,
                 detail=f"{method} not in AMS write table: {path}",
             )
-        try:
-            body = await request.json()
-        except (ValueError, UnicodeDecodeError):
-            raise HTTPException(status_code=422, detail="request body must be JSON") from None
+        # Action endpoints (schedule enable/disable/run) take no body, so an
+        # empty request forwards as a bodiless one. A body that is present but
+        # not JSON is still a 422 — it never reaches AMS half-parsed.
+        raw = await request.body()
+        body: Any = None
+        if raw:
+            try:
+                body = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                raise HTTPException(status_code=422, detail="request body must be JSON") from None
         logger.info("ams-bridge write: user=%s %s /%s", user or "single-user", method, path)
         headers: dict[str, str] = {}
         key = _api_key()
         if key:
             headers["X-API-Key"] = key
+        send_kwargs: dict[str, Any] = {"headers": headers}
+        if body is not None:
+            send_kwargs["json"] = body
         try:
             async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
-                resp = await client.request(method, f"{base}/{path}", json=body, headers=headers)
+                resp = await client.request(method, f"{base}/{path}", **send_kwargs)
         except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"AMS unreachable: {exc}") from exc
         try:

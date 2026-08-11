@@ -10,6 +10,14 @@ export type NativeCodingAgentCapability = "permissionMode" | "approvalMode";
 export interface NativeCodingAgentSpec {
   key: NativeCodingAgentIconKind;
   agentName: string;
+  /**
+   * Every agent name that IS this native coding agent rather than
+   * merely being built on its harness: the canonical wrapper row plus
+   * the legacy seeded row. Only these collapse into one picker entry.
+   * Harness alone is not identity -- a custom agent can be built on
+   * `claude-native` and still be its own choice (#abot_prime).
+   */
+  aliasAgentNames: readonly string[];
   harness: string;
   wrapperLabel: string;
   displayName: string;
@@ -22,6 +30,7 @@ export const NATIVE_CODING_AGENTS = [
   {
     key: "claude",
     agentName: "claude-native-ui",
+    aliasAgentNames: ["claude-native-ui", "claude_code"],
     harness: "claude-native",
     wrapperLabel: "claude-code-native-ui",
     displayName: "Claude Code",
@@ -32,6 +41,7 @@ export const NATIVE_CODING_AGENTS = [
   {
     key: "codex",
     agentName: "codex-native-ui",
+    aliasAgentNames: ["codex-native-ui", "codex"],
     harness: "codex-native",
     wrapperLabel: "codex-native-ui",
     displayName: "Codex",
@@ -42,6 +52,7 @@ export const NATIVE_CODING_AGENTS = [
   {
     key: "pi",
     agentName: "pi-native-ui",
+    aliasAgentNames: ["pi-native-ui", "pi"],
     harness: "pi-native",
     wrapperLabel: "pi-native-ui",
     displayName: "Pi",
@@ -55,6 +66,11 @@ const BY_AGENT_NAME: Map<string, NativeCodingAgentSpec> = new Map(
 );
 const BY_HARNESS: Map<string, NativeCodingAgentSpec> = new Map(
   NATIVE_CODING_AGENTS.map((agent) => [agent.harness, agent]),
+);
+const BY_ALIAS_NAME: Map<string, NativeCodingAgentSpec> = new Map(
+  NATIVE_CODING_AGENTS.flatMap((agent) =>
+    agent.aliasAgentNames.map((alias) => [alias, agent] as const),
+  ),
 );
 const BY_WRAPPER: Map<string, NativeCodingAgentSpec> = new Map(
   NATIVE_CODING_AGENTS.map((agent) => [agent.wrapperLabel, agent]),
@@ -78,6 +94,25 @@ export function nativeCodingAgentForHarness(
 ): NativeCodingAgentSpec | undefined {
   if (harness == null) return undefined;
   return BY_HARNESS.get(HARNESS_ALIASES[harness] ?? harness);
+}
+
+/**
+ * The native coding agent this name IS, if any -- identity, not
+ * capability. Use this to decide whether two picker rows are the same
+ * choice, or what to label a row.
+ *
+ * Deliberately narrower than {@link nativeCodingAgentForAvailableAgent},
+ * which matches on harness first and so claims EVERY agent built on
+ * `claude-native` / `codex-native` / `pi-native`. That breadth is right
+ * for icons and capability probes (a custom claude-native agent really
+ * does support permission modes) and wrong for identity: it collapsed
+ * custom orchestrators out of the picker entirely, leaving them
+ * unlaunchable.
+ */
+export function nativeCodingAgentRowForName(
+  name: string | null | undefined,
+): NativeCodingAgentSpec | undefined {
+  return name == null ? undefined : BY_ALIAS_NAME.get(name);
 }
 
 export function nativeCodingAgentForWrapper(

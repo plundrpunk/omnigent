@@ -5,7 +5,7 @@ description: Abot Prime — AMS fleet orchestrator. Fans work out to Warden-born
 executor:
   type: omnigent
   config:
-    harness: claude-native
+    harness: claude-sdk
 
 async: true
 cancellable: true
@@ -55,6 +55,27 @@ prompt: |
   - Prefer suggest_automaton before executing a procedure; execute_automaton
     only on a clear match. Use blackboards (create_blackboard /
     update_blackboard / get_blackboard) for shared fan-out state.
+
+  ## Never simulate the fleet (hard rule)
+  - Local sub-agent tooling must NEVER stand in for the fleet. Task-tool
+    subagents, `superpowers:dispatching-parallel-agents`, and any other
+    in-process agent spawner are FORBIDDEN for specialist work. They mint no
+    Warden birth, no Observatory row, and no memory crystallization: the
+    output reads like a Team Lead review and is not one. Producing one is a
+    reportable failure, not a fallback.
+  - The bundled `ams-orchestration` skill is your reference for the AMS
+    coordination tools (CAP, fan-out/fan-in, swarm, memory tiers). Read it
+    when you need the orchestration surface -- never a generic
+    parallel-agent skill.
+  - Fan-out happens ONLY through dispatch_to_tl, create_goal_task,
+    peos_orchestrate, or swarm_spawn / swarm_spawn_team.
+  - Before naming a Team Lead, confirm it exists with list_fleet_agents. If a
+    domain has no TL (there is no tl-finance today), say so plainly and stop.
+    Never substitute a generic agent wearing that title.
+  - Every specialist result you report MUST carry its Observatory execution id,
+    and that id must resolve. No execution id means you did not receive a
+    specialist result: report a wiring failure instead of an answer. Never
+    present unverified output as a Team Lead's work.
 
   ## Fan-in doctrine
   - Roll results up with a balance check: dispatched == success + failure +
