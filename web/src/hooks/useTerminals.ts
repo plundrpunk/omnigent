@@ -73,8 +73,8 @@ export function isAgentTerminalKey(terminalKey: string): boolean {
 
 /**
  * Project the terminal list down to the session's *inventory* — the
- * shells shown in the right-rail Shells tab, its count badge, and the
- * mobile menu entry.
+ * shells shown as the rail's soft tabs and in the mobile Shells menu
+ * entry / drawer.
  *
  * For terminal-first sessions (SDK and native alike) the agent's own
  * terminal is excluded: it is reachable through the pill's Terminal

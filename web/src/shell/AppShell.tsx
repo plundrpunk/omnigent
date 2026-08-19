@@ -136,9 +136,9 @@ import type { RightRailTab } from "./railTabs";
  * folder tree) and Changes (changed-files-only flat list) are peer tabs —
  * the selected tab *is* the scope. Opening a file (chat link or rail click)
  * forces the rail to a files scope so the viewer is visible. Terminal-first
- * sessions render the terminal inline in main and therefore hide the rail's
- * Terminals tab. The Agents tab only appears once there's more than one
- * agent (the root has at least one child).
+ * sessions render the terminal inline in main. Shells have no nav tab — they
+ * open as closable soft tabs in the rail's tab strip. The Agents tab only
+ * appears once there's more than one agent (the root has at least one child).
  */
 export function AppShell() {
   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
@@ -158,7 +158,7 @@ export function AppShell() {
     conversationId ? (readSessionWorkspaceState(conversationId).rightRailTab ?? "files") : "files",
   );
   // The comments panel only contributes to the min width when the rail is
-  // actually showing the file viewer — on the Terminals tab the FileViewer
+  // actually showing the file viewer — on any other tab the FileViewer
   // is unmounted, so the 720 floor would just waste horizontal space. Both
   // the Files and Changes tabs surface the inline viewer, so either qualifies.
   // 240px (CommentsPanel default/min width) + 480px comfortable code viewer
@@ -532,11 +532,11 @@ export function AppShell() {
   // Claude-native sub-agents have no terminal of their own — the parent
   // owns the tmux pane.
   const isClaudeNativeSubagent = wrapperLabel === "claude-code-native-ui-subagent";
-  // Hide the rail Shells tab only for claude-native sub-agents — they
-  // have no terminals of their own (the parent owns the tmux pane).
-  // Native top-level sessions get the same Shells rail as SDK ones;
-  // their vendor pane is excluded from the inventory like the SDK
-  // REPL (see ``inventoryTerminals``).
+  // Hide shells (the mobile Shells drawer entry) only for claude-native
+  // sub-agents — they have no terminals of their own (the parent owns the
+  // tmux pane). Native top-level sessions get shells like SDK ones; their
+  // vendor pane is excluded from the inventory like the SDK REPL (see
+  // ``inventoryTerminals``).
   const hideTerminalsTab = isClaudeNativeSubagent;
   // Inventory view of the terminal list for the rail tab, its badge,
   // and the mobile menu. The pill surfaces (``terminalsAvailable``,
@@ -630,32 +630,26 @@ export function AppShell() {
         // Agents tab is unconditional: the panel always lists at least
         // the main agent (its "main" row), so there's never a dead end.
         subagents: true,
-        // Shells tab: shown only once a shell actually exists — creating one
-        // is now done from the tab strip's "+" menu, so an agent that merely
-        // *declares* shell access with no open shell shows no (empty) tab.
-        // Inventory view: the embedded REPL terminal of terminal-first SDK
-        // sessions doesn't count. ``hideTerminalsTab`` is label-derived and
-        // ``railTerminals`` starts empty while the agent loads, so native
-        // sessions don't flash the tab.
-        terminals: !hideTerminalsTab && railTerminals.length > 0,
+        // Shells have no nav tab — they open as closable soft tabs in the
+        // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
+        // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
         todos: todosSupported && todos.length > 0,
       }) as const,
-    [showFilesPanel, hideTerminalsTab, railTerminals.length, todosSupported, todos.length],
+    [showFilesPanel, todosSupported, todos.length],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
   // no-filesystem agent with no terminals/sub-agents/todos would otherwise
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
-  // Keep the selected tab valid. When the current tab disappears — files
-  // panel turns off, or the Shells tab hides (native wrapper / no shell
-  // and no shell access) — fall back to the first still-visible tab in
-  // display order (Files · Changes · Agents · Shells · Tasks · Browser). Picking
+  // Keep the selected tab valid. When the current tab disappears — e.g. the
+  // files panel turns off — fall back to the first still-visible tab in
+  // display order (Files · Changes · Agents · Tasks · Browser). Picking
   // the first available (rather than ping-ponging between two effects) keeps
   // this convergent even when several tabs vanish at once.
   useEffect(() => {
     if (railTabsAvailable[rightRailTab]) return;
-    const next = (["files", "changes", "subagents", "terminals", "todos", "browser"] as const).find(
+    const next = (["files", "changes", "subagents", "todos", "browser"] as const).find(
       (t) => railTabsAvailable[t],
     );
     if (next) setRightRailTab(next);
@@ -870,7 +864,7 @@ export function AppShell() {
       return false;
     });
     // A selected file must be visible in the rail. The Files and Changes tabs
-    // both surface the inline viewer; the Agents/Todos/Terminals tabs don't, so
+    // both surface the inline viewer; the Agents/Todos tabs don't, so
     // pull the rail to Files unless it's already on a files scope.
     if (nextSelected && nextTab !== "files" && nextTab !== "changes") {
       nextTab = "files";
@@ -944,11 +938,9 @@ export function AppShell() {
       setSubagentsPanelOpen(false); // close mobile agents drawer
       setTodosPanelOpen(false); // close mobile tasks drawer
       // Pull the rail to the Files tab when parked on a tab where the viewer
-      // won't render (Terminals, Subagents, Todos). The Files tab surfaces the
+      // won't render (Subagents, Todos). The Files tab surfaces the
       // FileViewer inline, so leave it undisturbed.
-      setRightRailTab((prev) =>
-        prev === "terminals" || prev === "subagents" || prev === "todos" ? "files" : prev,
-      );
+      setRightRailTab((prev) => (prev === "subagents" || prev === "todos" ? "files" : prev));
       // Reveal the rail so the viewer is actually visible — a session the user
       // collapsed (or one that started collapsed via the Appearance default)
       // would otherwise route the file into an invisible panel. Persist
@@ -1284,7 +1276,7 @@ export function AppShell() {
 
   // Close a single shell tab. If it was the active one, activate its neighbor
   // (prefer the previous tab, else the next); when none remain the selection
-  // clears and the rail falls back to the Shells list. Mirrors ``closeFile``.
+  // clears and the rail falls back to its default content. Mirrors ``closeFile``.
   const closeTerminalTab = useCallback((key: string) => {
     setOpenTerminals((prev) => {
       const idx = prev.indexOf(key);
@@ -1301,8 +1293,8 @@ export function AppShell() {
 
   // Prune shell tabs whose terminal has gone away (closed by the agent, or the
   // runner went offline and emptied the list). Keeps the strip from pointing at
-  // dead PTYs; the active selection falls back to the Shells list when its tab
-  // is dropped. Skip while the list is still loading OR the fetch errored so
+  // dead PTYs; the active selection falls back to the rail's default content
+  // when its tab is dropped. Skip while the list is still loading OR the fetch errored so
   // restored (persisted) tabs aren't wiped by a non-authoritative empty list —
   // an errored read is `[]` too, and pruning against it would discard tabs
   // whose PTYs we simply couldn't reach.
@@ -1356,9 +1348,10 @@ export function AppShell() {
     setSubagentsPanelOpen(true);
   }
 
-  // Mobile FAB → "Shells" opens the desktop rail's Shells tab content as a
-  // full-screen drawer. This preserves the "+ New shell" empty state on
-  // phones instead of requiring an existing shell before the entry works.
+  // Mobile FAB → "Shells" opens the session's shells list as a full-screen
+  // drawer (there is no desktop Shells tab; desktop opens shells as soft
+  // tabs). This preserves the "+ New shell" empty state on phones instead
+  // of requiring an existing shell before the entry works.
   function openShellsPanel() {
     setSelectedFilePath(null); // close file viewer
     clearFileViewerUrl();
@@ -1752,8 +1745,6 @@ export function AppShell() {
                     showFilesPanel={showFilesPanel}
                     showBrowserTab={railTabsAvailable.browser}
                     changedCount={changedCount}
-                    showShellsTab={railTabsAvailable.terminals}
-                    terminalsLength={railTerminals.length}
                     subagentsWorking={subagentsWorking}
                     agentCount={agentCount}
                     todosSupported={todosSupported}

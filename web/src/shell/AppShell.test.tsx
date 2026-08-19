@@ -990,110 +990,6 @@ describe("Right-rail terminals card", () => {
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-view", "chat");
   });
 
-  it("renders the Terminals tab in a regular session once a terminal is attached, and the inline section after selecting it", () => {
-    // With the tabbed rail, the inline section only mounts once the user
-    // switches from Files (default) to Terminals. The tab button is present
-    // in a non-terminal-first session as long as a terminal is attached.
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
-    useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "main", session: "main", running: true }],
-      isLoading: false,
-      error: null,
-    });
-
-    renderShell("/c/conv_abc");
-
-    // Default tab is Files — inline section is unmounted.
-    expect(screen.queryByTestId("inline-terminals-section")).toBeNull();
-    // Tab button is present (regex tolerates the inline count badge "1").
-    const terminalsTab = screen.getByRole("tab", { name: /Shells/i });
-    expect(terminalsTab).toBeInTheDocument();
-
-    // Radix Tabs activates on mousedown, not click.
-    fireEvent.mouseDown(terminalsTab);
-    expect(screen.getByTestId("inline-terminals-section")).toBeInTheDocument();
-  });
-
-  it("hides the Terminals tab in a regular session with no terminal attached", () => {
-    // Terminals are agent-created (the rail has no "new terminal" affordance),
-    // so an empty Terminals tab is a dead end ("No terminals running."). It
-    // must stay hidden until a terminal attaches — matching the mobile
-    // session-menu's rule. This also avoids the snapshot-load flash:
-    // ``hideTerminalsTab`` is label-derived and starts false, so without the
-    // attach gate the tab would briefly appear then vanish once the snapshot
-    // reveals a terminal-first / claude-native-subagent session.
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
-    // Default beforeEach mock already returns no terminals; assert explicitly
-    // for clarity that this is the no-terminal case.
-    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
-
-    renderShell("/c/conv_abc");
-
-    expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
-    // The rail still works — Files is the default and remains selected.
-    expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true");
-  });
-
-  it("reveals the Terminals tab when a terminal attaches after mount", () => {
-    // The tab is additive: it pops in (no flash-out) the moment a terminal
-    // lands over SSE, which the seed/snapshot streams into the cache.
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
-    useTerminalsMock.mockReturnValue({ terminals: [], isLoading: false, error: null });
-
-    // Stable QueryClient + fresh element per render so the rerender reads the
-    // updated mock (React bails on an identical element reference).
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const makeTree = () => (
-      <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_abc"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
-      </QueryClientProvider>
-    );
-    const { rerender } = render(makeTree());
-
-    // No terminal yet → tab hidden.
-    expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
-
-    // A terminal lands.
-    useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "main", session: "main", running: true }],
-      isLoading: false,
-      error: null,
-    });
-    rerender(makeTree());
-
-    // Tab now present (additive — the user wasn't yanked off any tab).
-    expect(screen.getByRole("tab", { name: /Shells/i })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /Files/i })).toHaveAttribute("aria-selected", "true");
-  });
-
   it("opening a file in a terminal-first session keeps the view in Terminal", () => {
     // Regression: openFileViewer used to call setPanelInitialKey(null)
     // unconditionally to "close the terminal panel" — but in terminal-
@@ -1135,9 +1031,16 @@ describe("Right-rail terminals card", () => {
 });
 
 describe("Chat-mode terminal panel layout", () => {
-  it("opens the shell as a rail tab (not the full-width push panel) and keeps chat visible", () => {
-    // Desktop rail click → the shell opens as a tab inside the workspace rail;
-    // the full-width push panel stays closed and chat is not hidden.
+  it("hosts an open shell as a rail tab (not the full-width push panel) and keeps chat visible", () => {
+    // A shell opens as a tab inside the workspace rail — its xterm surfaces in
+    // the rail's content slot, the full-width push panel stays closed, and chat
+    // is not hidden. Seed a restored (open + selected) shell tab so it's live on
+    // load (creation itself is covered in WorkspacePanel's "+" menu tests).
+    writeSessionWorkspaceState("conv_abc", {
+      open: true,
+      openTerminals: ["terminal:terminal_main"],
+      selectedTerminalKey: "terminal:terminal_main",
+    });
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
@@ -1151,29 +1054,23 @@ describe("Chat-mode terminal panel layout", () => {
 
     renderShell("/c/conv_abc");
 
-    // Baseline: closed push panel, chat visible. The md:hidden gate lives on
-    // the chat+workspace group (main's parent), not main itself.
+    // The shell tab's xterm is mounted in the rail...
+    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_main");
+    // ...while the push panel stays closed and chat stays visible. The
+    // md:hidden gate lives on the chat+workspace group (main's parent).
     const chatGroup = () => screen.getByRole("main").parentElement as HTMLElement;
     expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
     expect(chatGroup().className.split(" ")).not.toContain("md:hidden");
-
-    // Switch the rail to the Shells tab so the inline section mounts, then open
-    // a shell. Radix Tabs activates on mousedown, not click.
-    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
-    fireEvent.click(screen.getByRole("button", { name: /rail: open terminal/i }));
-
-    // After click: the push panel stays closed and chat stays visible — the
-    // shell now lives in a rail tab (its xterm surfaces in the rail's content
-    // slot), so the main column is undisturbed.
-    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
-    expect(chatGroup().className.split(" ")).not.toContain("md:hidden");
-    // The shell tab's xterm is mounted in the rail.
-    expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_main");
   });
 
-  it("closes a shell tab from the rail — xterm unmounts and the Shells list returns", () => {
-    // Open a shell tab, then close it via the tab's "x". The rail falls back to
-    // the Shells list (no tab selected) and the xterm is gone.
+  it("closes a shell tab from the rail — the xterm unmounts and the rail returns to its default view", () => {
+    // Close an open shell tab via its "x": the xterm unmounts and the rail
+    // falls back to its default content (the files scope), not a shells list.
+    writeSessionWorkspaceState("conv_abc", {
+      open: true,
+      openTerminals: ["terminal:terminal_main"],
+      selectedTerminalKey: "terminal:terminal_main",
+    });
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null },
       isLoading: false,
@@ -1187,17 +1084,16 @@ describe("Chat-mode terminal panel layout", () => {
 
     renderShell("/c/conv_abc");
 
-    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
-    fireEvent.click(screen.getByRole("button", { name: /rail: open terminal/i }));
-    // The shell tab and its xterm are present.
+    // The restored shell tab and its xterm are present.
     expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_main");
 
     // Close the tab via its "x" (labeled by the resolved name · session).
     fireEvent.click(screen.getByRole("button", { name: "Close main · u-1" }));
 
-    // The xterm unmounts; with no tab selected the Shells list is shown again.
+    // The xterm unmounts and the rail shows its default content — no shells list.
     expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
-    expect(screen.getByTestId("inline-terminals-section")).toBeInTheDocument();
+    expect(screen.queryByTestId("inline-terminals-section")).toBeNull();
+    expect(screen.getByTestId("files-panel")).toBeInTheDocument();
   });
 });
 
@@ -1591,192 +1487,6 @@ describe("Subagents tab", () => {
     expect(badge.className).not.toContain("text-success");
   });
 
-  it("keeps the terminal count badge neutral when a terminal spawns off-tab", () => {
-    // The tab badge is a quantity indicator, not an error or alert. A new
-    // terminal should update the count without switching to destructive red.
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
-    // Baseline: one pre-existing terminal at mount.
-    useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "main", session: "main", running: true }],
-      isLoading: false,
-      error: null,
-    });
-
-    // Build the tree with a stable QueryClient and a fresh element per call:
-    // React bails on a rerender given the identical element reference, so the
-    // new mock would not be read.
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const makeTree = () => (
-      <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_abc"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
-      </QueryClientProvider>
-    );
-    const { rerender } = render(makeTree());
-
-    let badge = within(screen.getByRole("tab", { name: /Shells/i })).getByText("1");
-    expect(badge.className).toContain("text-muted-foreground");
-    expect(badge.className).not.toContain("bg-destructive");
-
-    // A second terminal spawns while the user is on the (default) Files tab.
-    useTerminalsMock.mockReturnValue({
-      terminals: [
-        { id: "terminal_main", name: "main", session: "main", running: true },
-        { id: "terminal_2", name: "bash", session: "main", running: true },
-      ],
-      isLoading: false,
-      error: null,
-    });
-    rerender(makeTree());
-
-    badge = within(screen.getByRole("tab", { name: /Shells/i })).getByText("2");
-    expect(badge.className).toContain("text-muted-foreground");
-    expect(badge.className).not.toContain("bg-destructive");
-    expect(badge.className).not.toContain("text-white");
-
-    // Opening the Terminals tab keeps the count in the same neutral style.
-    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
-    badge = within(screen.getByRole("tab", { name: /Shells/i })).getByText("2");
-    expect(badge.className).toContain("text-muted-foreground");
-    expect(badge.className).not.toContain("bg-destructive");
-  });
-
-  it("keeps the terminal count badge neutral when terminals stream in on connect", () => {
-    // useTerminals is SSE-driven: on connect it seeds [] then snapshot-on-
-    // connect replays a create for every running terminal. The replay should
-    // update the count without making a normal refresh look like an error.
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
-    // Cold cache on connect: empty seed, no terminals yet.
-    useTerminalsMock.mockReturnValue({
-      terminals: [],
-      isLoading: false,
-      error: null,
-    });
-
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const makeTree = () => (
-      <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_abc"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
-      </QueryClientProvider>
-    );
-    const { rerender } = render(makeTree());
-
-    // Snapshot-on-connect streams two terminals into the cache.
-    useTerminalsMock.mockReturnValue({
-      terminals: [
-        { id: "terminal_main", name: "main", session: "main", running: true },
-        { id: "terminal_2", name: "bash", session: "main", running: true },
-      ],
-      isLoading: false,
-      error: null,
-    });
-    rerender(makeTree());
-
-    const badge = within(screen.getByRole("tab", { name: /Shells/i })).getByText("2");
-    expect(badge.className).toContain("text-muted-foreground");
-    expect(badge.className).not.toContain("bg-destructive");
-    expect(badge.className).not.toContain("text-white");
-  });
-
-  it("keeps the terminal count badge neutral while already viewing Terminals", () => {
-    // The count badge should stay muted regardless of whether the user is
-    // already on the Terminals tab.
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
-    useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "main", session: "main", running: true }],
-      isLoading: false,
-      error: null,
-    });
-
-    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const makeTree = () => (
-      <QueryClientProvider client={qc}>
-        <TooltipProvider>
-          <MemoryRouter initialEntries={["/c/conv_abc"]}>
-            <Routes>
-              <Route element={<AppShell />}>
-                <Route
-                  path="c/:conversationId"
-                  element={
-                    <>
-                      <TerminalFirstViewProbe />
-                      <LocationDisplay />
-                    </>
-                  }
-                />
-              </Route>
-            </Routes>
-          </MemoryRouter>
-        </TooltipProvider>
-      </QueryClientProvider>
-    );
-    const { rerender } = render(makeTree());
-
-    // Switch to the Terminals tab first. Confirm it actually activated (the
-    // inline section only mounts when the tab is selected) — otherwise the
-    // "no alert" assertion below could pass for the wrong reason.
-    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
-    expect(screen.getByTestId("inline-terminals-section")).toBeInTheDocument();
-
-    // Now a terminal spawns while it's the active tab.
-    useTerminalsMock.mockReturnValue({
-      terminals: [
-        { id: "terminal_main", name: "main", session: "main", running: true },
-        { id: "terminal_2", name: "bash", session: "main", running: true },
-      ],
-      isLoading: false,
-      error: null,
-    });
-    rerender(makeTree());
-
-    const badge = within(screen.getByRole("tab", { name: /Shells/i })).getByText("2");
-    expect(badge.className).toContain("text-muted-foreground");
-    expect(badge.className).not.toContain("bg-destructive");
-  });
-
   it("keeps the idle Agents count badge neutral when a sub-agent spawns off-tab", () => {
     // Idle Agents badge counts are quantity indicators, not warning badges.
     // A new child should update the count without switching to destructive red.
@@ -1976,14 +1686,6 @@ describe("Subagents tab", () => {
       isLoading: false,
       error: null,
     });
-    // A terminal is attached so the Terminals tab is present — this test
-    // asserts the three workspace tabs coexist inside a child, not the
-    // Terminals-attach gate itself (covered separately below).
-    useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "main", session: "main", running: true }],
-      isLoading: false,
-      error: null,
-    });
     useSessionMock.mockReturnValue({
       session: {
         id: "conv_child",
@@ -2009,7 +1711,6 @@ describe("Subagents tab", () => {
 
     expect(screen.getByRole("tab", { name: /Agents/i })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: /Files/i })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /Shells/i })).toBeInTheDocument();
   });
 
   it("keeps the back-to-parent header link when the parent title is unresolved", () => {
@@ -2159,30 +1860,6 @@ describe("Right workspace card visibility", () => {
     expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
     // The tab-fallback effect lands on Agents (the only available tab).
     expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
-  });
-
-  it("keeps the card and collapse toggle when terminals are the only rail content", () => {
-    // Same no-filesystem agent, but with an attached terminal: the rail
-    // has a Terminals tab, so the card mounts and the collapse toggle
-    // must render. Failure here means the toggle is still gated on
-    // showFilesPanel alone — the pre-fix bug left a visible card with
-    // no way to collapse it.
-    useEnvironmentMock.mockReturnValue({
-      data: { available: false, root: null, home: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }],
-      isLoading: false,
-      error: null,
-    });
-    mockConversations([{ id: "conv_abc", permission_level: null }]);
-
-    renderShell("/c/conv_abc");
-
-    expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /Shells/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 
@@ -2447,95 +2124,6 @@ describe("Embedded REPL terminal rail inventory", () => {
     // The pill still sees the REPL terminal — false here would grey out
     // the Terminal pill and make the embedded REPL unreachable.
     expect(screen.getByTestId("view-probe")).toHaveAttribute("data-terminals-available", "true");
-  });
-
-  it("lists only agent-launched terminals in the rail for terminal-first SDK sessions", () => {
-    // With the REPL plus an agent-launched bash terminal, the tab shows
-    // and its badge counts 1 (the bash terminal). 2 would mean the REPL
-    // leaked into the inventory; 0/absent would hide the agent's real
-    // terminal along with it.
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null, home: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    useTerminalsMock.mockReturnValue({
-      terminals: [
-        { id: "terminal_tui_main", name: "tui", session: "main", running: true },
-        { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
-      ],
-      isLoading: false,
-      error: null,
-    });
-    mockConversations([
-      {
-        id: "conv_sdk",
-        permission_level: null,
-        labels: { "omnigent.ui": "terminal" },
-      },
-    ]);
-
-    renderShell("/c/conv_sdk");
-
-    const tab = screen.getByRole("tab", { name: /Shells/i });
-    // The badge renders the inventory count next to the tab title.
-    expect(tab).toHaveTextContent(/Shells\s*1/);
-  });
-
-  it("hides the Shells tab when no shell exists, even if the agent declares shell access", () => {
-    // Shell creation now lives in the tab strip's "+" menu, so the Shells tab
-    // is a pure list — it must NOT show just because the agent declares a
-    // terminals: block. Here the only terminal is the embedded REPL (excluded
-    // from the inventory), so there's no shell to list and no tab.
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null, home: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_tui_main", name: "tui", session: "main", running: true }],
-      isLoading: false,
-      error: null,
-    });
-    useSessionAgentMock.mockReturnValue({
-      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
-    } as ReturnType<typeof useSessionAgent>);
-    mockConversations([
-      {
-        id: "conv_sdk",
-        permission_level: null,
-        labels: { "omnigent.ui": "terminal" },
-      },
-    ]);
-
-    renderShell("/c/conv_sdk");
-
-    expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
-  });
-
-  it("shows the Shells tab once a shell exists", () => {
-    // A real (non-REPL) shell in the inventory surfaces the tab, which lists it.
-    useEnvironmentMock.mockReturnValue({
-      data: { available: true, root: null, home: null },
-      isLoading: false,
-    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
-    useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_zsh_s1", name: "zsh", session: "s1", running: true }],
-      isLoading: false,
-      error: null,
-    });
-    useSessionAgentMock.mockReturnValue({
-      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
-    } as ReturnType<typeof useSessionAgent>);
-    mockConversations([{ id: "conv_sdk", permission_level: null }]);
-
-    renderShell("/c/conv_sdk");
-
-    const tab = screen.getByRole("tab", { name: /Shells/i });
-    // Display order: Shells sits to the RIGHT of Agents in the strip.
-    const agentsTab = screen.getByRole("tab", { name: /Agents/i });
-    expect(agentsTab.compareDocumentPosition(tab) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    // Selecting it mounts the shells list.
-    fireEvent.mouseDown(tab);
-    expect(screen.getByTestId("inline-terminals-section")).toBeInTheDocument();
   });
 });
 
@@ -2832,13 +2420,6 @@ describe("Right-rail tab switching — file viewer close", () => {
     // another rail tab closes the viewer, and returning to Files shows the
     // panel, not the previously open file.
     setupFilesAvailable();
-    // A terminal is attached so the Terminals tab is available to switch to
-    // (the tab is gated on an attached terminal).
-    useTerminalsMock.mockReturnValue({
-      terminals: [{ id: "terminal_main", name: "main", session: "main", running: true }],
-      isLoading: false,
-      error: null,
-    });
     renderShell("/c/conv_abc");
 
     // Files is the default tab. Open README.md from the panel.
@@ -2846,11 +2427,11 @@ describe("Right-rail tab switching — file viewer close", () => {
     // Failure: openFileViewer did not set selectedFilePath.
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
 
-    // Switch to Terminals — file viewer must close, terminals section appears.
-    fireEvent.mouseDown(screen.getByRole("tab", { name: /Shells/i }));
+    // Switch to Agents (always present) — file viewer must close, its panel appears.
+    fireEvent.mouseDown(screen.getByRole("tab", { name: /Agents/i }));
     // Failure: the tab-change handler did not close the viewer when leaving Files.
     expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
-    expect(screen.getByTestId("inline-terminals-section")).toBeInTheDocument();
+    expect(screen.getByTestId("subagents-panel")).toBeInTheDocument();
 
     // Go back to Files — the panel shows, NOT the previously open file.
     fireEvent.mouseDown(screen.getByRole("tab", { name: /^Files$/i }));

@@ -10,7 +10,6 @@ import {
   MaximizeIcon,
   MinimizeIcon,
   PlusIcon,
-  SquareTerminalIcon,
   TerminalIcon,
   XIcon,
 } from "lucide-react";
@@ -38,7 +37,6 @@ import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { FilesPanel } from "./FilesPanel";
 import { FileViewer } from "./FileViewer";
 import type { ChangedSort } from "./FlatFileList";
-import { InlineTerminalsSection } from "./InlineTerminalsSection";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { TodoPanel } from "./TodoPanel";
 import { useTerminalStatuses } from "./useTerminalStatuses";
@@ -528,15 +526,6 @@ interface WorkspacePanelProps {
   showBrowserTab: boolean;
   /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
-  /**
-   * Whether the Shells tab is available — AppShell's combined gate
-   * (not a native wrapper, AND either a shell exists or the agent's
-   * spec declares shell access, which makes the tab show by default
-   * with its "+ New shell" empty state).
-   */
-  showShellsTab: boolean;
-  /** Number of open shells, shown as the Shells tab badge when > 0. */
-  terminalsLength: number;
   /** How many child agents are actively working (Agents tab badge). */
   subagentsWorking: number;
   /**
@@ -624,8 +613,6 @@ export function WorkspacePanel({
   showFilesPanel,
   showBrowserTab,
   changedCount,
-  showShellsTab,
-  terminalsLength,
   subagentsWorking,
   agentCount,
   todosSupported,
@@ -657,8 +644,8 @@ export function WorkspacePanel({
   const handleCloseTab = useCallback(() => {
     if (selectedFilePath !== null) onCloseFile(selectedFilePath);
   }, [onCloseFile, selectedFilePath]);
-  // Resolve shell tab keys to display labels. The list is already fetched for
-  // the Shells tab / count badge, so this shares the same query cache.
+  // Resolve shell tab keys to display labels. The terminals list is already
+  // fetched elsewhere for the session, so this shares the same query cache.
   const { terminals } = useTerminals(conversationId);
   const terminalLabelFor = useCallback(
     (key: string) => {
@@ -702,14 +689,12 @@ export function WorkspacePanel({
           className="absolute inset-y-0 left-0 z-10 w-1 cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
         />
       )}
-      {/* Tab strip, in display order Files · Changes · Agents · Shells · Tasks.
+      {/* Tab strip, in display order Files · Changes · Agents · Tasks.
           Files (full folder tree) and Changes (changed-files-only list) are
           two peer tabs — same gate (an on-disk workspace), same FilesPanel,
           each pinned to one scope. Agents is always present (the Agents panel
-          lists at least the main agent). Shells shows whenever AppShell's gate
-          allows it (the agent declares shell access, or a shell already
-          exists) — the empty state carries the "+ New shell"
-          affordance, so an empty tab is an entry point, not a dead end.
+          lists at least the main agent). Shells have no nav tab — they open as
+          closable soft tabs (see the "+" NewTabMenu / TerminalTabsStrip below).
           The Agents tab keys off ``rootSessionId``, so inside a child
           it lists the siblings + a "main" link back to the parent. */}
       {/* Tab strip: the static nav tabs + divider stay pinned on the left at
@@ -781,21 +766,6 @@ export function WorkspacePanel({
                 </span>
               </TabsTrigger>
             </WorkspaceTabTooltip>
-            {showShellsTab && (
-              <WorkspaceTabTooltip label="Shells">
-                <TabsTrigger
-                  value="terminals"
-                  aria-label={terminalsLength > 0 ? `Shells ${terminalsLength}` : "Shells"}
-                  className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
-                >
-                  <SquareTerminalIcon />
-                  <span className="sr-only">Shells</span>
-                  {terminalsLength > 0 && (
-                    <span className="sr-only text-muted-foreground">{terminalsLength}</span>
-                  )}
-                </TabsTrigger>
-              </WorkspaceTabTooltip>
-            )}
             {todosSupported && todosTotal > 0 && (
               <WorkspaceTabTooltip label="Tasks">
                 <TabsTrigger
@@ -898,12 +868,8 @@ export function WorkspacePanel({
       </div>
       {/* Tab content — single slot. An open shell tab holds its xterm; a
           file tab holds FileViewer; the Files/Changes tabs show FilesPanel
-          (tree vs changed-only list); the
-          Shells tab holds the list-only inline section (clicking a row
-          opens the shell as a tab above, surfacing its xterm here);
-          Subagents lists the root's children + a "main" link back to the
-          parent. The Shells branch is unreachable when its tab is hidden —
-          native wrappers, claude-native sub-agents, or no shell attached. */}
+          (tree vs changed-only list); Subagents lists the root's children +
+          a "main" link back to the parent. */}
       <div data-workspace-panel-content className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {selectedTerminalKey !== null ? (
           <RailTerminalView
@@ -932,8 +898,6 @@ export function WorkspacePanel({
           <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
         ) : rightRailTab === "todos" && todosSupported ? (
           <TodoPanel frameless />
-        ) : rightRailTab === "terminals" && showShellsTab ? (
-          <InlineTerminalsSection conversationId={conversationId} onExpand={openTerminalTab} />
         ) : (
           showFilesPanel && (
             <FilesPanel
