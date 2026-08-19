@@ -32,7 +32,9 @@ import { ImageLightboxProvider } from "./components/ImageLightbox";
 import { RunnerHealthProvider } from "./hooks/RunnerHealthProvider";
 import { CapabilitiesContext } from "./lib/CapabilitiesContext";
 import { createBootServerInfo } from "./lib/bootCapabilities";
+import { useBranding } from "./lib/branding";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
+import { useDocumentFavicon } from "./lib/documentFavicon";
 import { EmbeddedProvider } from "./lib/embedded";
 import { type OmnigentHostConfig, setEmbedRoot, setOmnigentHostConfig } from "./lib/host";
 import { resolveIdentity } from "./lib/identity";
@@ -131,6 +133,13 @@ function EmbedCapabilitiesProvider({ children }: { children: ReactNode }) {
   return <CapabilitiesContext.Provider value={info}>{children}</CapabilitiesContext.Provider>;
 }
 
+/** Tab favicon while embedded: the operator's branding favicon when set, else Otto. */
+function EmbedDocumentFavicon() {
+  const { logos } = useBranding();
+  useDocumentFavicon(logos.favicon);
+  return null;
+}
+
 function OmnigentProviders({
   routing,
   basename,
@@ -191,6 +200,7 @@ function OmnigentProviders({
               <ImageLightboxProvider>
                 <RoutingProvider value={routing}>
                   <EmbedCapabilitiesProvider>
+                    <EmbedDocumentFavicon />
                     <SessionUpdatesProvider>
                       <RunnerHealthProvider>
                         <QueueFlushProvider>
