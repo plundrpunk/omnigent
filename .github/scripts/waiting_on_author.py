@@ -21,6 +21,7 @@ REVIEW_LABEL = "waiting-for-review"
 WAITING_DAYS = 7
 CANONICAL_REPO = "omnigent-ai/omnigent"
 MAX_CLOSURES_PER_RUN = 30
+READ_ONLY_FORK_EVENTS = {"pull_request_review", "pull_request_review_comment"}
 
 
 def label_names(item: dict[str, Any]) -> list[str]:
@@ -32,6 +33,13 @@ def label_names(item: dict[str, Any]) -> list[str]:
 
 def has_waiting_label(item: dict[str, Any]) -> bool:
     return LABEL in label_names(item)
+
+
+def is_fork_pull_request(payload: dict[str, Any]) -> bool:
+    pull = payload.get("pull_request") or {}
+    head_repo = ((pull.get("head") or {}).get("repo") or {}).get("full_name") or ""
+    base_repo = ((pull.get("base") or {}).get("repo") or {}).get("full_name") or ""
+    return bool(head_repo and base_repo and head_repo.lower() != base_repo.lower())
 
 
 def parse_time(value: str) -> datetime:
@@ -486,6 +494,14 @@ def run(
 
     if event_name in {"schedule", "workflow_dispatch"}:
         close_stale_waiting_prs(api, now=now)
+        return
+
+    if event_name in READ_ONLY_FORK_EVENTS and is_fork_pull_request(payload):
+        pull_number = (payload.get("pull_request") or {}).get("number", "unknown")
+        print(
+            f"::notice::Skipping {event_name} for fork PR #{pull_number}; "
+            "GitHub provides a read-only token for fork review events."
+        )
         return
 
     # Author activity wins: the same event cannot be both, and clearing the label

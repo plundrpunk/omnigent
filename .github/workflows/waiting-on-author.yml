@@ -6,6 +6,8 @@ name: Waiting on Author Hygiene
 # once a review is submitted). The two labels are mutually exclusive. PRs left
 # waiting on the author for 7 days are closed. The workflow runs from trusted
 # default-branch code and never checks out PR-authored files.
+# Fork review events receive a read-only token, so the script logs and skips
+# those events instead of failing while issue comments and pushes remain active.
 
 on:
   pull_request_target:

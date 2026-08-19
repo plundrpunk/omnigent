@@ -45,6 +45,14 @@ def issue(number: int, labels: list[str] | None = None, is_pr: bool = True) -> d
     return item
 
 
+def fork_pull(number: int = 12) -> dict[str, Any]:
+    return {
+        "number": number,
+        "head": {"repo": {"full_name": "contributor/omnigent"}},
+        "base": {"repo": {"full_name": waiting_on_author.CANONICAL_REPO}},
+    }
+
+
 def labeled_at(iso: str, label: str | None = None) -> dict[str, Any]:
     return {
         "event": "labeled",
@@ -482,6 +490,36 @@ class AutoWaitingOnAuthorTest(unittest.TestCase):
             pull=pr(labels=[]),
         )
         self.assertEqual(api.added, [(12, waiting_on_author.LABEL)])
+
+    def test_fork_review_events_skip_read_only_mutations(self) -> None:
+        events = [
+            (
+                "pull_request_review",
+                {
+                    "pull_request": fork_pull(),
+                    "review": {
+                        "user": {"login": "maintainer1"},
+                        "state": "changes_requested",
+                        "body": "please fix",
+                    },
+                },
+                pr(labels=[]),
+            ),
+            (
+                "pull_request_review_comment",
+                {
+                    "pull_request": fork_pull(),
+                    "comment": {"user": {"login": "alice"}, "body": "fixed"},
+                },
+                pr(author="alice"),
+            ),
+        ]
+
+        for event, payload, pull in events:
+            with self.subTest(event=event):
+                api = self.dispatch(event, payload, pull=pull)
+                self.assertEqual(api.added, [])
+                self.assertEqual(api.removed, [])
 
     def test_applying_clears_waiting_for_review(self) -> None:
         api = self.dispatch(
