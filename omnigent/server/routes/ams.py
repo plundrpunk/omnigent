@@ -278,3 +278,88 @@ def create_ams_router(auth_provider: AuthProvider | None = None) -> APIRouter:
         return await _forward_write("POST", path, request)
 
     return router
+
+
+#: Opt-in hard requirement: when truthy, a missing or dead AMS bridge
+#: aborts server boot instead of merely logging. Deployments where AOS
+#: without AMS is useless (the Mac Studio desktop) set this to "1".
+_REQUIRE_AMS_ENV = "OMNIGENT_REQUIRE_AMS"
+
+_startup_logger = logging.getLogger("omnigent.server.ams")
+
+
+async def check_bridge_at_startup(
+    *,
+    probe: Any | None = None,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any]:
+    """Fail-loud AMS bridge check, run once from the server lifespan.
+
+    Without this, a server started with missing/wrong ``AMS_BASE_URL`` /
+    ``AMS_API_KEY`` boots silently and every AMS-backed page (Training,
+    System, Fleet, Providers) 503s per-request — which is how the
+    2026-08-20 "Training data couldn't be loaded" outage stayed invisible
+    for days. This check runs at boot and shouts.
+
+    :param probe: Optional async callable ``(base_url, api_key) -> int``
+        returning the health status code — injectable for tests. The
+        default probes ``GET {AMS_BASE_URL}/health`` with a 5s timeout.
+    :param logger: Logger override for tests.
+    :returns: ``{"state": "ok" | "unconfigured" | "unreachable" |
+        "unhealthy", "base_url": ..., "detail": ...}``.
+    :raises RuntimeError: when :data:`_REQUIRE_AMS_ENV` is truthy and the
+        state is anything but ``ok``.
+    """
+    log = logger or _startup_logger
+    base = _base_url()
+    required = os.environ.get(_REQUIRE_AMS_ENV, "").strip().lower() in ("1", "true", "yes")
+
+    def _shout(level: int, headline: str, detail: str) -> None:
+        bar = "=" * 72
+        log.log(
+            level,
+            "\n%s\nAMS BRIDGE: %s\n%s\n%s\n%s",
+            bar,
+            headline,
+            detail,
+            "Fix: set AMS_BASE_URL and AMS_API_KEY in the server environment "
+            "(LaunchAgent com.drf.omnigent on the Mac; /etc/goal-queue on the VPS) "
+            "and restart. Status endpoint: GET /v1/ams/config",
+            bar,
+        )
+
+    if not base:
+        detail = "AMS_BASE_URL is not set; every AMS-backed page will fail with 503."
+        _shout(logging.ERROR if required else logging.WARNING, "NOT CONFIGURED", detail)
+        if required:
+            raise RuntimeError(f"AMS bridge required ({_REQUIRE_AMS_ENV}=1) but not configured")
+        return {"state": "unconfigured", "base_url": None, "detail": detail}
+
+    if probe is None:
+
+        async def probe(base_url: str, api_key: str) -> int:  # noqa: A001 - shadowing the param on purpose
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(
+                    f"{base_url}/health",
+                    headers={"X-API-Key": api_key} if api_key else {},
+                )
+                return response.status_code
+
+    try:
+        status_code = await probe(base, _api_key())
+    except Exception as exc:  # noqa: BLE001 - any failure is the same verdict at boot
+        detail = f"probe of {base}/health failed: {exc!r}"
+        _shout(logging.ERROR, "UNREACHABLE", detail)
+        if required:
+            raise RuntimeError(f"AMS bridge required but unreachable: {exc!r}") from exc
+        return {"state": "unreachable", "base_url": base, "detail": detail}
+
+    if status_code != 200:
+        detail = f"{base}/health returned HTTP {status_code}"
+        _shout(logging.ERROR, "UNHEALTHY", detail)
+        if required:
+            raise RuntimeError(f"AMS bridge required but unhealthy: HTTP {status_code}")
+        return {"state": "unhealthy", "base_url": base, "detail": detail}
+
+    log.info("AMS bridge OK: %s (api key %s)", base, "set" if _api_key() else "NOT set")
+    return {"state": "ok", "base_url": base, "detail": "healthy"}

@@ -847,6 +847,14 @@ def create_app(
         _log_level_name = _os.environ.get("OMNIGENT_LOG_LEVEL", "INFO").upper()
         logging.getLogger("omnigent").setLevel(getattr(logging, _log_level_name, logging.INFO))
 
+        # Fail loudly at boot when the AMS bridge is missing or dead,
+        # instead of 503ing per-request with no server-side signal (the
+        # 2026-08-20 Training-page outage). Set OMNIGENT_REQUIRE_AMS=1 to
+        # make a bad bridge abort boot entirely.
+        from omnigent.server.routes.ams import check_bridge_at_startup
+
+        await check_bridge_at_startup()
+
         harness_pm = HarnessProcessManager()
         await harness_pm.start()
         # Store on both ``app.state`` (canonical, accessible from
