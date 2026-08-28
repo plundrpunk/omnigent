@@ -62,10 +62,12 @@ from omnigent.server.performance_metrics import (
     set_request_session_id_for_access_log,
     set_request_user_agent_for_access_log,
 )
+from omnigent.server.routes.ams import create_ams_router
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.dictation import create_dictation_router
+from omnigent.server.routes.goal import create_goal_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
@@ -2390,6 +2392,19 @@ def create_app(
         create_policy_registry_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["policy_registry"],
+    )
+    # Bridges to the two external services AOS drives: the Automaton Memory
+    # System and the Harness goal-contract runner. Both are no-ops unless their
+    # base URL is configured.
+    app.include_router(
+        create_ams_router(auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["ams"],
+    )
+    app.include_router(
+        create_goal_router(auth_provider=auth_provider),
+        prefix="/v1",
+        tags=["goal"],
     )
     if scheduled_task_store is not None:
         app.include_router(
