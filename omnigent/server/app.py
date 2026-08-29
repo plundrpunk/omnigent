@@ -1180,6 +1180,13 @@ def create_app(
 
         _to_thread.current_default_thread_limiter().total_tokens = 200
 
+        # Fail loud at boot when the AMS bridge is configured but unreachable,
+        # rather than on the first request that needed it. Honours
+        # OMNIGENT_REQUIRE_AMS=1, which raises instead of warning.
+        from omnigent.server.routes.ams import check_bridge_at_startup
+
+        await check_bridge_at_startup()
+
         # Initialise usage telemetry (fire-and-forget; no-op when disabled).
         from omnigent.telemetry import init_client as _init_telemetry
 
@@ -2397,7 +2404,10 @@ def create_app(
     # System and the Harness goal-contract runner. Both are no-ops unless their
     # base URL is configured.
     app.include_router(
-        create_ams_router(auth_provider=auth_provider),
+        create_ams_router(
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
         prefix="/v1",
         tags=["ams"],
     )

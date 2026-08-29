@@ -43,12 +43,13 @@ reported as absence.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
-from collections.abc import Mapping
 import os
 import re
 import tempfile
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -91,8 +92,14 @@ _STDERR_TAIL_CHARS = 8 * 1024
 #: absent: a bridge-started run never gets an unsandboxed shell.
 _EXEC_SANDBOXES = ("subprocess", "docker")
 
+#: Set to 1/true/yes to let a request select ``exec.sandbox="subprocess"``.
+#: Off by default: SubprocessToolRuntime is a guardrail, not a sandbox -- any
+#: interpreter it permits can still read the wider filesystem and reach the
+#: network. Model-proposed commands belong in Docker.
+_ALLOW_SUBPROCESS_ENV = "OMNIGENT_GOAL_ALLOW_SUBPROCESS_SANDBOX"
+
 #: Default sandbox when an exec block omits one — the stricter of the two.
-_DEFAULT_EXEC_SANDBOX = "subprocess"
+_DEFAULT_EXEC_SANDBOX = "docker"
 
 #: ``--command`` is a completion endpoint (a CLI or shim). A bare name or
 #: an absolute path is allowed; no spaces, quotes, or shell metacharacters,
@@ -100,14 +107,35 @@ _DEFAULT_EXEC_SANDBOX = "subprocess"
 _EXEC_COMMAND_RE = re.compile(r"^/?[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 
 #: Endpoint knobs for openai-compatible / anthropic / ollama providers.
-#: ``api_key_env`` is the NAME of a server-side env var — a request can
-#: select which key the server uses but can never supply or read one.
 _ENDPOINT_FIELDS: dict[str, str] = {
     "base_url": "--base-url",
     "api_key_env": "--api-key-env",
 }
 
-_API_KEY_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+#: Env var holding the comma-separated names a request may select via
+#: ``api_key_env``. Empty (the default) means requests may not choose a key
+#: at all.
+#:
+#: A caller must never be able to pair an arbitrary env var name with an
+#: arbitrary URL: the server holds many secrets, and "use ANTHROPIC_API_KEY,
+#: send it to https://attacker.example" is a complete exfiltration primitive.
+#: Existence in os.environ is not a safety property -- every secret exists in
+#: os.environ. Only an explicit server-side allowlist is.
+_API_KEY_ENV_ALLOWLIST_ENV = "OMNIGENT_GOAL_API_KEY_ENVS"
+
+#: Env var holding the comma-separated base URLs a request may select.
+#: Empty (the default) means requests may not choose an endpoint.
+_BASE_URL_ALLOWLIST_ENV = "OMNIGENT_GOAL_BASE_URLS"
+
+
+def _env_flag(env_name: str) -> bool:
+    return os.environ.get(env_name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _allowlist(env_name: str) -> frozenset[str]:
+    raw = os.environ.get(env_name, "")
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
 
 #: The harness's own role set (harness_automaton.roles.DEFAULT_ROLES).
 #: There is no "orchestrator" — ``planner`` is the role that decomposes the
@@ -153,29 +181,53 @@ def _validate_role_models(spec: Any) -> list[str]:
 
 
 def _validate_endpoint(body: dict[str, Any]) -> dict[str, str]:
-    """Validate optional ``base_url`` / ``api_key_env`` overrides."""
+    """Validate optional ``base_url`` / ``api_key_env`` overrides.
+
+    Both are checked against a server-side allowlist, not merely validated for
+    shape. A caller that can name any env var and any URL can make the server
+    post any secret it holds to any host it likes.
+    """
     out: dict[str, str] = {}
+
     base_url = body.get("base_url")
     if base_url is not None:
-        if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
-            raise HTTPException(
-                status_code=422, detail="base_url must be an http(s) URL"
-            )
-        out["base_url"] = base_url
-    api_key_env = body.get("api_key_env")
-    if api_key_env is not None:
-        if not isinstance(api_key_env, str) or not _API_KEY_ENV_RE.match(api_key_env):
+        allowed_urls = _allowlist(_BASE_URL_ALLOWLIST_ENV)
+        if not isinstance(base_url, str):
+            raise HTTPException(status_code=422, detail="base_url must be a string")
+        if base_url not in allowed_urls:
             raise HTTPException(
                 status_code=422,
-                detail="api_key_env must be an environment variable NAME, not a key",
+                detail=(
+                    "base_url is not allowlisted on this server; "
+                    f"set {_BASE_URL_ALLOWLIST_ENV} to permit it"
+                ),
+            )
+        out["base_url"] = base_url
+
+    api_key_env = body.get("api_key_env")
+    if api_key_env is not None:
+        allowed_keys = _allowlist(_API_KEY_ENV_ALLOWLIST_ENV)
+        if not isinstance(api_key_env, str):
+            raise HTTPException(status_code=422, detail="api_key_env must be a string")
+        if api_key_env not in allowed_keys:
+            # Deliberately does not say whether the variable exists: that alone
+            # would let a caller enumerate the server's secrets by name.
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "api_key_env is not allowlisted on this server; "
+                    f"set {_API_KEY_ENV_ALLOWLIST_ENV} to permit it"
+                ),
             )
         if api_key_env not in os.environ:
             raise HTTPException(
                 status_code=422,
-                detail=f"{api_key_env} is not set in the server environment",
+                detail=f"{api_key_env} is allowlisted but not set in the environment",
             )
         out["api_key_env"] = api_key_env
+
     return out
+
 
 #: Loop budgets forwarded to the CLI. The harness defaults ``max_revisions``
 #: to 1 — a single failed verification ends the run — which is far too tight
@@ -238,6 +290,20 @@ def _automaton_bin() -> str:
 
 def _goal_cwd() -> str:
     return os.environ.get("HA_GOAL_CWD") or ""
+
+
+def _run_workdir(run_id: str) -> Path:
+    """Per-run working directory.
+
+    The harness writes artifacts to ``<workdir>/goal/<goal_id>/``. Two runs of
+    the same goal_id therefore share a directory unless each run gets its own
+    workdir: the second run would read the first's blocker and outcome files,
+    and a concurrent pair would interleave evidence.
+    """
+    workdir = Path(_goal_workdir())
+    if not workdir.is_absolute():
+        workdir = Path(_goal_cwd()) / workdir
+    return workdir / "runs" / run_id
 
 
 def _goal_workdir() -> str:
@@ -316,6 +382,15 @@ def _validate_exec(spec: Any) -> dict[str, Any] | None:
             status_code=422,
             detail=f"exec.sandbox must be one of {', '.join(_EXEC_SANDBOXES)}",
         )
+    if sandbox == "subprocess" and not _env_flag(_ALLOW_SUBPROCESS_ENV):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "exec.sandbox='subprocess' is disabled on this server; "
+                "model-proposed commands run in Docker. Set "
+                f"{_ALLOW_SUBPROCESS_ENV}=1 to permit it."
+            ),
+        )
 
     allow_write = spec.get("allow_write", False)
     if not isinstance(allow_write, bool):
@@ -364,7 +439,9 @@ def _validate_contract(contract: Any) -> dict[str, Any]:
         )
     end_state = contract.get("end_state")
     if not isinstance(end_state, str) or not end_state.strip():
-        raise HTTPException(status_code=422, detail="contract.end_state must be a non-empty string")
+        raise HTTPException(
+            status_code=422, detail="contract.end_state must be a non-empty string"
+        )
     gate = contract.get("evidence_criteria")
     if not isinstance(gate, dict) or not any(gate.get(k) for k in _GATE_KEYS):
         raise HTTPException(
@@ -426,11 +503,36 @@ class GoalRunRegistry:
     def get(self, run_id: str) -> dict[str, Any] | None:
         return self._runs.get(run_id)
 
-    def list(self, conversation_id: str | None = None) -> list[dict[str, Any]]:
+    def list(
+        self,
+        conversation_id: str | None = None,
+        *,
+        owner: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Runs visible to ``owner``. ``None`` means unrestricted.
+
+        A goal run carries the output of arbitrary tool execution, so one
+        user's run must not be listable or readable by another.
+        """
         runs = list(self._runs.values())
         if conversation_id is not None:
             runs = [r for r in runs if r.get("conversation_id") == conversation_id]
+        if owner is not None:
+            runs = [r for r in runs if r.get("owner") == owner]
         return sorted(runs, key=lambda r: r["started_at"], reverse=True)
+
+    def get_for(self, run_id: str, owner: str | None) -> dict[str, Any] | None:
+        """One run, or None when it does not exist *or* is not yours.
+
+        Both cases return None on purpose: distinguishing them would confirm
+        the existence of another user's run.
+        """
+        run = self._runs.get(run_id)
+        if run is None:
+            return None
+        if owner is not None and run.get("owner") != owner:
+            return None
+        return run
 
     def running_count(self) -> int:
         return sum(1 for r in self._runs.values() if r["status"] == "running")
@@ -439,6 +541,8 @@ class GoalRunRegistry:
 async def _execute_goal_run(run: dict[str, Any]) -> None:
     """Run the CLI to completion and fold exit code + artifacts into ``run``."""
     contract = run["contract"]
+    run_workdir = _run_workdir(str(run["run_id"]))
+    run_workdir.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         "w", suffix=".json", delete=False, encoding="utf-8"
     ) as handle:
@@ -450,7 +554,7 @@ async def _execute_goal_run(run: dict[str, Any]) -> None:
         "--contract",
         contract_path,
         "--workdir",
-        _goal_workdir(),
+        str(run_workdir),
         "--json",
     ]
     provider = run.get("provider")
@@ -504,15 +608,10 @@ async def _execute_goal_run(run: dict[str, Any]) -> None:
         )
         return
     finally:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(contract_path)
-        except OSError:
-            pass
 
-    workdir = Path(_goal_workdir())
-    if not workdir.is_absolute():
-        workdir = Path(_goal_cwd()) / workdir
-    artifact_dir = workdir / "goal" / contract["goal_id"]
+    artifact_dir = run_workdir / "goal" / contract["goal_id"]
     outcome = _parse_trailing_json(stdout)
     outcome_file = _read_artifact(artifact_dir / "goal-outcome.json")
     if outcome_file is not None:
@@ -566,7 +665,7 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
     @router.post("/goal", status_code=202)
     async def start_goal(request: Request) -> dict[str, Any]:
         """Validate the contract and start a background goal run."""
-        require_user(request, auth_provider)
+        owner = require_user(request, auth_provider)
         _require_configured()
         try:
             body = await request.json()
@@ -619,6 +718,9 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
             "error": None,
             "started_at": _now_iso(),
             "finished_at": None,
+            # Who may later list, read or stream this run. None in
+            # single-user mode, where every caller is the same person.
+            "owner": owner,
         }
         registry.create(run)
         task = asyncio.create_task(_execute_goal_run(run))
@@ -630,45 +732,41 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
     @router.get("/goal")
     async def list_goals(request: Request, conversation_id: str | None = None) -> dict[str, Any]:
         """List runs, newest first; empty list means exactly that."""
-        require_user(request, auth_provider)
+        owner = require_user(request, auth_provider)
         _require_configured()
-        return {"runs": [_public(r) for r in registry.list(conversation_id)]}
+        return {"runs": [_public(r) for r in registry.list(conversation_id, owner=owner)]}
 
     @router.get("/goal/{run_id}")
     async def get_goal(run_id: str, request: Request) -> dict[str, Any]:
         """One run by id."""
-        require_user(request, auth_provider)
+        owner = require_user(request, auth_provider)
         _require_configured()
-        run = registry.get(run_id)
+        run = registry.get_for(run_id, owner)
         if run is None:
             raise HTTPException(status_code=404, detail=f"unknown goal run: {run_id}")
         return _public(run)
 
     @router.get("/goal/{run_id}/events")
-    async def get_goal_events(
-        run_id: str, request: Request, since: int = 0
-    ) -> dict[str, Any]:
+    async def get_goal_events(run_id: str, request: Request, since: int = 0) -> dict[str, Any]:
         """Normalised run events, for live rendering in the work-loop panel.
 
         ``since`` is an event index, so the client can poll for the tail
         rather than re-fetching the whole run each time.
         """
-        require_user(request, auth_provider)
+        owner = require_user(request, auth_provider)
         _require_configured()
-        run = registry.get(run_id)
+        run = registry.get_for(run_id, owner)
         if run is None:
             raise HTTPException(status_code=404, detail=f"unknown goal run: {run_id}")
 
         artifact = _artifact_for(run)
         if artifact is None:
-            return {"run_id": run_id, "status": run.get("status"),
-                    "events": [], "total": 0}
+            return {"run_id": run_id, "status": run.get("status"), "events": [], "total": 0}
         try:
             data = json.loads(artifact.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             # A run writes its artifact continuously; a torn read is normal.
-            return {"run_id": run_id, "status": run.get("status"),
-                    "events": [], "total": 0}
+            return {"run_id": run_id, "status": run.get("status"), "events": [], "total": 0}
 
         raw_events = data.get("events") or []
         start = max(0, int(since))
@@ -707,7 +805,13 @@ def _artifact_for(run: dict[str, Any]) -> Path | None:
             candidate = Path(str(raw))
             if candidate.is_file():
                 return candidate
-    art_dir = Path(_goal_workdir()) / "artifacts"
+    # Scoped to this run's own workdir. The previous global "newest artifact
+    # touched since the run began" fallback could serve another run's events
+    # entirely -- including another user's -- whenever two ran concurrently.
+    run_id = run.get("run_id")
+    if not run_id:
+        return None
+    art_dir = _run_workdir(str(run_id)) / "artifacts"
     if not art_dir.is_dir():
         return None
     files = [f for f in art_dir.glob("*.json") if f.is_file()]
