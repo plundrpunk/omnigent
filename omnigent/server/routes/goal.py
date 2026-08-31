@@ -56,8 +56,9 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import AuthProvider, RESERVED_USER_LOCAL
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.stores.permission_store import PermissionStore
 
 #: CLI exit code → run status. Anything else is an ``error`` (never a
 #: success): unknown codes must not be able to read as completion.
@@ -634,11 +635,17 @@ async def _execute_goal_run(run: dict[str, Any]) -> None:
     )
 
 
-def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
+def create_goal_router(
+    auth_provider: AuthProvider | None = None,
+    permission_store: PermissionStore | None = None,
+) -> APIRouter:
     """Build the goal-run router.
 
     :param auth_provider: Auth provider used to identify the requesting
         user. ``None`` in single-user mode (endpoint is open).
+    :param permission_store: Store providing ``is_admin``. Required in
+        multi-user mode for exec-capable goal runs; without it, those
+        requests are refused rather than allowed.
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
@@ -654,6 +661,30 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
                     "Goal bridge not configured — set HA_AUTOMATON_BIN and "
                     "HA_GOAL_CWD in the server environment."
                 ),
+            )
+
+    async def _require_exec_admin(owner: str | None, exec_spec: dict[str, Any] | None) -> None:
+        """Exec-capable runs are shared command execution, so they are admin-only.
+
+        Multi-user callers can otherwise bypass any UI affordance and ask the
+        server to start a writable harness run directly. Single-user local mode
+        remains allowed via the reserved ``local`` identity.
+        """
+        if exec_spec is None or auth_provider is None or owner == RESERVED_USER_LOCAL:
+            return
+        if permission_store is None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Goal exec requests require an admin check, and no permission "
+                    "store is configured on this server."
+                ),
+            )
+        is_admin = await asyncio.to_thread(permission_store.is_admin, owner)
+        if not is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail="Goal exec requests are restricted to admin users.",
             )
 
     @router.get("/goal/config")
@@ -691,6 +722,7 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
         limits = _validate_limits(body.get("limits"))
         endpoint = _validate_endpoint(body)
         role_models = _validate_role_models(body.get("role_models"))
+        await _require_exec_admin(owner, exec_spec)
         if registry.running_count() >= _MAX_CONCURRENT_RUNS:
             raise HTTPException(
                 status_code=429,

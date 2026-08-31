@@ -2412,7 +2412,10 @@ def create_app(
         tags=["ams"],
     )
     app.include_router(
-        create_goal_router(auth_provider=auth_provider),
+        create_goal_router(
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
         prefix="/v1",
         tags=["goal"],
     )

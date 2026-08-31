@@ -16,6 +16,13 @@ from pathlib import Path
 
 import httpx
 import pytest
+import pytest_asyncio
+from fastapi import FastAPI
+from httpx import ASGITransport
+from starlette.requests import HTTPConnection
+
+from omnigent.server.auth import AuthProvider
+from omnigent.server.routes.goal import create_goal_router
 
 #: A fake ``automaton`` CLI. Reads the contract, writes artifacts the
 #: way the real goal path does, then exits with the code smuggled in
@@ -67,12 +74,26 @@ def goal_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("HA_AUTOMATON_BIN", str(bin_path))
     monkeypatch.setenv("HA_GOAL_CWD", str(tmp_path))
     monkeypatch.setenv("HA_GOAL_WORKDIR", "runs-goal")
+    monkeypatch.setenv("HA_GOAL_EXEC_ROOTS", str(tmp_path))
     return tmp_path
 
 
-async def _wait_terminal(client: httpx.AsyncClient, run_id: str) -> dict:
+@pytest_asyncio.fixture()
+async def client() -> httpx.AsyncClient:
+    app = FastAPI()
+    app.include_router(create_goal_router(), prefix="/v1")
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c
+
+
+async def _wait_terminal(
+    client: httpx.AsyncClient,
+    run_id: str,
+    *,
+    headers: dict[str, str] | None = None,
+) -> dict:
     for _ in range(100):
-        resp = await client.get(f"/v1/goal/{run_id}")
+        resp = await client.get(f"/v1/goal/{run_id}", headers=headers)
         assert resp.status_code == 200
         run = resp.json()
         if run["status"] != "running":
@@ -195,3 +216,78 @@ async def test_list_filters_by_conversation(client: httpx.AsyncClient, goal_env:
 async def test_unknown_run_is_404(client: httpx.AsyncClient, goal_env: Path) -> None:
     resp = await client.get("/v1/goal/nope")
     assert resp.status_code == 404
+
+
+class _HeaderAuth(AuthProvider):
+    """Minimal auth stub for multi-user goal-route tests."""
+
+    def get_user_id(self, request: HTTPConnection) -> str | None:
+        return request.headers.get("x-test-user")
+
+
+class _StubPermissionStore:
+    def __init__(self, admins: set[str] | None = None) -> None:
+        self._admins = admins or set()
+
+    def is_admin(self, user_id: str) -> bool:
+        return user_id in self._admins
+
+
+def _goal_client_for_exec_auth(permission_store: _StubPermissionStore | None) -> httpx.AsyncClient:
+    app = FastAPI()
+    app.include_router(
+        create_goal_router(
+            auth_provider=_HeaderAuth(),
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+    )
+    return httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+async def test_exec_requests_are_rejected_without_a_permission_store(goal_env: Path) -> None:
+    async with _goal_client_for_exec_auth(None) as client:
+        resp = await client.post(
+            "/v1/goal",
+            headers={"x-test-user": "alice@example.com"},
+            json={
+                "contract": _contract(),
+                "exec": {"command": "automaton", "workspace": str(goal_env)},
+            },
+        )
+    assert resp.status_code == 403
+    assert "admin check" in resp.json()["detail"]
+
+
+async def test_exec_requests_are_rejected_for_non_admin_users(goal_env: Path) -> None:
+    async with _goal_client_for_exec_auth(_StubPermissionStore()) as client:
+        resp = await client.post(
+            "/v1/goal",
+            headers={"x-test-user": "alice@example.com"},
+            json={
+                "contract": _contract(),
+                "exec": {"command": "automaton", "workspace": str(goal_env)},
+            },
+        )
+    assert resp.status_code == 403
+    assert "admin users" in resp.json()["detail"]
+
+
+async def test_exec_requests_are_allowed_for_admin_users(goal_env: Path) -> None:
+    async with _goal_client_for_exec_auth(_StubPermissionStore({"alice@example.com"})) as client:
+        resp = await client.post(
+            "/v1/goal",
+            headers={"x-test-user": "alice@example.com"},
+            json={
+                "contract": _contract("t-exec-admin"),
+                "exec": {"command": "automaton", "workspace": str(goal_env)},
+            },
+        )
+        assert resp.status_code == 202
+        run = await _wait_terminal(
+            client,
+            resp.json()["run_id"],
+            headers={"x-test-user": "alice@example.com"},
+        )
+    assert run["status"] == "completed"
+    assert run["exec"]["workspace"] == str(goal_env.resolve())

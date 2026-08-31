@@ -15,6 +15,11 @@ from typing import Any
 
 import httpx
 import pytest
+import pytest_asyncio
+from fastapi import FastAPI
+from httpx import ASGITransport
+
+from omnigent.server.routes.ams import create_ams_router
 
 _captured: list[dict[str, Any]] = []
 
@@ -62,6 +67,14 @@ def ams_env(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     return _captured
 
 
+@pytest_asyncio.fixture()
+async def client() -> httpx.AsyncClient:
+    app = FastAPI()
+    app.include_router(create_ams_router(), prefix="/v1")
+    async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c
+
+
 async def test_role_mappings_put_forwards_with_key(
     client: httpx.AsyncClient, ams_env: list[dict[str, Any]]
 ) -> None:
@@ -91,6 +104,24 @@ async def test_spawn_defaults_and_agent_patch_and_directive_forward(
         resp = await getattr(client, method)(url, json=body)
         assert resp.status_code == 200, (method, url, resp.text)
     assert [c["method"] for c in ams_env] == ["PUT", "PATCH", "POST"]
+
+
+async def test_colon_agent_ids_forward_on_listed_write_routes(
+    client: httpx.AsyncClient, ams_env: list[dict[str, Any]]
+) -> None:
+    cases = [
+        ("patch", "/v1/ams/api/v1/agents/team:worker", {"config": {"default_model": "grok"}}),
+        ("post", "/v1/ams/api/warden/agents/team:worker/directive", {"directive": "reload"}),
+        ("put", "/v1/ams/api/warden/agents/team:worker/model", {"model": "gpt-5"}),
+    ]
+    for method, url, body in cases:
+        resp = await getattr(client, method)(url, json=body)
+        assert resp.status_code == 200, (method, url, resp.text)
+    assert [c["url"] for c in ams_env] == [
+        "http://ams.test/api/v1/agents/team:worker",
+        "http://ams.test/api/warden/agents/team:worker/directive",
+        "http://ams.test/api/warden/agents/team:worker/model",
+    ]
 
 
 async def test_loop_writes_forward(
