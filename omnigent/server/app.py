@@ -62,10 +62,12 @@ from omnigent.server.performance_metrics import (
     set_request_session_id_for_access_log,
     set_request_user_agent_for_access_log,
 )
+from omnigent.server.routes.ams import create_ams_router
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
 from omnigent.server.routes.dictation import create_dictation_router
+from omnigent.server.routes.goal import create_goal_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
@@ -776,7 +778,7 @@ def _ensure_default_acp_agents(
 
         configured = list(acp_agents())
         shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
-    except Exception:  # noqa: BLE001 — a malformed acp: block must never break startup
+    except Exception:  # noqa: BLE001 - malformed optional ACP config must not block startup.
         _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
         configured = []
         shadowed = frozenset()
@@ -1177,6 +1179,13 @@ def create_app(
         from anyio import to_thread as _to_thread
 
         _to_thread.current_default_thread_limiter().total_tokens = 200
+
+        # Fail loud at boot when the AMS bridge is configured but unreachable,
+        # rather than on the first request that needed it. Honours
+        # OMNIGENT_REQUIRE_AMS=1, which raises instead of warning.
+        from omnigent.server.routes.ams import check_bridge_at_startup
+
+        await check_bridge_at_startup()
 
         # Initialise usage telemetry (fire-and-forget; no-op when disabled).
         from omnigent.telemetry import init_client as _init_telemetry
@@ -2390,6 +2399,25 @@ def create_app(
         create_policy_registry_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["policy_registry"],
+    )
+    # Bridges to the two external services AOS drives: the Automaton Memory
+    # System and the Harness goal-contract runner. Both are no-ops unless their
+    # base URL is configured.
+    app.include_router(
+        create_ams_router(
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["ams"],
+    )
+    app.include_router(
+        create_goal_router(
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["goal"],
     )
     if scheduled_task_store is not None:
         app.include_router(
