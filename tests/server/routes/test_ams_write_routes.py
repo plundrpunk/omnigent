@@ -11,6 +11,7 @@ wire.
 from __future__ import annotations
 
 import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
@@ -68,7 +69,7 @@ def ams_env(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 
 
 @pytest_asyncio.fixture()
-async def client() -> httpx.AsyncClient:
+async def client() -> AsyncIterator[httpx.AsyncClient]:
     app = FastAPI()
     app.include_router(create_ams_router(), prefix="/v1")
     async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:

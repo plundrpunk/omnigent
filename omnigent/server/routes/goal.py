@@ -56,7 +56,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from omnigent.server.auth import AuthProvider, RESERVED_USER_LOCAL
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.stores.permission_store import PermissionStore
 
@@ -680,6 +680,8 @@ def create_goal_router(
                     "store is configured on this server."
                 ),
             )
+        if owner is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
         is_admin = await asyncio.to_thread(permission_store.is_admin, owner)
         if not is_admin:
             raise HTTPException(

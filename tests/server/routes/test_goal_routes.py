@@ -12,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import json
 import stat
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import cast
 
 import httpx
 import pytest
@@ -23,6 +25,7 @@ from starlette.requests import HTTPConnection
 
 from omnigent.server.auth import AuthProvider
 from omnigent.server.routes.goal import create_goal_router
+from omnigent.stores.permission_store import PermissionStore
 
 #: A fake ``automaton`` CLI. Reads the contract, writes artifacts the
 #: way the real goal path does, then exits with the code smuggled in
@@ -79,7 +82,7 @@ def goal_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest_asyncio.fixture()
-async def client() -> httpx.AsyncClient:
+async def client() -> AsyncIterator[httpx.AsyncClient]:
     app = FastAPI()
     app.include_router(create_goal_router(), prefix="/v1")
     async with httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -238,7 +241,7 @@ def _goal_client_for_exec_auth(permission_store: _StubPermissionStore | None) ->
     app.include_router(
         create_goal_router(
             auth_provider=_HeaderAuth(),
-            permission_store=permission_store,
+            permission_store=cast(PermissionStore | None, permission_store),
         ),
         prefix="/v1",
     )
