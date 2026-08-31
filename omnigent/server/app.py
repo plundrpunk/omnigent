@@ -62,6 +62,7 @@ from omnigent.server.performance_metrics import (
     set_request_session_id_for_access_log,
     set_request_user_agent_for_access_log,
 )
+from omnigent.server.routes.ams import create_ams_router
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -1177,6 +1178,13 @@ def create_app(
         from anyio import to_thread as _to_thread
 
         _to_thread.current_default_thread_limiter().total_tokens = 200
+
+        # Fail loud at boot when the AMS bridge is configured but unreachable,
+        # rather than on the first request that needed it. Honours
+        # OMNIGENT_REQUIRE_AMS=1, which raises instead of warning.
+        from omnigent.server.routes.ams import check_bridge_at_startup
+
+        await check_bridge_at_startup()
 
         # Initialise usage telemetry (fire-and-forget; no-op when disabled).
         from omnigent.telemetry import init_client as _init_telemetry
@@ -2390,6 +2398,15 @@ def create_app(
         create_policy_registry_router(auth_provider=auth_provider),
         prefix="/v1",
         tags=["policy_registry"],
+    )
+    # Bridge Omnigent's AMS-backed pages through one server-side service key.
+    app.include_router(
+        create_ams_router(
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["ams"],
     )
     if scheduled_task_store is not None:
         app.include_router(

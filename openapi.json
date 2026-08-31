@@ -8114,6 +8114,196 @@
         ]
       }
     },
+    "/v1/ams/config": {
+      "get": {
+        "description": "Report whether the bridge is configured (never leaks the key).",
+        "operationId": "ams_config_v1_ams_config_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Ams Config V1 Ams Config Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Ams Config",
+        "tags": [
+          "ams"
+        ]
+      }
+    },
+    "/v1/ams/{path}": {
+      "get": {
+        "description": "Forward a whitelisted GET to the AMS REST API.",
+        "operationId": "ams_proxy_v1_ams__path__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Ams Proxy V1 Ams  Path  Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ams Proxy",
+        "tags": [
+          "ams"
+        ]
+      },
+      "patch": {
+        "description": "Forward a write-table PATCH to the AMS REST API.",
+        "operationId": "ams_patch_v1_ams__path__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Ams Patch V1 Ams  Path  Patch"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ams Patch",
+        "tags": [
+          "ams"
+        ]
+      },
+      "post": {
+        "description": "Forward a write-table POST to the AMS REST API.",
+        "operationId": "ams_post_v1_ams__path__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Ams Post V1 Ams  Path  Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ams Post",
+        "tags": [
+          "ams"
+        ]
+      },
+      "put": {
+        "description": "Forward a write-table PUT to the AMS REST API.",
+        "operationId": "ams_put_v1_ams__path__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Ams Put V1 Ams  Path  Put"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Ams Put",
+        "tags": [
+          "ams"
+        ]
+      }
+    },
     "/v1/branding/logo/{variant}": {
       "get": {
         "description": "Serve a validated public branding asset, or 404 when unset.",
