@@ -64,6 +64,10 @@ if [[ "$touches_ui" != "true" ]]; then
 fi
 
 # --- 2. LLM judge: behavior change without adequate e2e_ui coverage? ------
+# A judge is only needed after confirming that this PR changes the UI. Keeping
+# this assertion here lets backend-only PRs pass without an unused gateway setup.
+: "${E2E_UI_JUDGE_MODEL:?Set OMNIGENT_CI_E2E_JUDGE_MODEL repository variable}"
+
 # Build a bounded diff blob: only web/** and tests/e2e_ui/** patches. Each
 # file's patch is truncated to MAX_PATCH_LINES so one huge file can't crowd out
 # the others, keeping the prompt representative across many-file PRs. An
