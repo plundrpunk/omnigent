@@ -299,10 +299,6 @@ export function InboxPage() {
                   )}
                 </button>
                 <span className="flex shrink-0 items-center gap-2">
-                  <span className="text-sm text-muted-foreground">
-                    {/* Server timestamps are epoch seconds; relativeTime takes ms. */}
-                    {relativeTime(item.row.updated_at * 1000)}
-                  </span>
                   <Button asChild variant="ghost" size="sm" className="text-sm">
                     <Link to={`/c/${item.row.id}`} componentId="inbox.approval.open_session">
                       Open session
