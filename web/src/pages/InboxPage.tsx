@@ -263,7 +263,7 @@ export function InboxPage() {
               key={elicitationId}
               data-testid="inbox-item"
               data-expanded={expanded}
-              className="flex flex-col gap-2 rounded-xl border border-border bg-card p-4"
+              className="flex flex-col gap-2 rounded-xl border border-border bg-card p-4 [overflow-wrap:anywhere]"
             >
               <div className="flex items-center gap-2">
                 {/* The toggle is a sibling of the Open-session link (not a
@@ -284,7 +284,7 @@ export function InboxPage() {
                       !expanded && "-rotate-90",
                     )}
                   />
-                  <span className="min-w-0 shrink-0 truncate text-ui font-medium">
+                  <span className="min-w-0 truncate text-ui font-medium">
                     {title}
                     {agentLabel !== title && (
                       <span className="ml-2 text-sm font-normal text-muted-foreground">
