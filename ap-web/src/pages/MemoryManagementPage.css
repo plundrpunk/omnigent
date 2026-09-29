@@ -1,0 +1,28 @@
+.memory-management { --step: 1.61; --space: 1rem; --small: calc(var(--space) / var(--step)); --large: calc(var(--space) * var(--step)); --xlarge: calc(var(--large) * var(--step)); max-width: 90rem; width: 100%; margin: auto; padding: var(--xlarge); font-size: var(--space); }
+.memory-management h1 { font-size: var(--xlarge); font-weight: 600; line-height: 1.15; }
+.memory-management h2 { font-size: var(--large); font-weight: 600; }
+.memory-management h3 { font-size: var(--space); font-weight: 600; }
+.memory-management p { margin-block: var(--small); }
+.memory-eyebrow { letter-spacing: .12em; font-size: .75rem; }
+.memory-header, .memory-actions { display: flex; gap: var(--small); align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.memory-header { margin-bottom: var(--large); }
+.memory-body { margin-top: var(--large); }
+.memory-filters { display: flex; flex-wrap: wrap; gap: var(--space); margin-block: var(--large); }
+.memory-filters label { flex: 1; min-width: 10rem; }
+.memory-management label, .memory-confirm label { display: grid; gap: var(--small); }
+.memory-management input, .memory-management select, .memory-confirm input { width: 100%; border: 1px solid var(--border); background: var(--background); color: var(--foreground); border-radius: .5rem; padding: var(--small); min-height: 44px; }
+.memory-management button, .memory-confirm button, .memory-management summary { min-height: 44px; }
+.memory-management :focus-visible, .memory-confirm :focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+.memory-columns { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.61fr); gap: var(--large); margin-top: var(--large); }
+.memory-panel { min-width: 0; border: 1px solid var(--border); border-radius: .75rem; padding: var(--large); background: var(--card); overflow-wrap: anywhere; }
+.memory-records { list-style: none; padding: 0; margin-block: var(--space); }
+.memory-record { width: 100%; display: grid; gap: var(--small); text-align: left; padding: var(--space); border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
+.memory-record:hover, .memory-record[aria-pressed=true] { background: var(--accent); }
+.memory-record small, .memory-id { font-family: monospace; font-size: .75rem; }
+.memory-detail pre { white-space: pre-wrap; overflow-wrap: anywhere; font-family: inherit; margin-block: var(--space); max-height: 32rem; overflow: auto; }
+.memory-detail h3 { margin-top: var(--large); }
+.memory-detail summary { cursor: pointer; padding-block: var(--small); }
+.memory-detail .memory-actions { margin-top: var(--large); justify-content: flex-start; }
+.memory-confirm { max-height: 90dvh; overflow-y: auto; }
+@media (max-width: 760px) { .memory-management { padding: var(--space); } .memory-columns { grid-template-columns: minmax(0, 1fr); } .memory-panel { padding: var(--space); } .memory-management h1 { font-size: var(--large); } }
+.memory-management [role=tablist] { height: auto; }
