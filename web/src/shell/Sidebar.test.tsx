@@ -693,6 +693,18 @@ describe("Sidebar session list", () => {
     expect(badge).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
+  it("links to Memory & Handoffs and keeps New session inactive on that route", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/memory");
+
+    const memory = screen.getByTestId("memory-management-nav");
+    expect(memory).toHaveAttribute("href", "/memory");
+    expect(memory).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(screen.getByRole("link", { name: "New session" })).not.toHaveClass(
+      "bg-[var(--sidebar-active)]",
+    );
+  });
+
   it("hides Usage navigation while the release feature is off", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();

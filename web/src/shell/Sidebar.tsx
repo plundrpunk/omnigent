@@ -16,6 +16,7 @@ import {
 } from "react";
 import {
   ArchiveIcon,
+  DatabaseIcon,
   ArchiveRestoreIcon,
   CheckIcon,
   CheckIcon as CheckMarkIcon,
@@ -320,6 +321,7 @@ function useActiveNavItem(): {
   isInboxPage: boolean;
   isTasksPage: boolean;
   isUsagePage: boolean;
+  isMemoryPage: boolean;
   newSessionProjectName: string | null;
 } {
   const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
@@ -327,9 +329,10 @@ function useActiveNavItem(): {
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
   const isInboxPage = leaf === "inbox";
   const isTasksPage = leaf === "tasks";
+  const isMemoryPage = leaf === "memory";
   const isUsagePage = leaf === "usage";
   const isNewSessionRoute =
-    activeConversationId == null && !isInboxPage && !isTasksPage && !isUsagePage;
+    activeConversationId == null && !isInboxPage && !isTasksPage && !isUsagePage && !isMemoryPage;
   const requestedProject = isNewSessionRoute
     ? new URLSearchParams(location.search).get("project")
     : null;
@@ -338,7 +341,14 @@ function useActiveNavItem(): {
   // would otherwise light up the "New session" button. A project-prefilled
   // new session belongs to that project row instead of the global nav item.
   const isNewChatPage = isNewSessionRoute && newSessionProjectName == null;
-  return { isNewChatPage, isInboxPage, isTasksPage, isUsagePage, newSessionProjectName };
+  return {
+    isNewChatPage,
+    isInboxPage,
+    isTasksPage,
+    isUsagePage,
+    isMemoryPage,
+    newSessionProjectName,
+  };
 }
 
 /**
@@ -614,8 +624,14 @@ export function Sidebar({
   }
 
   // Which top-level nav button to highlight for the current route.
-  const { isNewChatPage, isInboxPage, isTasksPage, isUsagePage, newSessionProjectName } =
-    useActiveNavItem();
+  const {
+    isNewChatPage,
+    isInboxPage,
+    isTasksPage,
+    isUsagePage,
+    isMemoryPage,
+    newSessionProjectName,
+  } = useActiveNavItem();
 
   // On /settings the card keeps its chrome but swaps the conversation list
   // for the settings section nav (see settingsNav.tsx) — entering settings
@@ -996,6 +1012,22 @@ export function Sidebar({
                       {inboxCount}
                     </span>
                   )}
+                </Link>
+              </Button>
+              <Button
+                asChild
+                variant="ghost"
+                className={cn(
+                  SIDEBAR_ROW,
+                  "min-h-11 w-full justify-start border-0 font-normal",
+                  SIDEBAR_HOVER_HIGHLIGHT,
+                  isMemoryPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                )}
+                data-testid="memory-management-nav"
+              >
+                <Link to="/memory" onClick={onNavClick} componentId="sidebar.memory">
+                  <DatabaseIcon className="ui-icon" />
+                  Memory &amp; Handoffs
                 </Link>
               </Button>
               {usagePageEnabled && (

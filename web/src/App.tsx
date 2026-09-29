@@ -56,6 +56,12 @@ const UsagePage = withPageView(
   "usage",
   lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
 );
+const MemoryManagementPage = withPageView(
+  "memory",
+  lazy(() =>
+    import("@/pages/MemoryManagementPage").then((m) => ({ default: m.MemoryManagementPage })),
+  ),
+);
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
@@ -154,6 +160,7 @@ function App({ basename }: AppProps = {}) {
           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
           <Route path={`${prefix}/inbox`} element={<InboxPage />} />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
+          <Route path={`${prefix}/memory`} element={<MemoryManagementPage />} />
           {isFeatureEnabled(info, "usage_page") && (
             <Route path={`${prefix}/usage`} element={<UsagePage />} />
           )}

@@ -202,6 +202,26 @@ def create_ams_router(
             "has_api_key": bool(_api_key()),
         }
 
+    @router.get("/ams/management/status")
+    async def management_status(request: Request) -> dict[str, Any]:
+        require_user(request, auth_provider)
+        return {
+            "available": False,
+            "reason": (
+                "Your AOS account has not been verified against an AMS owner. "
+                "No records have been requested."
+            ),
+        }
+
+    @router.api_route(
+        "/ams/management/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"]
+    )
+    async def management_unavailable(request: Request) -> Any:
+        # Never reuse the shared AMS key for this surface without a trusted
+        # caller-to-owner binding. No environment toggle bypasses this gate.
+        require_user(request, auth_provider)
+        raise HTTPException(status_code=503, detail="AMS account ownership is not verified")
+
     @router.get("/ams/{path:path}")
     async def ams_proxy(path: str, request: Request) -> Any:
         """Forward a whitelisted GET to the AMS REST API."""
