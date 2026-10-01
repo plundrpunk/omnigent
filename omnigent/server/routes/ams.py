@@ -57,9 +57,10 @@ import re
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 
-from omnigent.server.auth import AuthProvider
+from omnigent.server.accounts_bootstrap import resolve_admin_username
+from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes._auth_helpers import require_user
 
 logger = logging.getLogger(__name__)
@@ -202,25 +203,109 @@ def create_ams_router(
             "has_api_key": bool(_api_key()),
         }
 
+    async def _management_user(request: Request) -> str:
+        user = require_user(request, auth_provider)
+        if auth_provider is None or user is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        # The reserved local identity is emitted only by the existing explicit
+        # single-user runtime; identity headers cannot impersonate it.
+        if user == RESERVED_USER_LOCAL:
+            return user
+        if user != resolve_admin_username():
+            raise HTTPException(
+                status_code=403, detail="AMS management belongs to the private instance operator"
+            )
+        await _require_admin(request)
+        return user
+
     @router.get("/ams/management/status")
     async def management_status(request: Request) -> dict[str, Any]:
-        require_user(request, auth_provider)
+        await _management_user(request)
+        configured = bool(_base_url() and _api_key())
         return {
-            "available": False,
-            "reason": (
-                "Your AOS account has not been verified against an AMS owner. "
-                "No records have been requested."
-            ),
+            "available": configured,
+            "reason": None if configured else "AMS_BASE_URL and AMS_API_KEY must be configured.",
         }
 
     @router.api_route(
         "/ams/management/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"]
     )
-    async def management_unavailable(request: Request) -> Any:
-        # Never reuse the shared AMS key for this surface without a trusted
-        # caller-to-owner binding. No environment toggle bypasses this gate.
-        require_user(request, auth_provider)
-        raise HTTPException(status_code=503, detail="AMS account ownership is not verified")
+    async def management_proxy(path: str, request: Request) -> Any:
+        user = await _management_user(request)
+        method = request.method
+        list_memories = method == "GET" and path in ("memories", "memories/")
+        list_continuations = method == "GET" and path == "continuations/pending"
+        memory_record = re.fullmatch(rf"memories/{_UUID}", path) is not None
+        continuation_record = re.fullmatch(rf"continuations/{_UUID}", path) is not None
+        if list_memories:
+            allowed_query = {"memory_tier", "status", "limit", "offset"}
+            upstream = "api/v1/memories/"
+        elif list_continuations:
+            allowed_query = {"project", "limit"}
+            upstream = "api/v1/continuations/pending"
+        elif method == "GET" and (memory_record or continuation_record):
+            allowed_query = set()
+            upstream = f"api/v1/{path}"
+        elif method == "DELETE" and memory_record:
+            allowed_query = {"soft_delete"}
+            upstream = f"api/v1/{path}"
+        else:
+            raise HTTPException(
+                status_code=403, detail="Action is not in the AMS management table"
+            )
+
+        params = dict(request.query_params)
+        if set(params) - allowed_query or len(request.query_params.multi_items()) != len(params):
+            raise HTTPException(status_code=422, detail="Unsupported or duplicate query parameter")
+        if list_memories:
+            if params.get("memory_tier", "") not in ("", "episodic", "semantic", "procedural"):
+                raise HTTPException(status_code=422, detail="Invalid memory tier")
+            if params.get("status", "active") not in ("active", "archived"):
+                raise HTTPException(status_code=422, detail="Invalid memory status")
+        for name, maximum in (("limit", 100 if list_memories else 50), ("offset", None)):
+            if name in params and (
+                len(params[name]) > 10
+                or not params[name].isascii()
+                or not params[name].isdigit()
+                or int(params[name]) < (1 if name == "limit" else 0)
+                or (maximum is not None and int(params[name]) > maximum)
+            ):
+                raise HTTPException(status_code=422, detail=f"Invalid {name}")
+        if len(params.get("project", "")) > 200:
+            raise HTTPException(status_code=422, detail="Project is too long")
+        if method == "DELETE" and params.get("soft_delete") not in ("true", "false"):
+            raise HTTPException(status_code=422, detail="Select archive or permanent deletion")
+        if await request.body():
+            raise HTTPException(status_code=422, detail="Management requests do not accept a body")
+        base, key = _base_url(), _api_key()
+        if not base or not key:
+            raise HTTPException(
+                status_code=503, detail="AMS_BASE_URL and AMS_API_KEY are required"
+            )
+        # AMS resolves the configured service key to its own tenant. Never
+        # forward browser credentials or caller-supplied owner overrides.
+        try:
+            async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+                resp = await client.request(
+                    method, f"{base}/{upstream}", params=params, headers={"X-API-Key": key}
+                )
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="AMS connection failed") from exc
+        if method == "DELETE":
+            logger.info(
+                "ams-management: user=%s %s /%s status=%s", user, method, path, resp.status_code
+            )
+        if resp.status_code == 204:
+            return Response(status_code=204)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=502, detail="AMS returned a non-JSON response"
+            ) from exc
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=payload)
+        return payload
 
     @router.get("/ams/{path:path}")
     async def ams_proxy(path: str, request: Request) -> Any:

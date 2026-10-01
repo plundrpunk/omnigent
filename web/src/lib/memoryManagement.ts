@@ -49,15 +49,17 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok)
     throw new Error(
       response.status === 503
-        ? "Live management is unavailable until account ownership is verified."
-        : "The request failed. Refresh and try again; no success was confirmed.",
+        ? "AMS connection is unavailable. Check the private instance server configuration."
+        : response.status === 403
+          ? "This AMS account is available only to the private instance operator."
+          : "The request failed. Refresh and try again; no success was confirmed.",
     );
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
-// Dedicated namespace: never fall back to the existing shared-key bridge.
-// The server deliberately denies record access until the identity contract is implemented.
+// Dedicated namespace: the server authorizes the private operator and allows
+// only selected management actions. Never fall back to the general bridge.
 export const managementClient: ManagementClient = {
   access: () => request<ManagementAccess>("status"),
   async list({ kind, tier, status, project, offset }) {

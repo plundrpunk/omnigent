@@ -179,7 +179,7 @@ export function MemoryManagementPage({ client = managementClient }: { client?: M
                 <h2>Live management unavailable</h2>
                 <p>
                   {access.reason ||
-                    "Your AOS account has not been verified against an AMS owner. No records have been requested."}
+                    "The private AMS account is unavailable. No records have been requested."}
                 </p>
               </div>
             )}

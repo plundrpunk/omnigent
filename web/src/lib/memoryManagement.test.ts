@@ -18,9 +18,16 @@ describe("management transport", () => {
       { method: "DELETE" },
     );
   });
-  it("never falls back to shared-key routes", async () => {
+  it("does not retry failed management through the general bridge", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValue(new Response(null, { status: 503 }));
-    await expect(managementClient.detail("memories", "forged-id")).rejects.toThrow("ownership");
+    await expect(managementClient.detail("memories", "forged-id")).rejects.toThrow(
+      "AMS connection",
+    );
+    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+  });
+  it("explains a separately prepared account denial", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(new Response(null, { status: 403 }));
+    await expect(managementClient.access()).rejects.toThrow("private instance operator");
     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
   });
 });
