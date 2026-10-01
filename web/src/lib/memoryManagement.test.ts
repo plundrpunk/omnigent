@@ -27,7 +27,7 @@ describe("management transport", () => {
   });
   it("explains a separately prepared account denial", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValue(new Response(null, { status: 403 }));
-    await expect(managementClient.access()).rejects.toThrow("private instance operator");
+    await expect(managementClient.access()).rejects.toThrow("direct local instance");
     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
   });
 });

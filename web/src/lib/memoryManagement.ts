@@ -51,7 +51,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       response.status === 503
         ? "AMS connection is unavailable. Check the private instance server configuration."
         : response.status === 403
-          ? "This AMS account is available only to the private instance operator."
+          ? "This private AMS connection is available only through the operator’s direct local instance."
           : "The request failed. Refresh and try again; no success was confirmed.",
     );
   if (response.status === 204) return undefined as T;

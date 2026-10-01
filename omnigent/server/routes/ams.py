@@ -54,14 +54,21 @@ import json
 import logging
 import os
 import re
+from ipaddress import ip_address
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from omnigent.server.accounts_bootstrap import resolve_admin_username
-from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.auth import (
+    RESERVED_USER_LOCAL,
+    AuthProvider,
+    UnifiedAuthProvider,
+    bind_host_is_loopback,
+)
 from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.ws_origin import OMNIGENT_INTERNAL_WS_ORIGIN
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +158,7 @@ def _path_allowed(path: str) -> bool:
 def create_ams_router(
     auth_provider: AuthProvider | None = None,
     permission_store: Any | None = None,
+    bind_host: str | None = None,
 ) -> APIRouter:
     """Build the AMS bridge router.
 
@@ -159,6 +167,8 @@ def create_ams_router(
     :param permission_store: Store providing ``is_admin``. Required in
         multi-user mode for the write table; without it every write is
         refused rather than allowed.
+    :param bind_host: Actual server listen host, supplied by the launcher.
+        Unknown or non-loopback binds cannot use private AMS data.
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
@@ -203,20 +213,79 @@ def create_ams_router(
             "has_api_key": bool(_api_key()),
         }
 
+    def _local_request_allowed(request: Request) -> bool:
+        if not bind_host or not bind_host_is_loopback(bind_host):
+            return False
+        server = request.scope.get("server")
+        client = request.client
+        if not server or not client:
+            return False
+        if len(request.headers.getlist("host")) != 1 or len(request.headers.getlist("origin")) > 1:
+            return False
+        try:
+            if not ip_address(server[0]).is_loopback or not ip_address(client.host).is_loopback:
+                return False
+            host = urlsplit(f"//{request.headers.get('host', '')}")
+            if not host.hostname or not bind_host_is_loopback(host.hostname):
+                return False
+            port = host.port or (443 if request.url.scheme == "https" else 80)
+            if host.username or host.password or host.path or host.query or host.fragment:
+                return False
+            if port != server[1]:
+                return False
+            if any(
+                name == "forwarded" or name == "x-real-ip" or name.startswith("x-forwarded-")
+                for name in request.headers
+            ):
+                return False
+            if request.headers.get("sec-fetch-site", "none") not in ("none", "same-origin"):
+                return False
+            origin = request.headers.get("origin")
+            if origin and origin != OMNIGENT_INTERNAL_WS_ORIGIN:
+                parsed = urlsplit(origin)
+                origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+                if (
+                    parsed.scheme != request.url.scheme
+                    or parsed.hostname != host.hostname
+                    or origin_port != port
+                    or parsed.username
+                    or parsed.password
+                    or parsed.path
+                    or parsed.query
+                    or parsed.fragment
+                ):
+                    return False
+        except (ValueError, TypeError):
+            return False
+        return True
+
     async def _management_user(request: Request) -> str:
         user = require_user(request, auth_provider)
         if auth_provider is None or user is None:
             raise HTTPException(status_code=401, detail="Authentication required")
-        # The reserved local identity is emitted only by the existing explicit
-        # single-user runtime; identity headers cannot impersonate it.
-        if user == RESERVED_USER_LOCAL:
-            return user
-        if user != resolve_admin_username():
+        # Named accounts require a persisted operator binding. A bootstrap
+        # username or another admin is not evidence of that binding.
+        if user != RESERVED_USER_LOCAL:
             raise HTTPException(
-                status_code=403, detail="AMS management belongs to the private instance operator"
+                status_code=403, detail="No named account is bound to this private AMS connection"
+            )
+        if (
+            not isinstance(auth_provider, UnifiedAuthProvider)
+            or auth_provider._source != "header"
+            or not auth_provider._local_single_user
+            or not _local_request_allowed(request)
+        ):
+            raise HTTPException(
+                status_code=403, detail="Private AMS requires direct loopback access"
             )
         await _require_admin(request)
         return user
+
+    def _private_data_path(path: str) -> bool:
+        return any(
+            path == prefix or path.startswith(prefix + "/")
+            for prefix in ("api/v1/memories", "api/v1/continuations")
+        )
 
     @router.get("/ams/management/status")
     async def management_status(request: Request) -> dict[str, Any]:
@@ -325,6 +394,10 @@ def create_ams_router(
                 status_code=403,
                 detail=f"Path not in AMS read whitelist: {path}",
             )
+        if _private_data_path(path):
+            await _management_user(request)
+            if {"user_id", "owner_id", "org_id", "tenant_id"} & set(request.query_params):
+                raise HTTPException(status_code=422, detail="Owner overrides are not supported")
         headers: dict[str, str] = {}
         key = _api_key()
         if key:
@@ -370,6 +443,8 @@ def create_ams_router(
                 status_code=403,
                 detail=f"{method} not in AMS write table: {path}",
             )
+        if _private_data_path(path):
+            await _management_user(request)
         # Action endpoints (schedule enable/disable/run) take no body, so an
         # empty request forwards as a bodiless one. A body that is present but
         # not JSON is still a 422 — it never reaches AMS half-parsed.
@@ -380,6 +455,9 @@ def create_ams_router(
                 body = json.loads(raw)
             except (ValueError, UnicodeDecodeError):
                 raise HTTPException(status_code=422, detail="request body must be JSON") from None
+        if _private_data_path(path) and isinstance(body, dict):
+            if {"user_id", "owner_id", "org_id", "tenant_id"} & set(body):
+                raise HTTPException(status_code=422, detail="Owner overrides are not supported")
         logger.info("ams-bridge write: user=%s %s /%s", user or "single-user", method, path)
         headers: dict[str, str] = {}
         key = _api_key()

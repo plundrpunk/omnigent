@@ -951,6 +951,7 @@ def create_app(
     public_sharing: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
+    bind_host: str | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -959,6 +960,8 @@ def create_app(
     Each dependency is forwarded to the router factories that need it;
     the app itself only wires them together.
 
+    :param bind_host: Actual listen host passed by the launcher, used to
+        restrict private AMS data to a direct loopback instance.
     :param agent_store: Store for agent CRUD operations.
     :param file_store: Store for uploaded-file metadata.
     :param conversation_store: Store for conversation and
@@ -2407,6 +2410,7 @@ def create_app(
         create_ams_router(
             auth_provider=auth_provider,
             permission_store=permission_store,
+            bind_host=bind_host,
         ),
         prefix="/v1",
         tags=["ams"],

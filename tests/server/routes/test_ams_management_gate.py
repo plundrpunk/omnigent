@@ -28,15 +28,22 @@ class Permissions:
         return self.admin
 
 
-def app_client(auth: AuthProvider | None, permissions: Any = None) -> TestClient:
+def app_client(
+    auth: AuthProvider | None,
+    permissions: Any = Permissions(),
+    *,
+    bind_host: str | None = "127.0.0.1",
+    base_url: str = "http://127.0.0.1:6767",
+    client_host: str = "127.0.0.1",
+) -> TestClient:
     app = FastAPI()
-    app.include_router(create_ams_router(auth, permissions), prefix="/v1")
+    app.include_router(create_ams_router(auth, permissions, bind_host=bind_host), prefix="/v1")
 
     @app.exception_handler(OmnigentError)
     async def auth_error(request, exc):
         return JSONResponse(status_code=exc.http_status, content={"error": exc.message})
 
-    return TestClient(app)
+    return TestClient(app, base_url=base_url, client=(client_host, 50000))
 
 
 @pytest.fixture()
@@ -51,6 +58,9 @@ def upstream(monkeypatch: pytest.MonkeyPatch) -> list[httpx.Request]:
     }
 
     def serve(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            # Startup health is mocked separately from protected record requests.
+            return httpx.Response(200, json={"status": "healthy"})
         requests.append(request)
         assert request.headers["X-API-Key"] == "synthetic-default-owner-key"
         assert "authorization" not in request.headers
@@ -64,6 +74,8 @@ def upstream(monkeypatch: pytest.MonkeyPatch) -> list[httpx.Request]:
                     "total": 1,
                 },
             )
+        if request.url.path == "/api/v1/memories/search":
+            return httpx.Response(200, json={"memories": [records[MEMORY]]})
         if request.url.path.startswith("/api/v1/memories/"):
             record = records.get(request.url.path.rsplit("/", 1)[-1])
             if not record or record["user_id"] != "default-owner":
@@ -141,11 +153,15 @@ def test_other_accounts_and_forged_local_headers_never_reach_default_owner(calle
 
 @pytest.mark.parametrize(
     "caller,admin,expected",
-    [("operator", True, 200), ("wife", True, 403), ("operator", False, 403), (None, True, 401)],
+    [
+        ("operator", True, 403),
+        ("wife", True, 403),
+        ("operator", False, 403),
+        ("local", True, 401),
+        (None, True, 401),
+    ],
 )
-def test_signed_accounts_cookie_requires_exact_operator_and_existing_admin(
-    caller, admin, expected, upstream
-):
+def test_named_accounts_are_denied_without_persisted_binding(caller, admin, expected, upstream):
     config = AccountsConfig(
         cookie_secret=b"test-only-cookie-secret-32-bytes!!",
         session_ttl_hours=8,
@@ -175,20 +191,16 @@ def test_signed_accounts_cookie_requires_exact_operator_and_existing_admin(
             assert not upstream
 
 
-def test_operator_resolves_from_existing_bootstrap_without_new_setting(monkeypatch, upstream):
+def test_bootstrap_name_is_not_a_persisted_operator_binding(monkeypatch, upstream):
     monkeypatch.delenv("OMNIGENT_ACCOUNTS_INIT_ADMIN_USERNAME")
     monkeypatch.setattr("omnigent.server.accounts_bootstrap.getpass.getuser", lambda: "operator")
     auth = UnifiedAuthProvider(source="header", local_single_user=False)
     with app_client(auth, Permissions()) as client:
-        assert (
-            client.get(f"{ROOT}/status", headers={"X-Forwarded-Email": "operator"}).json()[
-                "available"
-            ]
-            is True
-        )
-        assert (
-            client.get(f"{ROOT}/status", headers={"X-Forwarded-Email": "wife"}).status_code == 403
-        )
+        for name in ("operator", "wife"):
+            assert (
+                client.get(f"{ROOT}/status", headers={"X-Forwarded-Email": name}).status_code
+                == 403
+            )
     assert not upstream
 
 
@@ -291,3 +303,221 @@ def test_body_and_unlisted_methods_are_not_forwarded(upstream):
         assert client.request("HEAD", f"{ROOT}/memories/{MEMORY}").status_code == 405
         assert client.request("OPTIONS", f"{ROOT}/memories/{MEMORY}").status_code == 405
     assert not upstream
+
+
+@pytest.mark.parametrize(
+    "bind_host,base_url,client_host",
+    [
+        (None, "http://127.0.0.1:6767", "127.0.0.1"),
+        ("0.0.0.0", "http://127.0.0.1:6767", "127.0.0.1"),
+        ("::", "http://127.0.0.1:6767", "::1"),
+        ("127.0.0.1", "http://192.0.2.1:6767", "127.0.0.1"),
+        ("127.0.0.1", "http://127.0.0.1:6767", "192.0.2.10"),
+    ],
+)
+def test_local_sentinel_requires_verified_loopback_bind_and_socket(
+    bind_host, base_url, client_host, upstream
+):
+    auth = UnifiedAuthProvider(source="header", local_single_user=True)
+    with app_client(
+        auth, bind_host=bind_host, base_url=base_url, client_host=client_host
+    ) as client:
+        assert client.delete(f"{ROOT}/memories/{MEMORY}?soft_delete=false").status_code == 403
+        assert client.get("/v1/ams/api/v1/memories/").status_code == 403
+        assert (
+            client.post("/v1/ams/api/v1/memories/search", json={"query": "private"}).status_code
+            == 403
+        )
+    assert not upstream
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"Host": "attacker.example:6767"},
+        {"Host": "127.0.0.1:1234"},
+        {"Origin": "https://attacker.example"},
+        {"Origin": "http://127.0.0.1:1234"},
+        {"Origin": "null"},
+        {"Origin": "http://127.0.0.1:6767/extra"},
+        {"Forwarded": "for=192.0.2.2"},
+        {"X-Forwarded-For": "192.0.2.2"},
+        {"X-Forwarded-Host": "127.0.0.1:6767"},
+        {"X-Real-IP": "192.0.2.2"},
+        {"Sec-Fetch-Site": "cross-site"},
+        {"Sec-Fetch-Site": "same-site"},
+    ],
+)
+def test_hostile_browser_and_proxy_requests_do_not_use_local_identity(headers, upstream):
+    with app_client(UnifiedAuthProvider(source="header", local_single_user=True)) as client:
+        assert (
+            client.delete(
+                f"{ROOT}/memories/{MEMORY}?soft_delete=false", headers=headers
+            ).status_code
+            == 403
+        )
+        assert client.get("/v1/ams/api/v1/memories/", headers=headers).status_code == 403
+        assert (
+            client.post(
+                "/v1/ams/api/v1/memories/search", headers=headers, json={"query": "private"}
+            ).status_code
+            == 403
+        )
+    assert not upstream
+
+
+def test_direct_same_origin_local_requests_still_work(upstream):
+    with app_client(UnifiedAuthProvider(source="header", local_single_user=True)) as client:
+        headers = {"Origin": "http://127.0.0.1:6767", "Sec-Fetch-Site": "same-origin"}
+        assert client.get(f"{ROOT}/status", headers=headers).json()["available"] is True
+        assert client.get("/v1/ams/api/v1/memories/", headers=headers).status_code == 200
+        assert (
+            client.post(
+                "/v1/ams/api/v1/memories/search", headers=headers, json={"query": "private"}
+            ).status_code
+            == 200
+        )
+        assert (
+            client.delete(
+                f"{ROOT}/memories/{MEMORY}?soft_delete=true", headers=headers
+            ).status_code
+            == 204
+        )
+
+
+def test_local_admin_denial_cannot_be_bypassed(upstream):
+    with app_client(
+        UnifiedAuthProvider(source="header", local_single_user=True), Permissions(False)
+    ) as client:
+        assert client.delete(f"{ROOT}/memories/{MEMORY}?soft_delete=false").status_code == 403
+        assert client.get("/v1/ams/api/v1/memories/").status_code == 403
+        assert (
+            client.post("/v1/ams/api/v1/memories/search", json={"query": "private"}).status_code
+            == 403
+        )
+    assert not upstream
+
+
+@pytest.mark.parametrize("caller", ["wife", "brother", "operator", "another-admin"])
+def test_alternate_memory_routes_cannot_bypass_named_account_denial(caller, upstream):
+    with app_client(
+        UnifiedAuthProvider(source="header", local_single_user=False), Permissions()
+    ) as client:
+        headers = {"X-Forwarded-Email": caller}
+        assert client.get("/v1/ams/api/v1/memories/", headers=headers).status_code == 403
+        assert client.get(f"/v1/ams/api/v1/memories/{MEMORY}", headers=headers).status_code == 403
+        assert (
+            client.post(
+                "/v1/ams/api/v1/memories/search", headers=headers, json={"query": "private"}
+            ).status_code
+            == 403
+        )
+    assert not upstream
+
+
+def test_alternate_memory_routes_reject_owner_overrides(upstream):
+    with app_client(UnifiedAuthProvider(source="header", local_single_user=True)) as client:
+        assert client.get("/v1/ams/api/v1/memories/?user_id=other").status_code == 422
+        assert (
+            client.post(
+                "/v1/ams/api/v1/memories/search", json={"query": "private", "user_id": "other"}
+            ).status_code
+            == 422
+        )
+    assert not upstream
+
+
+@pytest.mark.parametrize(
+    "bind_host,caller,admin,origin,expected,source",
+    [
+        ("127.0.0.1", None, True, "http://127.0.0.1:6767", 200, "header"),
+        ("0.0.0.0", None, True, "http://127.0.0.1:6767", 403, "header"),
+        (None, None, True, "http://127.0.0.1:6767", 403, "header"),
+        ("127.0.0.1", None, False, "http://127.0.0.1:6767", 403, "header"),
+        ("127.0.0.1", None, True, "https://attacker.example", 403, "header"),
+        ("127.0.0.1", "wife", True, "http://127.0.0.1:6767", 403, "header"),
+        ("127.0.0.1", "operator", True, "http://127.0.0.1:6767", 403, "header"),
+        ("127.0.0.1", "local", True, "http://127.0.0.1:6767", 401, "header"),
+        ("127.0.0.1", "operator", True, "http://127.0.0.1:6767", 403, "accounts"),
+        ("127.0.0.1", "wife", True, "http://127.0.0.1:6767", 403, "accounts"),
+        ("127.0.0.1", "local", True, "http://127.0.0.1:6767", 401, "accounts"),
+        ("127.0.0.1", "setup-chosen-owner", True, "http://127.0.0.1:6767", 403, "accounts"),
+    ],
+)
+def test_real_app_factory_enforces_private_boundary(
+    bind_host, caller, admin, origin, expected, source, upstream, db_uri, tmp_path, runtime_init
+):
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.server.app import create_app
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.local import LocalArtifactStore
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("local", is_admin=admin)
+    permissions.set_admin("local", admin)
+    if caller and caller not in ("local", "setup-chosen-owner"):
+        permissions.ensure_user(caller, is_admin=True)
+    config = AccountsConfig(
+        cookie_secret=b"test-only-cookie-secret-32-bytes!!",
+        session_ttl_hours=8,
+        base_url="http://127.0.0.1:6767",
+        init_admin_password=None,
+        invite_ttl_seconds=3600,
+        magic_ttl_seconds=60,
+    )
+    account_store = None
+    if source == "accounts":
+        from omnigent.server.accounts_store import SqlAlchemyAccountStore
+        from omnigent.server.passwords import hash_password
+
+        account_store = SqlAlchemyAccountStore(db_uri)
+        account_store.create_user_with_password(
+            "setup-chosen-owner", hash_password("test-only-owner-password"), is_admin=True
+        )
+    auth = UnifiedAuthProvider(
+        source=source,
+        accounts_config=config if source == "accounts" else None,
+        local_single_user=True,
+    )
+    artifacts = LocalArtifactStore(str(tmp_path / "private-artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifacts,
+        agent_cache=AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "private-cache"),
+        permission_store=permissions,
+        auth_provider=auth,
+        account_store=account_store,
+        bind_host=bind_host,
+        server_config={},
+    )
+    headers = {"Origin": origin}
+    if caller:
+        headers["X-Forwarded-Email"] = caller
+    with TestClient(app, base_url="http://127.0.0.1:6767", client=("127.0.0.1", 50000)) as client:
+        if source == "accounts" and caller:
+            client.cookies.set(
+                config.session_cookie_name,
+                mint_session_cookie(
+                    user_id=caller,
+                    cookie_secret=config.cookie_secret,
+                    ttl_hours=8,
+                    provider="accounts",
+                ),
+            )
+        assert client.get(f"{ROOT}/memories/", headers=headers).status_code == expected
+        assert client.get("/v1/ams/api/v1/memories/", headers=headers).status_code == expected
+        assert (
+            client.post(
+                "/v1/ams/api/v1/memories/search", headers=headers, json={"query": "private"}
+            ).status_code
+            == expected
+        )
+        deletion = client.delete(f"{ROOT}/memories/{MEMORY}?soft_delete=true", headers=headers)
+        assert deletion.status_code == (204 if expected == 200 else expected)
+    if expected != 200:
+        assert not upstream

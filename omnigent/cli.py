@@ -4219,6 +4219,7 @@ def server(
         allowed_domains=config_str_list(cfg.get("allowed_domains")),
         sandbox_config=sandbox_config,
         server_config=title_server_config,
+        bind_host=host,
     )
 
     click.echo(f"Starting omnigent server on {host}:{port}")
