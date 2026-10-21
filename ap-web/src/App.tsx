@@ -40,7 +40,9 @@ const LoopsPage = lazy(() => import("@/pages/LoopsPage").then((m) => ({ default:
 const TrainingPage = lazy(() =>
   import("@/pages/TrainingPage").then((m) => ({ default: m.TrainingPage })),
 );
-const MemoryManagementPage = lazy(() => import("@/pages/MemoryManagementPage").then(m => ({ default: m.MemoryManagementPage })));
+const MemoryManagementPage = lazy(() =>
+  import("@/pages/MemoryManagementPage").then((m) => ({ default: m.MemoryManagementPage })),
+);
 const AdvancedPage = lazy(() =>
   import("@/pages/AdvancedPage").then((m) => ({ default: m.AdvancedPage })),
 );
