@@ -42,8 +42,9 @@ import json
 import logging
 import os
 import signal
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable, Sequence
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,7 @@ class ACPClient:
         self._request_timeout = request_timeout
 
         self._proc: asyncio.subprocess.Process | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._next_id = 0
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
@@ -201,7 +203,7 @@ class ACPClient:
             raise ACPError(f"failed to spawn ACP agent {self._argv[0]!r}: {exc}") from exc
 
         self._reader_task = asyncio.create_task(self._read_loop())
-        asyncio.create_task(self._drain_stderr())
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def close(self) -> None:
         """Terminate the agent, killing the process group on every path."""
@@ -285,10 +287,7 @@ class ACPClient:
         for future in self._pending.values():
             if not future.done():
                 future.set_exception(
-                    ACPError(
-                        "ACP agent exited; stderr: "
-                        + " | ".join(self._stderr_tail[-5:])
-                    )
+                    ACPError("ACP agent exited; stderr: " + " | ".join(self._stderr_tail[-5:]))
                 )
         self._pending.clear()
         await self._updates.put(None)
@@ -345,9 +344,7 @@ class ACPClient:
         # so a compliant agent should not ask, and an agent that asks anyway
         # does not get the host filesystem through us.
         if method in ("fs/read_text_file", "fs/write_text_file"):
-            await self._respond_error(
-                msg_id, -32601, f"client does not provide {method}"
-            )
+            await self._respond_error(msg_id, -32601, f"client does not provide {method}")
             return
 
         await self._respond_error(msg_id, -32601, f"method not found: {method}")
@@ -398,9 +395,7 @@ class ACPClient:
         )
 
         try:
-            message = await asyncio.wait_for(
-                future, timeout=timeout or self._request_timeout
-            )
+            message = await asyncio.wait_for(future, timeout=timeout or self._request_timeout)
         except asyncio.TimeoutError:
             self._pending.pop(msg_id, None)
             raise ACPError(
@@ -486,9 +481,7 @@ class ACPClient:
 
     async def set_model(self, session_id: str, model_id: str) -> None:
         """Switch the session's model."""
-        await self.request(
-            "session/set_model", {"sessionId": session_id, "modelId": model_id}
-        )
+        await self.request("session/set_model", {"sessionId": session_id, "modelId": model_id})
 
     async def prompt(
         self,

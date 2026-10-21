@@ -55,10 +55,7 @@ const GOOD_VERDICT = /^(ACCEPT|proceed|PASS)$/i;
 function Verdict({ value }: { value: string }) {
   return (
     <span
-      className={cn(
-        "font-semibold",
-        GOOD_VERDICT.test(value) ? "text-green-400" : "text-red-400",
-      )}
+      className={cn("font-semibold", GOOD_VERDICT.test(value) ? "text-green-400" : "text-red-400")}
     >
       {value}
     </span>
@@ -70,12 +67,8 @@ function EventRow({ event }: { event: GoalEvent }) {
 
   return (
     <div className="flex gap-2 py-1 font-mono text-[10px] leading-relaxed">
-      <span className="w-6 shrink-0 text-right text-muted-foreground/60">
-        {event.index}
-      </span>
-      <span className={cn("w-20 shrink-0 font-semibold", roleTone)}>
-        {event.role}
-      </span>
+      <span className="w-6 shrink-0 text-right text-muted-foreground/60">{event.index}</span>
+      <span className={cn("w-20 shrink-0 font-semibold", roleTone)}>{event.role}</span>
       <div className="min-w-0 flex-1">
         {event.kind === "tool" && (
           <div className="flex flex-wrap items-baseline gap-x-2">
@@ -84,9 +77,7 @@ function EventRow({ event }: { event: GoalEvent }) {
               {event.ok ? "OK" : "FAIL"}
             </span>
             {event.exit_code != null && (
-              <span className="text-muted-foreground">
-                exit={event.exit_code}
-              </span>
+              <span className="text-muted-foreground">exit={event.exit_code}</span>
             )}
             {event.target && (
               <span className="truncate text-muted-foreground" title={event.target}>
@@ -98,9 +89,7 @@ function EventRow({ event }: { event: GoalEvent }) {
 
         {event.kind === "executor" && (
           <div>
-            <span className="text-muted-foreground">
-              done={String(event.done)}
-            </span>
+            <span className="text-muted-foreground">done={String(event.done)}</span>
             {event.patch_keys && event.patch_keys.length > 0 && (
               <span className="ml-2 text-muted-foreground">
                 patch=[{event.patch_keys.join(", ")}]
@@ -117,9 +106,7 @@ function EventRow({ event }: { event: GoalEvent }) {
         {event.kind === "verdict" && event.verdict && (
           <div>
             <Verdict value={event.verdict} />
-            {event.subgoal && (
-              <span className="ml-2 text-muted-foreground">{event.subgoal}</span>
-            )}
+            {event.subgoal && <span className="ml-2 text-muted-foreground">{event.subgoal}</span>}
           </div>
         )}
 
@@ -128,9 +115,7 @@ function EventRow({ event }: { event: GoalEvent }) {
             {event.error}
           </div>
         )}
-        {event.summary && (
-          <div className="text-muted-foreground/70">{event.summary}</div>
-        )}
+        {event.summary && <div className="text-muted-foreground/70">{event.summary}</div>}
       </div>
     </div>
   );
@@ -140,17 +125,11 @@ export function GoalRunEvents({ events }: { events: GoalEvent[] | null }) {
   const { ref, onScroll } = useStickToBottom(events?.length ?? 0);
 
   if (events === null) {
-    return (
-      <div className="px-2 py-1.5 text-[10px] text-muted-foreground">
-        Loading run detail…
-      </div>
-    );
+    return <div className="px-2 py-1.5 text-[10px] text-muted-foreground">Loading run detail…</div>;
   }
   if (events.length === 0) {
     return (
-      <div className="px-2 py-1.5 text-[10px] text-muted-foreground">
-        No events recorded yet.
-      </div>
+      <div className="px-2 py-1.5 text-[10px] text-muted-foreground">No events recorded yet.</div>
     );
   }
   return (

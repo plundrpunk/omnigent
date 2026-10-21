@@ -10,7 +10,7 @@ index b2ca3e4e..a22e8b12 100644
 +++ b/ap-web/src/shell/WorkLoopPanel.tsx
 @@ -13,7 +13,6 @@ import {
  } from "lucide-react";
- 
+
  import { Button } from "@/components/ui/button";
 -import { Progress } from "@/components/ui/progress";
  import type { AnyBlock } from "@/lib/blocks";
@@ -26,14 +26,14 @@ index b2ca3e4e..a22e8b12 100644
    toolCount: number;
 @@ -304,11 +302,6 @@ export function deriveWorkLoopSnapshot(input: DeriveWorkLoopInput): WorkLoopSnap
    ];
- 
+
    const verifierPassed = receipt?.verifier.status === "passed";
 -  const progress =
 -    (objective ? 25 : 0) +
 -    (executionStarted ? 25 : 0) +
 -    (executionSettled ? 25 : 0) +
 -    (verifierPassed ? 25 : 0);
- 
+
    let overallLabel = objective ? "Ready" : "Draft";
    let overallTone: WorkLoopSnapshot["overallTone"] = objective ? "ready" : "muted";
 @@ -340,7 +333,6 @@ export function deriveWorkLoopSnapshot(input: DeriveWorkLoopInput): WorkLoopSnap
@@ -46,7 +46,7 @@ index b2ca3e4e..a22e8b12 100644
      toolCount,
 @@ -593,18 +585,21 @@ export function WorkLoopPanel({
          </section>
- 
+
          <section className="rounded-lg border border-border bg-card p-3">
 -          <div className="mb-2 flex items-center justify-between gap-2 text-xs">
 -            <span className="font-medium text-foreground">Definition of done</span>
@@ -75,7 +75,7 @@ index b2ca3e4e..a22e8b12 100644
 -              : "Completion stops short of 100% until the execution contract reports verifier evidence."}
 -          </p>
          </section>
- 
+
          <section className="rounded-lg border border-border bg-card p-3">
 commit 51bf68fe63dd9636df0dd7625d856998a6c8b12b
 Author: Drew <andrewrutledge1@gmail.com>
@@ -89,7 +89,7 @@ index 31164ca8..2215b140 100644
 +++ b/ap-web/src/shell/WorkLoopPanel.test.tsx
 @@ -77,7 +77,12 @@ describe("deriveWorkLoopSnapshot", () => {
      });
- 
+
      expect(snapshot.objective).toBe("Implement the session receipt");
 -    expect(snapshot.progress).toBe(75);
 +    expect(snapshot.stages.map(({ label, state }) => ({ label, state }))).toEqual([
@@ -104,7 +104,7 @@ index 31164ca8..2215b140 100644
 @@ -122,7 +127,12 @@ describe("deriveWorkLoopSnapshot", () => {
        fallbackObjective: "Inspect the historical run",
      });
- 
+
 -    expect(snapshot.progress).toBe(75);
 +    expect(snapshot.stages.map(({ label, state }) => ({ label, state }))).toEqual([
 +      { label: "Intake", state: "complete" },
@@ -118,7 +118,7 @@ index 31164ca8..2215b140 100644
 @@ -175,7 +185,12 @@ describe("deriveWorkLoopSnapshot", () => {
        agentsWorking: 0,
      });
- 
+
 -    expect(snapshot.progress).toBe(100);
 +    expect(snapshot.stages.map(({ label, state }) => ({ label, state }))).toEqual([
 +      { label: "Intake", state: "complete" },
@@ -134,7 +134,7 @@ Author: Drew <andrewrutledge1@gmail.com>
 Date:   Sat Jul 25 20:06:40 2026 -0400
 
     feat(ap-web): aos-p0c-patterns-discover
-    
+
     Authored by AOS. Gates verified locally: type-check + suite green.
     Harness status: completed (exit 0).
 
@@ -143,12 +143,12 @@ index 2f822617..cb325f5a 100644
 --- a/ap-web/src/pages/PatternsPage.tsx
 +++ b/ap-web/src/pages/PatternsPage.tsx
 @@ -280,22 +280,26 @@ interface CandidateMemory {
- 
+
  function DiscoverFeed() {
    const [candidates, setCandidates] = useState<CandidateMemory[] | null>(null);
 +  const [failed, setFailed] = useState(false);
 +  const [retryKey, setRetryKey] = useState(0);
- 
+
    useEffect(() => {
      let cancelled = false;
 +    setCandidates(null);
@@ -169,7 +169,7 @@ index 2f822617..cb325f5a 100644
      };
 -  }, []);
 +  }, [retryKey]);
- 
+
    return (
      <div className="space-y-3">
 @@ -303,7 +307,22 @@ function DiscoverFeed() {
@@ -213,7 +213,7 @@ Author: Drew <andrewrutledge1@gmail.com>
 Date:   Sat Jul 25 20:17:30 2026 -0400
 
     feat(ap-web): aos-p0d-training-empirical
-    
+
     Authored by AOS. Gates verified locally: type-check + suite green.
     Harness status: completed (exit 0).
 
@@ -245,7 +245,7 @@ Author: Drew <andrewrutledge1@gmail.com>
 Date:   Sat Jul 25 20:34:50 2026 -0400
 
     feat(ap-web): aos-p0f-fleet-edges
-    
+
     Authored by AOS. Gates verified locally: type-check + suite green.
     Harness status: blocked (exit 3).
 
@@ -263,7 +263,7 @@ index 2a4fdd85..37194641 100644
 -  const [showHistory, setShowHistory] = useState(false);
 +  const [showHistory, setShowHistory] = useState(true);
    const timerRef = useRef<number | null>(null);
- 
+
    const poll = useCallback(async () => {
 @@ -173,8 +174,10 @@ export function FleetPage() {
        setAgents(a);
@@ -275,7 +275,7 @@ index 2a4fdd85..37194641 100644
 +      setStale(true);
      }
    }, []);
- 
+
 @@ -198,8 +201,7 @@ export function FleetPage() {
        isRoot: /prime/i.test(a.agent_name),
      }));
@@ -311,7 +311,7 @@ Author: Drew <andrewrutledge1@gmail.com>
 Date:   Sat Jul 25 20:39:54 2026 -0400
 
     feat(ap-web): aos-p0g-system-numeric
-    
+
     Authored by AOS. Gates verified locally: type-check + suite green.
     Harness status: completed (exit 0).
 

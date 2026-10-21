@@ -426,7 +426,8 @@ describe("useAvailableAgents", () => {
         skills: [],
       },
     ]);
-  });it("keeps a custom agent built on a native harness as its own picker row", async () => {
+  });
+  it("keeps a custom agent built on a native harness as its own picker row", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({
         object: "list",

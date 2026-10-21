@@ -7,6 +7,7 @@ support, and burned the loop budget refining proposals it never wrote.
 Each fix below is scoped to one file and one concrete, checkable change,
 matching the shape of the preflight contract that passed.
 """
+
 import json
 import pathlib
 
@@ -47,7 +48,7 @@ COMMON_TAIL = (
     "changing, do them as two separate write_file calls in two separate turns "
     "— never both in a single response.\n"
     "  - If you are challenged and asked to try again, RE-EMIT the complete "
-    "write_file tool_call. A response containing only {\"done\": true}, with no "
+    'write_file tool_call. A response containing only {"done": true}, with no '
     "tool_calls, is never sufficient: the previous turn's proposal is not "
     "carried forward for you. State the full call again every time."
 )
@@ -77,8 +78,7 @@ FIXES = [
             "true observed count including zero."
         ),
         "check": (
-            "No Math.max(..., 1) remains in WorkLoopPanel.tsx for artifact or agent "
-            "counts."
+            "No Math.max(..., 1) remains in WorkLoopPanel.tsx for artifact or agent counts."
         ),
     },
     {
@@ -105,8 +105,7 @@ FIXES = [
             "smoothed avg_success_rate under a column headed 'success'."
         ),
         "check": (
-            "TrainingPage.tsx surfaces total_successes and total_executions from the "
-            "payload."
+            "TrainingPage.tsx surfaces total_successes and total_executions from the payload."
         ),
     },
     {

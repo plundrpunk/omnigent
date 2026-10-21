@@ -44,11 +44,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
 import os
 import re
 import tempfile
 import uuid
+from collections.abc import Mapping
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -158,9 +159,7 @@ def _validate_endpoint(body: dict[str, Any]) -> dict[str, str]:
     base_url = body.get("base_url")
     if base_url is not None:
         if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
-            raise HTTPException(
-                status_code=422, detail="base_url must be an http(s) URL"
-            )
+            raise HTTPException(status_code=422, detail="base_url must be an http(s) URL")
         out["base_url"] = base_url
     api_key_env = body.get("api_key_env")
     if api_key_env is not None:
@@ -176,6 +175,7 @@ def _validate_endpoint(body: dict[str, Any]) -> dict[str, str]:
             )
         out["api_key_env"] = api_key_env
     return out
+
 
 #: Loop budgets forwarded to the CLI. The harness defaults ``max_revisions``
 #: to 1 — a single failed verification ends the run — which is far too tight
@@ -364,7 +364,9 @@ def _validate_contract(contract: Any) -> dict[str, Any]:
         )
     end_state = contract.get("end_state")
     if not isinstance(end_state, str) or not end_state.strip():
-        raise HTTPException(status_code=422, detail="contract.end_state must be a non-empty string")
+        raise HTTPException(
+            status_code=422, detail="contract.end_state must be a non-empty string"
+        )
     gate = contract.get("evidence_criteria")
     if not isinstance(gate, dict) or not any(gate.get(k) for k in _GATE_KEYS):
         raise HTTPException(
@@ -504,10 +506,8 @@ async def _execute_goal_run(run: dict[str, Any]) -> None:
         )
         return
     finally:
-        try:
+        with suppress(OSError):
             os.unlink(contract_path)
-        except OSError:
-            pass
 
     workdir = Path(_goal_workdir())
     if not workdir.is_absolute():
@@ -645,9 +645,7 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
         return _public(run)
 
     @router.get("/goal/{run_id}/events")
-    async def get_goal_events(
-        run_id: str, request: Request, since: int = 0
-    ) -> dict[str, Any]:
+    async def get_goal_events(run_id: str, request: Request, since: int = 0) -> dict[str, Any]:
         """Normalised run events, for live rendering in the work-loop panel.
 
         ``since`` is an event index, so the client can poll for the tail
@@ -661,14 +659,12 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
 
         artifact = _artifact_for(run)
         if artifact is None:
-            return {"run_id": run_id, "status": run.get("status"),
-                    "events": [], "total": 0}
+            return {"run_id": run_id, "status": run.get("status"), "events": [], "total": 0}
         try:
             data = json.loads(artifact.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             # A run writes its artifact continuously; a torn read is normal.
-            return {"run_id": run_id, "status": run.get("status"),
-                    "events": [], "total": 0}
+            return {"run_id": run_id, "status": run.get("status"), "events": [], "total": 0}
 
         raw_events = data.get("events") or []
         start = max(0, int(since))
