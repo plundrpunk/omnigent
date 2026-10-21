@@ -87,3 +87,61 @@ async def test_unhealthy_status_shouts_but_boots(monkeypatch, quiet_logger) -> N
     result = await check_bridge_at_startup(probe=probe, logger=quiet_logger)
     assert result["state"] == "unhealthy"
     assert "500" in result["detail"]
+
+
+@pytest.mark.parametrize("api_key", ["", "test-key"])
+async def test_default_probe_uses_health_path_headers_and_timeout(monkeypatch, api_key) -> None:
+    import httpx
+
+    from omnigent.server.routes import ams
+
+    monkeypatch.setenv("AMS_BASE_URL", "https://ams.example/")
+    monkeypatch.setenv("AMS_API_KEY", api_key)
+    monkeypatch.setenv("OMNIGENT_REQUIRE_AMS", "yes")
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        assert str(request.url) == "https://ams.example/health"
+        assert request.headers.get("X-API-Key", "") == api_key
+        assert request.extensions["timeout"]["read"] == 5.0
+        return httpx.Response(200)
+
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        ams.httpx,
+        "AsyncClient",
+        lambda **kwargs: original_client(transport=httpx.MockTransport(respond), **kwargs),
+    )
+    result = await check_bridge_at_startup()
+    assert result == {"state": "ok", "base_url": "https://ams.example", "detail": "healthy"}
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("required", ["yes", " TRUE ", "1"])
+async def test_unhealthy_required_bridge_aborts(monkeypatch, required, quiet_logger) -> None:
+    monkeypatch.setenv("AMS_BASE_URL", "https://ams.example")
+    monkeypatch.setenv("OMNIGENT_REQUIRE_AMS", required)
+
+    async def probe(base_url, api_key):
+        return 401
+
+    with pytest.raises(RuntimeError, match="required but unhealthy: HTTP 401"):
+        await check_bridge_at_startup(probe=probe, logger=quiet_logger)
+
+
+async def test_server_lifespan_checks_bridge_before_starting_harness(app, monkeypatch) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.server import app as app_module
+    from omnigent.server.routes import ams
+
+    check = AsyncMock(side_effect=RuntimeError("AMS bridge required but unreachable"))
+    start = AsyncMock()
+    monkeypatch.setattr(ams, "check_bridge_at_startup", check)
+    monkeypatch.setattr(app_module.HarnessProcessManager, "start", start)
+    with pytest.raises(RuntimeError, match="AMS bridge required"):
+        async with app.router.lifespan_context(app):
+            pytest.fail("unhealthy required bridge must abort startup")
+    check.assert_awaited_once_with()
+    start.assert_not_awaited()
