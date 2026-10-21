@@ -6,6 +6,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import app as app_module
@@ -18,6 +19,34 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.mark.parametrize("path", ["/v1", "/v1/", "/v1/missing", "/v1/missing.json"])
+async def test_unknown_api_path_never_serves_spa(
+    app: FastAPI,
+    tmp_path: Path,
+    path: str,
+) -> None:
+    """The SPA mount must not turn an API typo into a successful HTML page."""
+    web_ui = tmp_path / "spa"
+    web_ui.mkdir()
+    (web_ui / "index.html").write_text("<!doctype html><div>SPA</div>")
+    # Even an accidentally bundled file cannot shadow the API namespace.
+    (web_ui / "v1").mkdir()
+    (web_ui / "v1" / "missing.json").write_text('{"asset": true}')
+    app.mount("/", app_module._SPAStaticFiles(directory=web_ui, html=True))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(path)
+        assert response.status_code == 404
+        assert response.headers["content-type"] == "application/json"
+        assert isinstance(response.json(), dict)
+        for ui_path in ("/c/session_123", "/v1-settings"):
+            shell = await client.get(ui_path)
+            assert shell.status_code == 200
+            assert "SPA" in shell.text
 
 
 async def test_root_returns_api_metadata_without_web_ui(

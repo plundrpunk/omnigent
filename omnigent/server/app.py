@@ -1878,6 +1878,10 @@ class _SPAStaticFiles(StaticFiles):
         await super().__call__(scope, receive, send)
 
     async def get_response(self, path: str, scope: Scope) -> Response:  # type: ignore[override]
+        # Unmatched API requests must never resolve to a bundled asset or
+        # the SPA shell, even when the UI build contains a v1 directory.
+        if path == "v1" or path.startswith("v1/"):
+            raise StarletteHTTPException(status_code=404, detail="Not Found")
         served_path = path
         try:
             response = await super().get_response(path, scope)
