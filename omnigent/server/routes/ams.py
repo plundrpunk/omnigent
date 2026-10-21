@@ -184,7 +184,8 @@ def create_ams_router(auth_provider: AuthProvider | None = None) -> APIRouter:
     @router.put("/ams/management/{path:path}")
     @router.patch("/ams/management/{path:path}")
     @router.delete("/ams/management/{path:path}")
-    async def management_unavailable(request: Request) -> Any:
+    async def management_unavailable(path: str, request: Request) -> Any:  # noqa: ARG001
+        # FastAPI needs path declared for binding and OpenAPI even while gated.
         # Never reuse the shared AMS key for this surface without a trusted
         # caller-to-owner binding. No environment toggle bypasses this gate.
         require_user(request, auth_provider)
