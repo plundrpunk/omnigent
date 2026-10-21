@@ -386,6 +386,7 @@ const GOAL_STATUS_META: Record<
   GoalRun["status"],
   { label: string; tone: string; spinning?: boolean }
 > = {
+  queued: { label: "Queued", tone: "bg-primary/15 text-primary", spinning: true },
   running: { label: "Running", tone: "bg-primary/15 text-primary", spinning: true },
   completed: { label: `${needsYourOK}: passed`, tone: "bg-success/15 text-success" },
   blocked: { label: `Blocked: ${needsYourOK}`, tone: "bg-destructive/15 text-destructive" },
@@ -398,8 +399,8 @@ function clipArtifact(text: string, max = 600): string {
   return text.length <= max ? text : `${text.slice(0, max)}…`;
 }
 
-function goalExitLabel(exitCode: number | null): string {
-  if (exitCode === null) return "exit —";
+function goalExitLabel(exitCode: number | null | undefined): string {
+  if (exitCode == null) return "exit —";
   if (exitCode === 0) return finished;
   if (exitCode === 3) return pausedForInput;
   if (exitCode === 6) return failedACheck;
@@ -409,8 +410,8 @@ function goalExitLabel(exitCode: number | null): string {
 /**
  * Verbatim rendering of the harness' goal runs (R9 V2).
  *
- * Every field shown here is the harness' own output: status is the CLI
- * exit code's mapping, blocker/checkpoint text is quoted as written.
+ * Status comes from the CLI exit code or AMS continuation state for fleet
+ * runs; blocker/checkpoint text is quoted as written.
  * The section renders nothing when there are no runs — absence is
  * absence, not an empty-state invitation.
  */

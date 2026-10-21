@@ -2,7 +2,8 @@
  * Client for the server's Harness Automaton goal bridge (`/v1/goal`,
  * R9 V2 — see `omnigent/server/routes/goal.py`).
  *
- * Truth rules: a run's `status` comes from the CLI exit code only;
+ * Truth rules: local `status` comes from the CLI exit code; fleet
+ * `status` comes from AMS continuation state.
  * `outcome` / `blocker_md` / `checkpoint` are quoted verbatim from the
  * harness' own artifacts. An unconfigured bridge reads as `null`
  * (absence), never as an empty success.
@@ -11,6 +12,7 @@
 import { hostFetch } from "@/lib/host";
 
 export type GoalRunStatus =
+  | "queued"
   | "running"
   | "completed"
   | "blocked"
@@ -35,6 +37,12 @@ export interface GoalRun {
   error: string | null;
   started_at: string;
   finished_at: string | null;
+  /** Fleet dispatch metadata, absent on local runs. */
+  dispatch?: "local" | "fleet";
+  continuation_id?: string;
+  project?: string;
+  summary?: string | null;
+  work_receipt?: Record<string, unknown> | null;
 }
 
 /**
