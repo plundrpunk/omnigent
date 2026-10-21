@@ -308,6 +308,90 @@ async def test_fleet_enqueue_payload(
     assert listed.json()["runs"] == [run]
 
 
+@pytest.mark.parametrize(
+    ("ams_status", "run_status"),
+    [
+        ("pending", "queued"),
+        ("claimed", "running"),
+        ("in_progress", "running"),
+        ("completed", "completed"),
+        ("failed", "blocked"),
+    ],
+)
+async def test_fleet_records_preserve_goal_run_contract(
+    client: httpx.AsyncClient,
+    fleet_env: dict,
+    ams_status: str,
+    run_status: str,
+) -> None:
+    response = await client.post(
+        "/v1/goal",
+        json={"contract": _contract(), "dispatch": "fleet", "conversation_id": "conv-fleet"},
+    )
+    assert response.status_code == 202
+    created = response.json()
+    finished_at = "2026-10-21T12:00:00Z" if ams_status == "completed" else None
+    outcome = {"result": "verbatim AMS outcome"}
+    receipt = {"receipt_id": "receipt-1"}
+    fleet_env["responses"].extend(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "status": ams_status,
+                    "summary": "verbatim AMS summary",
+                    "outcome": outcome,
+                    "completed_at": finished_at,
+                },
+            ),
+            httpx.Response(200, json=receipt),
+        ]
+    )
+    response = await client.get(f"/v1/goal/{created['run_id']}")
+    assert response.status_code == 200
+    refreshed = response.json()
+    response = await client.get("/v1/goal", params={"conversation_id": "conv-fleet"})
+    assert response.status_code == 200
+    assert response.json()["runs"] == [refreshed]
+    null_fields = {
+        "provider",
+        "model",
+        "limits",
+        "endpoint",
+        "role_models",
+        "exec",
+        "exit_code",
+        "blocker_md",
+        "checkpoint",
+        "stderr_tail",
+        "error",
+    }
+    goal_run_keys = null_fields | {
+        "run_id",
+        "goal_id",
+        "conversation_id",
+        "contract",
+        "status",
+        "outcome",
+        "started_at",
+        "finished_at",
+    }
+    for run in (created, refreshed, response.json()["runs"][0]):
+        assert goal_run_keys <= run.keys()
+        assert all(run[key] is None for key in null_fields)
+        assert run["dispatch"] == "fleet"
+        assert run["continuation_id"] == "continuation-1"
+        assert run["project"] == "fleet-autonomy"
+        assert run["conversation_id"] == "conv-fleet"
+    assert created["status"] == "queued"
+    assert created["outcome"] is None
+    assert refreshed["status"] == run_status
+    assert refreshed["outcome"] == outcome
+    assert refreshed["summary"] == "verbatim AMS summary"
+    assert refreshed["work_receipt"] == receipt
+    assert refreshed["finished_at"] == finished_at
+
+
 @pytest.mark.parametrize("extra", [{"exec": {}}, {"exec": None}, {"exec": {"workspace": "/tmp"}}])
 async def test_fleet_rejects_exec(
     client: httpx.AsyncClient,

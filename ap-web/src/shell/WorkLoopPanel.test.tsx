@@ -3,6 +3,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AnyBlock, BlockContext } from "@/lib/blocks";
+import type { GoalRun } from "@/lib/goal";
 import { useChatStore } from "@/store/chatStore";
 import { deriveWorkLoopSnapshot, GoalRunsSection, WorkLoopPanel } from "./WorkLoopPanel";
 
@@ -263,6 +264,37 @@ describe("GoalRunsSection", () => {
     expect(screen.getByText("needs your OK: passed")).toBeInTheDocument();
     expect(screen.getByText(/finished · codex/)).toBeInTheDocument();
     expect(screen.getByText("goal-outcome.json")).toBeInTheDocument();
+  });
+
+  it.each(["queued", "running"] as const)(
+    "renders a %s fleet run as active without an invented exit code",
+    (status) => {
+      const run: GoalRun = {
+        ...baseRun,
+        dispatch: "fleet",
+        continuation_id: "continuation-1",
+        status,
+        provider: null,
+        exit_code: null,
+        outcome: null,
+        finished_at: null,
+      };
+      render(<GoalRunsSection runs={[run]} />);
+      const badge = screen.getByText(status === "queued" ? "Queued" : "Running");
+      expect(badge).toHaveClass("bg-primary/15", "text-primary");
+      expect(badge.querySelector(".animate-spin")).not.toBeNull();
+      expect(screen.getByText("exit —")).toBeInTheDocument();
+      expect(screen.getByTestId("goal-run-card")).not.toHaveTextContent("undefined");
+      expect(screen.queryByText(/finished/)).not.toBeInTheDocument();
+    },
+  );
+
+  it("handles a missing exit code from an older fleet server", () => {
+    const { exit_code: _exitCode, ...legacyRun } = baseRun;
+    // Model an older wire response that predates the required exit_code field.
+    render(<GoalRunsSection runs={[legacyRun as unknown as GoalRun]} />);
+    expect(screen.getByText(/exit —/)).toBeInTheDocument();
+    expect(screen.getByTestId("goal-run-card")).not.toHaveTextContent("undefined");
   });
 
   it("labels exit 3 as paused for input and quotes blocker.md verbatim", () => {
