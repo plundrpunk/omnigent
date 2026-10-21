@@ -139,7 +139,9 @@ export default defineConfig({
     // Storage when vitest populates test globals — every test that touches
     // localStorage then fails with "localStorage.clear is not a function".
     // Disable Node's webstorage in worker processes so jsdom's wins.
-    execArgv: ["--no-experimental-webstorage"],
+    execArgv: process.allowedNodeEnvironmentFlags.has("--no-experimental-webstorage")
+      ? ["--no-experimental-webstorage"]
+      : [],
     coverage: {
       provider: "v8",
       // With `include` set, vitest counts every matching source file (untested

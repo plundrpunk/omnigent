@@ -7,6 +7,7 @@ exit codes -- was only visible by reading the artifact JSON. This lifts the
 card into its own component so it can hold expand state and follow the
 live event stream.
 """
+
 import pathlib
 import re
 import subprocess
@@ -84,12 +85,16 @@ assert src.count(old_map) == 1, f"map anchor matched {src.count(old_map)}x"
 src = src.replace(old_map, new_map)
 
 # 3. close the new component and add the detail toggle
-old_tail = """              {run.outcome && (
+old_tail = (
+    """              {run.outcome && (
                 <details className="mt-1.5">
-                  <summary className="cursor-pointer text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                  <summary className="cursor-pointer text-[10px]"""
+    """ font-medium uppercase tracking-wide text-muted-foreground">
                     goal-outcome.json
                   </summary>
-                  <pre className="mt-1 max-h-48 overflow-auto rounded bg-muted/40 p-2 font-mono text-[10px] leading-4 whitespace-pre-wrap text-foreground/90">
+                  <pre className="mt-1 max-h-48 overflow-auto rounded"""
+    """ bg-muted/40 p-2 font-mono text-[10px] leading-4 whitespace-pre-wrap"""
+    """ text-foreground/90">
                     {clipArtifact(JSON.stringify(run.outcome, null, 2), 2000)}
                   </pre>
                 </details>
@@ -101,12 +106,17 @@ old_tail = """              {run.outcome && (
     </section>
   );
 }"""
-new_tail = """              {run.outcome && (
+)
+new_tail = (
+    """              {run.outcome && (
                 <details className="mt-1.5">
-                  <summary className="cursor-pointer text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                  <summary className="cursor-pointer text-[10px]"""
+    """ font-medium uppercase tracking-wide text-muted-foreground">
                     goal-outcome.json
                   </summary>
-                  <pre className="mt-1 max-h-48 overflow-auto rounded bg-muted/40 p-2 font-mono text-[10px] leading-4 whitespace-pre-wrap text-foreground/90">
+                  <pre className="mt-1 max-h-48 overflow-auto rounded"""
+    """ bg-muted/40 p-2 font-mono text-[10px] leading-4 whitespace-pre-wrap"""
+    """ text-foreground/90">
                     {clipArtifact(JSON.stringify(run.outcome, null, 2), 2000)}
                   </pre>
                 </details>
@@ -115,7 +125,8 @@ new_tail = """              {run.outcome && (
                 type="button"
                 data-testid="goal-run-detail-toggle"
                 onClick={() => setShowDetail((open) => !open)}
-                className="mt-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground"
+                className="mt-2 text-[10px] font-medium uppercase"""
+    """ tracking-wide text-muted-foreground hover:text-foreground"
               >
                 {showDetail ? "Hide run detail" : "Show run detail"}
               </button>
@@ -128,6 +139,7 @@ new_tail = """              {run.outcome && (
     </>
   );
 }"""
+)
 assert src.count(old_tail) == 1, f"tail anchor matched {src.count(old_tail)}x"
 src = src.replace(old_tail, new_tail)
 
@@ -135,15 +147,18 @@ src = src.replace(old_tail, new_tail)
 if not re.search(r'import \{[^}]*\buseState\b[^}]*\} from "react";', src):
     m = re.search(r'import \{([^}]*)\} from "react";', src)
     if m:
-        src = src.replace(m.group(0), f'import {{{m.group(1).rstrip()}, useState }} from "react";', 1)
+        src = src.replace(
+            m.group(0), f'import {{{m.group(1).rstrip()}, useState }} from "react";', 1
+        )
     else:
         src = 'import { useState } from "react";\n' + src
 
 PANEL.write_text(src, encoding="utf-8")
 print("WorkLoopPanel.tsx patched")
 
-r = subprocess.run(["npm", "--prefix", "ap-web", "run", "type-check"],
-                   capture_output=True, text=True)
+r = subprocess.run(
+    ["npm", "--prefix", "ap-web", "run", "type-check"], capture_output=True, text=True
+)
 print("type-check:", "PASS" if r.returncode == 0 else "FAIL")
 if r.returncode != 0:
     print((r.stdout + r.stderr)[-1500:])

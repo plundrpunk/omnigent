@@ -294,8 +294,7 @@
     ),
     radial-gradient(ellipse at 15% 85%, rgba(57, 255, 20, 0.08) 0%, transparent 48%),
     radial-gradient(ellipse at 85% 12%, rgba(0, 240, 255, 0.1) 0%, transparent 50%),
-    radial-gradient(ellipse at 55% 45%, rgba(255, 215, 0, 0.05) 0%, transparent 42%),
-    #090a10;
+    radial-gradient(ellipse at 55% 45%, rgba(255, 215, 0, 0.05) 0%, transparent 42%), #090a10;
 }
 
 /* Chat scroll fade: the ChatHeader overlay paints no background (a flat
@@ -1013,7 +1012,6 @@
   letter-spacing: 0.03em;
 }
 
-
 /* AUTOMATON OS hero banner (NewChatDialog) */
 .banner-core {
   color: color-mix(in srgb, var(--foreground) 62%, transparent);
@@ -1022,6 +1020,11 @@
   color: var(--foreground);
 }
 @keyframes bannerBreathe {
-  0%, 100% { filter: brightness(1); }
-  50% { filter: brightness(1.22); }
+  0%,
+  100% {
+    filter: brightness(1);
+  }
+  50% {
+    filter: brightness(1.22);
+  }
 }

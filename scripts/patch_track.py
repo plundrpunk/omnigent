@@ -11,6 +11,7 @@
    commit-despite-block path and survived hand review, but the policy
    should not depend on that.)
 """
+
 import pathlib
 import py_compile
 
@@ -22,13 +23,13 @@ if "provable fact" in s:
 else:
     lines = s.splitlines(keepends=True)
     idx = next(i for i, ln in enumerate(lines) if "Change nothing else." in ln)
-    hint = '''    "  - A missing file is a provable fact, not a dead end. If an expected file "
+    hint = """    "  - A missing file is a provable fact, not a dead end. If an expected file "
     "(such as a co-located test) cannot be read, prove its presence or absence "
     "with run_shell: find ap-web/src/<dir> -maxdepth 1 -name <Stem>*.test.tsx "
     "-print (empty output is positive evidence of absence), and use grep -rln "
     "<symbol> ap-web/src to locate related coverage elsewhere. Never let an "
     "unresolved read loop the run.\\n"
-'''
+"""
     lines.insert(idx + 1, hint)
     sp.write_text("".join(lines), encoding="utf-8")
     py_compile.compile(str(sp), doraise=True)

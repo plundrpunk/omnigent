@@ -49,7 +49,8 @@ const PATTERNS: Pattern[] = [
     honesty: "proven-here",
     oneLiner: "Split work across parallel specialists, merge one answer.",
     how: "Prime decomposes the goal, dispatches each subtask to a specialist, then a fan-in step synthesizes the rollup under one correlation id.",
-    evidence: "Recorded fleet runs (AUG pitch wave, exec:fleet-1ccac297…) with fan-in rollups in AMS.",
+    evidence:
+      "Recorded fleet runs (AUG pitch wave, exec:fleet-1ccac297…) with fan-in rollups in AMS.",
     setupPrompt:
       "Run a fan-out/fan-in: decompose the following goal into independent subtasks, dispatch each to the best specialist agent, then synthesize all results into one rollup with a shared correlation id. Goal: <YOUR GOAL>",
   },
@@ -61,8 +62,7 @@ const PATTERNS: Pattern[] = [
     oneLiner: "Route a goal to the domain team-lead, who delegates.",
     how: "dispatch_to_tl hands the task to a TL agent; the TL plans, spawns workers, and reports upward.",
     evidence: "tl-marketing dispatches verified end-to-end; TL fleet registered.",
-    caveats:
-      `Known gap (memory 45ea10b3): dispatches can queue without spawning — watch for work that ${neverStarted} on Fleet.`,
+    caveats: `Known gap (memory 45ea10b3): dispatches can queue without spawning — watch for work that ${neverStarted} on Fleet.`,
     setupPrompt:
       "Dispatch this to the appropriate team lead via dispatch_to_tl, have them decompose it across their team, and report the rollup: <YOUR GOAL>",
   },
@@ -96,8 +96,7 @@ const PATTERNS: Pattern[] = [
     oneLiner: `Autonomous work that can't lie — ${needsYourOK} + honest outcomes.`,
     how: `A goal contract declares deliverables and final checks that ${needsYourOK}; headless runs report ${finished}, ${pausedForInput}, or ${failedACheck} with blocker.md / checkpoint.json artifacts.`,
     evidence: `Harness+AMS 10x WS2/WS3 recorded ${proofOfWhatWasDone} for checks and outcomes (2026-07-17).`,
-    setupPrompt:
-      `Create a goal contract for the following outcome with explicit deliverables and final checks that ${needsYourOK}, then run it headless with honest outcomes: <YOUR OUTCOME>`,
+    setupPrompt: `Create a goal contract for the following outcome with explicit deliverables and final checks that ${needsYourOK}, then run it headless with honest outcomes: <YOUR OUTCOME>`,
   },
   {
     id: "eval-gated-promotion",
@@ -107,22 +106,46 @@ const PATTERNS: Pattern[] = [
     oneLiner: "Candidates replace incumbents only by beating them.",
     how: `Candidate runs the eval suite; promotion requires ${proofOfWhatWasDone}; regressions are rejected with a diff. It ${stopsIfCheckFails}.`,
     evidence: "WS4 eval deploy check: recorded promotion rejection with a diff (2026-07-17).",
-    setupPrompt:
-      `Propose an improved version of <TARGET>, run it through the eval deploy check against the incumbent, and promote only with passing ${proofOfWhatWasDone} — reject with a diff otherwise.`,
+    setupPrompt: `Propose an improved version of <TARGET>, run it through the eval deploy check against the incumbent, and promote only with passing ${proofOfWhatWasDone} — reject with a diff otherwise.`,
   },
 ];
 
-const HONESTY_STYLE: Record<Honesty, { label: string; variant: "default" | "secondary" | "outline" }> = {
+const HONESTY_STYLE: Record<
+  Honesty,
+  { label: string; variant: "default" | "secondary" | "outline" }
+> = {
   "proven-here": { label: "proven here", variant: "default" },
   vetted: { label: "vetted", variant: "secondary" },
   scouted: { label: "scouted", variant: "outline" },
 };
 
 /** Small node for glyphs. */
-function N({ x, y, r = 7, cls = "fill-primary/70" }: { x: number; y: number; r?: number; cls?: string }) {
+function N({
+  x,
+  y,
+  r = 7,
+  cls = "fill-primary/70",
+}: {
+  x: number;
+  y: number;
+  r?: number;
+  cls?: string;
+}) {
   return <circle cx={x} cy={y} r={r} className={cls} />;
 }
-function E({ x1, y1, x2, y2, dash }: { x1: number; y1: number; x2: number; y2: number; dash?: boolean }) {
+function E({
+  x1,
+  y1,
+  x2,
+  y2,
+  dash,
+}: {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  dash?: boolean;
+}) {
   return (
     <line
       x1={x1}
@@ -340,9 +363,9 @@ function DiscoverFeed() {
   return (
     <div className="space-y-3">
       <p className="text-sm text-muted-foreground">
-        Scouted candidates land here and wait for evidence — nothing joins the
-        library without {proofOfWhatWasDone}. Defenseclaw guards executable
-        instantiations (skills, loops, automata), not prose cards.
+        Scouted candidates land here and wait for evidence — nothing joins the library without{" "}
+        {proofOfWhatWasDone}. Defenseclaw guards executable instantiations (skills, loops,
+        automata), not prose cards.
       </p>
       {failed ? (
         <div className="space-y-2">
@@ -368,7 +391,9 @@ function DiscoverFeed() {
                 <Badge variant="outline">scouted — awaiting evidence</Badge>
               </div>
               {c.content_snippet && (
-                <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{c.content_snippet}</p>
+                <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">
+                  {c.content_snippet}
+                </p>
               )}
             </li>
           ))}
