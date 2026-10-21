@@ -3964,6 +3964,212 @@
         ]
       }
     },
+    "/v1/coding-agents": {
+      "get": {
+        "description": "Scan this host for installed coding agents.\n\n:param refresh: Drop the model cache and re-probe each CLI.\n:param installed_only: Omit agents that are not present on disk.\n:param with_models: Enumerate models (the slow part; ~2s cold).",
+        "operationId": "list_coding_agents_v1_coding_agents_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Refresh",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "installed_only",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Installed Only",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "with_models",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "With Models",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Coding Agents V1 Coding Agents Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Coding Agents",
+        "tags": [
+          "coding_agents"
+        ]
+      }
+    },
+    "/v1/coding-agents/acp": {
+      "get": {
+        "description": "Report ACP readiness for every agent that has a known ACP mode.\n\nAgents needing an adapter report ``ready: false`` with the reason, so\na caller can fall back to the native-TUI path instead of failing.",
+        "operationId": "list_acp_agents_v1_coding_agents_acp_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response List Acp Agents V1 Coding Agents Acp Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Acp Agents",
+        "tags": [
+          "coding_agents"
+        ]
+      }
+    },
+    "/v1/coding-agents/{agent_key}": {
+      "get": {
+        "description": "Return one agent's record, including its full model catalog.\n\n:param agent_key: Registry key, e.g. ``claude`` or ``opencode``.\n:param refresh: Drop the model cache and re-probe first.",
+        "operationId": "get_coding_agent_v1_coding_agents__agent_key__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_key",
+            "required": true,
+            "schema": {
+              "title": "Agent Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Refresh",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Coding Agent V1 Coding Agents  Agent Key  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Coding Agent",
+        "tags": [
+          "coding_agents"
+        ]
+      }
+    },
+    "/v1/coding-agents/{agent_key}/acp/models": {
+      "get": {
+        "description": "Ask the agent itself, over ACP, which models it can run.\n\nSpawns the agent, performs ``initialize`` + ``session/new``, reads\n``models.availableModels`` off the response, and tears the process\ndown. Authoritative and self-updating -- no curated list to drift.\n\n:param agent_key: Registry key of an ACP-capable agent.\n:param cwd: Working directory for the probe session.",
+        "operationId": "get_acp_models_v1_coding_agents__agent_key__acp_models_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_key",
+            "required": true,
+            "schema": {
+              "title": "Agent Key",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cwd",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cwd"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Acp Models V1 Coding Agents  Agent Key  Acp Models Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Acp Models",
+        "tags": [
+          "coding_agents"
+        ]
+      }
+    },
     "/v1/goal": {
       "get": {
         "description": "List runs, newest first; empty list means exactly that.",
@@ -4102,6 +4308,61 @@
           }
         },
         "summary": "Get Goal",
+        "tags": [
+          "goal"
+        ]
+      }
+    },
+    "/v1/goal/{run_id}/events": {
+      "get": {
+        "description": "Normalised run events, for live rendering in the work-loop panel.\n\n``since`` is an event index, so the client can poll for the tail\nrather than re-fetching the whole run each time.",
+        "operationId": "get_goal_events_v1_goal__run_id__events_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "title": "Since",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Goal Events V1 Goal  Run Id  Events Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Goal Events",
         "tags": [
           "goal"
         ]
@@ -5264,6 +5525,53 @@
           }
         },
         "summary": "Get Session Agent Contents",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/auto-approve": {
+      "put": {
+        "description": "Toggle blanket auto-approval of permission/auth requests.\n\nBody: ``{\"enabled\": true|false}``. Sets/clears the\n``omnigent.auto_approve`` session label, which the\nPermissionRequest hook consults before parking a prompt.\nOwner-level edit access required -- approving everything is a\ntrust decision, not a viewer affordance.",
+        "operationId": "set_auto_approve_v1_sessions__session_id__auto_approve_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Set Auto Approve V1 Sessions  Session Id  Auto Approve Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Auto Approve",
         "tags": [
           "sessions"
         ]

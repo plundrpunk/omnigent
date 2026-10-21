@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Check the phase contracts for the two defects that just blocked the preflight."""
-import json, glob, os
+
+import glob
+import json
+import os
 
 NEG = ("no other", "nothing else", "was not modified", "absence of")
 
@@ -8,7 +11,8 @@ for f in sorted(glob.glob("contracts/aos/*.json")):
     name = os.path.basename(f)
     if name == "chain.json":
         continue
-    c = json.load(open(f))
+    with open(f) as source:
+        c = json.load(source)
     ec = c.get("evidence_criteria", {}) or {}
     insp = c.get("inspection_criteria", []) or []
     neg = [x for x in insp if any(n in x.lower() for n in NEG)]

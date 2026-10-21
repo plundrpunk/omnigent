@@ -29,18 +29,14 @@ const InboxPage = lazy(() => import("@/pages/InboxPage").then((m) => ({ default:
 const SystemPage = lazy(() =>
   import("@/pages/SystemPage").then((m) => ({ default: m.SystemPage })),
 );
-const FleetPage = lazy(() =>
-  import("@/pages/FleetPage").then((m) => ({ default: m.FleetPage })),
-);
+const FleetPage = lazy(() => import("@/pages/FleetPage").then((m) => ({ default: m.FleetPage })));
 const PatternsPage = lazy(() =>
   import("@/pages/PatternsPage").then((m) => ({ default: m.PatternsPage })),
 );
 const ModelsPage = lazy(() =>
   import("@/pages/ModelsPage").then((m) => ({ default: m.ModelsPage })),
 );
-const LoopsPage = lazy(() =>
-  import("@/pages/LoopsPage").then((m) => ({ default: m.LoopsPage })),
-);
+const LoopsPage = lazy(() => import("@/pages/LoopsPage").then((m) => ({ default: m.LoopsPage })));
 const TrainingPage = lazy(() =>
   import("@/pages/TrainingPage").then((m) => ({ default: m.TrainingPage })),
 );

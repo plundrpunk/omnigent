@@ -19,6 +19,7 @@ gates after every contract:
 Brand invariant is a blocked condition on every contract: wordmark, wolf,
 gold-on-dark, and the "Let's do this thing!" hero are untouchable.
 """
+
 import json
 import pathlib
 
@@ -77,7 +78,8 @@ TAIL = (
     "      npm --prefix ap-web run type-check\n"
     "      npm --prefix ap-web test\n"
     "    Run them exactly as written; a scoped variant does not satisfy the "
-    "gate. Also run git status --porcelain as a run_shell call - it shows new untracked files, which git diff does not - and confirm only the named files (and "
+    "gate. Also run git status --porcelain as a run_shell call - it shows new untracked files, "
+    "which git diff does not - and confirm only the named files (and "
     "their co-located tests) changed.\n"
     "  - Set done=true once the edits are written and both gate commands have "
     "run. done is not a claim that the patch is committed - staging and "
@@ -90,7 +92,7 @@ TAIL = (
     "absence with run_shell find/grep - empty output is positive evidence of "
     "absence.\n"
     "  - If you are challenged and asked to try again, RE-EMIT the complete "
-    "write_file tool_call. A response containing only {\"done\": true} is "
+    'write_file tool_call. A response containing only {"done": true} is '
     "never sufficient: proposals are not carried forward between turns.\n"
     "  - BASELINE: the suite already skips 1 test file "
     "(src/loadtest/streamRenderBench.run.test.ts) and 2 tests. Inherited "
@@ -316,8 +318,7 @@ for fx in FIXES:
         "evidence_criteria": {**GATE, "required_files": [primary]},
         "inspection_criteria": [
             fx["check"],
-            "Only the named files and, if needed, their co-located tests "
-            "were modified.",
+            "Only the named files and, if needed, their co-located tests were modified.",
             "No test was deleted, renamed away, or marked skip/todo/only. "
             "BASELINE: 1 skipped test file and 2 skipped tests are "
             "inherited and expected; only an increase is a failure.",

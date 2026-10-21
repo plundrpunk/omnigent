@@ -13440,13 +13440,8 @@ def create_sessions_router(
         # AFTER payload validation -- malformed hook bodies still fail
         # loudly -- and logged per-decision so the transcript of what was
         # auto-approved survives in the server log.
-        _conv_aa = await asyncio.to_thread(
-            conversation_store.get_conversation, session_id
-        )
-        if (
-            _conv_aa is not None
-            and _conv_aa.labels.get(_AUTO_APPROVE_LABEL_KEY) == "true"
-        ):
+        _conv_aa = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if _conv_aa is not None and _conv_aa.labels.get(_AUTO_APPROVE_LABEL_KEY) == "true":
             _logger.info(
                 "auto-approved permission request: session=%s tool=%s",
                 session_id,

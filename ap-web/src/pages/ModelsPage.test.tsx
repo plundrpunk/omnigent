@@ -47,9 +47,7 @@ describe("ModelsPage role picker", () => {
     expect(screen.getByRole("button", { name: /kimi_code \(current\)/ })).toBeDisabled();
 
     fireEvent.click(screen.getByRole("button", { name: /grok_code/ }));
-    await waitFor(() =>
-      expect(mockedPut).toHaveBeenCalledWith({ orchestrator: "grok_code" }),
-    );
+    await waitFor(() => expect(mockedPut).toHaveBeenCalledWith({ orchestrator: "grok_code" }));
     // Redraw comes from a refetch, not an optimistic write.
     await waitFor(() => expect(mockedRoles).toHaveBeenCalledTimes(2));
   });

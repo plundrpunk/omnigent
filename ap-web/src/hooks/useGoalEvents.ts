@@ -1,10 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 
-import {
-  fetchGoalEvents,
-  isRunActive,
-  type GoalEvent,
-} from "@/lib/goalEvents";
+import { fetchGoalEvents, isRunActive, type GoalEvent } from "@/lib/goalEvents";
 
 /** How often an active run is polled for new events. */
 const POLL_MS = 2000;

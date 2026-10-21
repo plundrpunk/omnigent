@@ -29,7 +29,8 @@ export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
   // the remedy that applies elsewhere, so a local/VPS AOS user isn't sent
   // chasing a config file their setup never uses.
   const misleadingDatabricksHint =
-    display.includes(".databrickscfg") && (display.includes("401") || /unauthori[sz]ed/i.test(display));
+    display.includes(".databrickscfg") &&
+    (display.includes("401") || /unauthori[sz]ed/i.test(display));
   return (
     <Alert variant="destructive">
       <AlertCircleIcon />
@@ -42,8 +43,8 @@ export function ErrorBanner({ message, source, code }: ErrorBannerProps) {
         <AlertDescription className="mt-1 opacity-90">
           Note: the ~/.databrickscfg hint above only applies to Databricks-backed servers. On this
           deployment a 401 usually means the model provider credential the server holds is missing
-          or expired — check provider status on the Models page, or re-authenticate with
-          `omnigent login &lt;server-url&gt;`.
+          or expired — check provider status on the Models page, or re-authenticate with `omnigent
+          login &lt;server-url&gt;`.
         </AlertDescription>
       )}
     </Alert>
