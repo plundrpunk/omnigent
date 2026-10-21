@@ -64,7 +64,7 @@ from urllib.parse import quote
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 
-from omnigent.server.auth import LEVEL_EDIT, AuthProvider
+from omnigent.server.auth import LEVEL_EDIT, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes import ams
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.stores import ConversationStore
@@ -688,8 +688,15 @@ def create_goal_router(
     :param auth_provider: Auth provider used to identify the requesting
         user. ``None`` in single-user mode (endpoint is open).
     :param conversation_store: Sessions used by the shared access check.
-    :param permission_store: Session grants; ``None`` disables enforcement.
+    :param permission_store: Session grants and explicit admin flags;
+        ``None`` disables session checks, but not goal owner checks.
     :returns: A configured :class:`APIRouter`.
+
+    Reads require an exact owner match, even for shared sessions and admins.
+    Ownerless legacy runs are visible only to an authenticated identity with
+    the permission store's explicit admin flag. Without that store they are
+    hidden. Auth-disabled single-user runs use the reserved ``local`` owner;
+    disabling auth does not grant access to other owners or legacy records.
     """
     if permission_store is not None and conversation_store is None:
         raise ValueError("conversation_store is required with permission_store")
@@ -697,6 +704,22 @@ def create_goal_router(
     registry = GoalRunRegistry()
     # Exposed for tests: the registry is per-router, not module-global.
     router.state = registry  # type: ignore[attr-defined]
+
+    async def _can_read(run: dict[str, Any], user_id: str) -> bool:
+        owner = run.get("owner")
+        if owner:
+            return owner == user_id
+        return (
+            auth_provider is not None
+            and permission_store is not None
+            and await asyncio.to_thread(permission_store.is_admin, user_id)
+        )
+
+    async def _require_run(run_id: str, user_id: str) -> dict[str, Any]:
+        run = registry.get(run_id)
+        if run is None or not await _can_read(run, user_id):
+            raise HTTPException(status_code=404, detail="goal run not found")
+        return run
 
     def _require_configured() -> None:
         if not _automaton_bin() or not _goal_cwd():
@@ -749,7 +772,7 @@ def create_goal_router(
                     detail="exec is not allowed for fleet dispatch; the daemon sets the workspace",
                 )
             run = await _enqueue_fleet_goal(contract, conversation_id)
-            run["owner"] = user_id
+            run["owner"] = user_id or RESERVED_USER_LOCAL
             registry.create(run)
             return _public(run)
         provider = body.get("provider")
@@ -775,7 +798,7 @@ def create_goal_router(
             "run_id": str(uuid.uuid4()),
             "goal_id": contract["goal_id"],
             "conversation_id": conversation_id,
-            "owner": user_id,
+            "owner": user_id or RESERVED_USER_LOCAL,
             "provider": provider,
             "model": model,
             "limits": limits or None,
@@ -805,23 +828,25 @@ def create_goal_router(
     @router.get("/goal")
     async def list_goals(request: Request, conversation_id: str | None = None) -> dict[str, Any]:
         """List runs, newest first; empty list means exactly that."""
-        require_user(request, auth_provider)
+        user_id = require_user(request, auth_provider) or RESERVED_USER_LOCAL
         if not ams._base_url():
             _require_configured()
-        return {"runs": [_public(r) for r in registry.list(conversation_id)]}
+        return {
+            "runs": [
+                _public(r) for r in registry.list(conversation_id) if await _can_read(r, user_id)
+            ]
+        }
 
     @router.get("/goal/{run_id}")
     async def get_goal(run_id: str, request: Request) -> dict[str, Any]:
         """One run by id."""
-        require_user(request, auth_provider)
-        run = registry.get(run_id)
-        if run is not None and run.get("dispatch") == "fleet":
+        user_id = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        run = await _require_run(run_id, user_id)
+        if run.get("dispatch") == "fleet":
             await _refresh_fleet_goal(run)
             return _public(run)
         if not ams._base_url():
             _require_configured()
-        if run is None:
-            raise HTTPException(status_code=404, detail=f"unknown goal run: {run_id}")
         return _public(run)
 
     @router.get("/goal/{run_id}/events")
@@ -831,16 +856,13 @@ def create_goal_router(
         ``since`` is an event index, so the client can poll for the tail
         rather than re-fetching the whole run each time.
         """
-        require_user(request, auth_provider)
-        run = registry.get(run_id)
-        if run is not None and run.get("dispatch") == "fleet":
+        user_id = require_user(request, auth_provider) or RESERVED_USER_LOCAL
+        run = await _require_run(run_id, user_id)
+        if run.get("dispatch") == "fleet":
             await _refresh_fleet_goal(run)
             return {"run_id": run_id, "status": run["status"], "events": [], "total": 0}
         _require_configured()
-        if run is None:
-            raise HTTPException(status_code=404, detail=f"unknown goal run: {run_id}")
-
-        artifact = _artifact_for(run)
+        artifact = _artifact_for(run, allow_fallback=auth_provider is None)
         if artifact is None:
             return {"run_id": run_id, "status": run.get("status"), "events": [], "total": 0}
         try:
@@ -873,11 +895,13 @@ _EVENT_TEXT_CAP = 400
 _MAX_EVENTS = 400
 
 
-def _artifact_for(run: dict[str, Any]) -> Path | None:
+def _artifact_for(run: dict[str, Any], *, allow_fallback: bool = True) -> Path | None:
     """Locate a run's artifact, during the run as well as after it.
 
-    A finished run names its artifact in the CLI outcome. A running one does
-    not yet, so fall back to the newest artifact touched since the run began.
+    A finished run names its artifact in the CLI outcome. The legacy
+    auth-disabled fallback selects the newest file in the shared directory.
+    Authenticated reads disable that shared-directory fallback: it cannot
+    establish which run (or owner) produced a file.
     """
     outcome = run.get("outcome") or {}
     if isinstance(outcome, dict):
@@ -886,6 +910,8 @@ def _artifact_for(run: dict[str, Any]) -> Path | None:
             candidate = Path(str(raw))
             if candidate.is_file():
                 return candidate
+    if not allow_fallback:
+        return None
     art_dir = Path(_goal_workdir()) / "artifacts"
     if not art_dir.is_dir():
         return None
