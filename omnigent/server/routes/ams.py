@@ -302,6 +302,15 @@ def create_ams_router(auth_provider: AuthProvider | None = None) -> APIRouter:
         """Forward a write-table POST to the AMS REST API."""
         return await _forward_write("POST", path, request)
 
+    @router.delete("/ams/{path:path}")
+    async def ams_delete(path: str, request: Request) -> Any:
+        """Refuse DELETE explicitly: no AMS delete is on the write table.
+
+        Without this route the server's ``/v1`` JSON 404 catch-all answers
+        first, which hides that the bridge refused the method.
+        """
+        return await _forward_write("DELETE", path, request)
+
     return router
 
 

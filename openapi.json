@@ -4114,6 +4114,57 @@
       }
     },
     "/v1/ams/{path}": {
+      "delete": {
+        "description": "Refuse DELETE explicitly: no AMS delete is on the write table.\n\nWithout this route the server's ``/v1`` JSON 404 catch-all answers\nfirst, which hides that the bridge refused the method.",
+        "operationId": "ams_delete_v1_ams__path__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Ams Delete V1 Ams  Path  Delete"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
+          }
+        },
+        "summary": "Ams Delete",
+        "tags": [
+          "ams"
+        ]
+      },
       "get": {
         "description": "Forward a whitelisted GET to the AMS REST API.",
         "operationId": "ams_proxy_v1_ams__path__get",
