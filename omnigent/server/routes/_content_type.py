@@ -20,6 +20,8 @@ lives in exactly one place and reads identically across every route.
 
 from __future__ import annotations
 
+from urllib.parse import urlsplit
+
 from fastapi import HTTPException, Request
 
 
@@ -97,6 +99,8 @@ def require_json_or_multipart_content_type(request: Request) -> None:
     form-encoded, octet-stream, ...) with ``415`` *before* the handler's
     content-type dispatch runs.
 
+    Multipart is a browser simple-request type, so browser uploads must
+    be same-origin. SDK uploads without browser headers remain supported.
     Only the request headers are inspected — the body is never read.
 
     :param request: The incoming FastAPI request.
@@ -104,7 +108,34 @@ def require_json_or_multipart_content_type(request: Request) -> None:
         is neither a JSON media type nor ``multipart/form-data``.
     """
     media_type = _request_media_type(request)
-    if _is_json_media_type(media_type) or media_type == "multipart/form-data":
+    if _is_json_media_type(media_type):
+        return
+    if media_type == "multipart/form-data":
+        origin = request.headers.get("origin")
+        fetch_site = request.headers.get("sec-fetch-site")
+        allowed = fetch_site not in {"cross-site", "same-site"}
+        if origin is not None:
+            try:
+                source = urlsplit(origin)
+                target = request.url
+                allowed = allowed and (
+                    source.scheme in {"http", "https"}
+                    and source.scheme == target.scheme
+                    and source.hostname == target.hostname
+                    and (source.port or (443 if source.scheme == "https" else 80))
+                    == (target.port or (443 if target.scheme == "https" else 80))
+                    and not (
+                        source.username
+                        or source.password
+                        or source.path
+                        or source.query
+                        or source.fragment
+                    )
+                )
+            except ValueError:
+                allowed = False
+        if not allowed:
+            raise HTTPException(status_code=403, detail="Cross-origin multipart request forbidden")
         return
     raise HTTPException(
         status_code=415,
