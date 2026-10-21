@@ -385,3 +385,94 @@ async def test_relative_artifact_path_resolves_against_goal_cwd(
     )
     actions = [e["action"] for e in resp.json()["entries"]]
     assert actions == ["goal_started", "critique", "goal_finished"]
+
+
+async def test_receipt_link_never_returns_foreign_payload_sharing_an_event_id(
+    client: httpx.AsyncClient, seeded: dict[str, str], fake_ams: _FakeAms
+) -> None:
+    """An out-of-scope AMS copy must not overwrite the in-scope session copy."""
+    fake_ams.receipts["goal-queue:g-1"] = _receipt(
+        RECEIPT_ID, "mallory", "goal-queue:g-1", secret="mallory-only"
+    )
+    resp = await client.get(
+        f"/v1/trajectory/{seeded['alice']}/receipts/{RECEIPT_ID}",
+        headers={"X-Test-User": ALICE},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["user_id"] == "drew"
+    assert "mallory" not in resp.text
+
+    # The payload served is the one whose entry the timeline shows.
+    timeline = await client.get(
+        f"/v1/trajectory/{seeded['alice']}", headers={"X-Test-User": ALICE}
+    )
+    shown = [e for e in timeline.json()["entries"] if (e["receipt"] or {}).get("id") == RECEIPT_ID]
+    assert [e["owner"] for e in shown] == ["drew"]
+
+
+async def test_receipt_link_prefers_in_scope_ams_copy(
+    client: httpx.AsyncClient, seeded: dict[str, str], fake_ams: _FakeAms
+) -> None:
+    fake_ams.receipts["goal-queue:g-1"] = _receipt(
+        RECEIPT_ID, "drew", "goal-queue:g-1", copy="ams"
+    )
+    resp = await client.get(
+        f"/v1/trajectory/{seeded['alice']}/receipts/{RECEIPT_ID}",
+        headers={"X-Test-User": ALICE},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["metadata"]["copy"] == "ams"
+
+
+async def test_capped_sessions_show_the_newest_window(
+    client: httpx.AsyncClient,
+    seeded: dict[str, str],
+    stores: tuple[SqlAlchemyConversationStore, SqlAlchemyPermissionStore],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past the item cap, new activity still appears (oldest items roll off)."""
+    from omnigent.server.routes import trajectory as trajectory_routes
+
+    conv_store, _ = stores
+    monkeypatch.setattr(trajectory_routes, "_ITEM_LIMIT", 2)
+    monkeypatch.setattr(trajectory_routes, "_CHILD_ITEM_LIMIT", 1)
+    conv_store.append(
+        seeded["alice"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_2",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "newest parent"}]
+                ),
+                created_by=ALICE,
+            )
+        ],
+    )
+    conv_store.append(
+        seeded["child"],
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_c2",
+                data=MessageData(
+                    role="assistant",
+                    agent="researcher",
+                    content=[{"type": "output_text", "text": "newest child"}],
+                ),
+            )
+        ],
+    )
+    resp = await client.get(f"/v1/trajectory/{seeded['alice']}", headers={"X-Test-User": ALICE})
+    body = resp.json()
+    summaries = [e["summary"] for e in body["entries"] if e["source"] == "omnigent"]
+    assert any("newest parent" in s for s in summaries)
+    assert any("newest child" in s for s in summaries)
+    assert not any("ship it" in s for s in summaries)
+    assert not any("found it" in s for s in summaries)
+    assert body["sources"]["omnigent"]["truncated"] is True
+    assert body["sources"]["omnigent"]["count"] == 3
+    # The surviving window is still in chronological order.
+    parent = [e for e in body["entries"] if e["conversation_id"] == seeded["alice"]]
+    omni = [e for e in parent if e["source"] == "omnigent"]
+    assert [e["action"] for e in omni][-1] == "user_message"
