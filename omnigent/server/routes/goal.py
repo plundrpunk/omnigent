@@ -20,7 +20,9 @@ Configuration comes from the server environment:
 - ``HA_GOAL_CWD`` — working directory for the subprocess (the
   harness-automaton checkout). Unset ⇒ 503.
 - ``HA_GOAL_WORKDIR`` — ``--workdir`` passed to the CLI (default
-  ``runs-goal``); artifacts land in ``<workdir>/goal/<goal_id>/``.
+  ``runs-goal``); artifacts land in
+  ``<workdir>/runs/<run_id>/goal/<goal_id>.<run_id>/`` (run-scoped, so a reused
+  caller-chosen goal id never reads another run's).
 - Fleet dispatch uses the existing AMS bridge configuration and
   ``AOS_FLEET_GOAL_PROJECT`` (default ``fleet-autonomy``). The daemon
   controls the workspace; fleet requests cannot supply an ``exec`` block.
@@ -733,10 +735,14 @@ async def _execute_goal_run(run: dict[str, Any]) -> None:
     contract = run["contract"]
     run_workdir = _run_workdir(str(run["run_id"]))
     run_workdir.mkdir(parents=True, exist_ok=True)
+    # The harness names its artifact dir ``<workdir>/goal/<goal_id>/`` and never
+    # clears it. ``goal_id`` is caller-chosen, so besides the per-run workdir the
+    # harness also gets a run-scoped id; the record keeps the caller's goal_id.
+    harness_goal_id = f"{contract['goal_id']}.{run['run_id']}"
     with tempfile.NamedTemporaryFile(
         "w", suffix=".json", delete=False, encoding="utf-8"
     ) as handle:
-        json.dump(contract, handle)
+        json.dump({**contract, "goal_id": harness_goal_id}, handle)
         contract_path = handle.name
     argv = [
         _automaton_bin(),
@@ -801,7 +807,7 @@ async def _execute_goal_run(run: dict[str, Any]) -> None:
         with suppress(OSError):
             os.unlink(contract_path)
 
-    artifact_dir = run_workdir / "goal" / contract["goal_id"]
+    artifact_dir = run_workdir / "goal" / harness_goal_id
     outcome = _parse_trailing_json(stdout)
     outcome_file = _read_artifact(artifact_dir / "goal-outcome.json")
     if outcome_file is not None:

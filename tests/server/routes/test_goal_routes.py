@@ -895,7 +895,10 @@ async def test_valid_options_are_recorded_and_forwarded(goal_api, goal_env, monk
         captured.append((argv, kwargs))
         path = Path(argv[argv.index("--contract") + 1])
         contract_paths.append(path)
-        assert json.loads(path.read_text()) == _contract()
+        forwarded = json.loads(path.read_text())
+        # The harness gets a run-scoped goal id so artifact dirs never collide.
+        assert forwarded.pop("goal_id").startswith("t-goal.")
+        assert forwarded == {k: v for k, v in _contract().items() if k != "goal_id"}
         proc = AsyncMock()
         proc.returncode = 0
         proc.communicate.return_value = (b'{"outcome":{"verified":true}}', b"")
@@ -980,14 +983,14 @@ async def test_invalid_outcome_artifact_preserves_stdout(
 
     workdir = goal_env / "absolute-workdir"
     monkeypatch.setenv("HA_GOAL_WORKDIR", str(workdir))
-    art = workdir / "runs" / "r1" / "goal" / "t-goal"
+    art = workdir / "runs" / "run-1" / "goal" / "t-goal.run-1"
     art.mkdir(parents=True)
     (art / "goal-outcome.json").write_text(artifact)
     proc = AsyncMock()
     proc.returncode = None
     proc.communicate.return_value = (b'{"source":"stdout"}', b"x" * 9000)
     monkeypatch.setattr(goal.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc))
-    run = {"run_id": "r1", "contract": _contract()}
+    run = {"run_id": "run-1", "contract": _contract()}
     await goal._execute_goal_run(run)
     assert run["outcome"] == {"source": "stdout"}
     assert run["exit_code"] == -1

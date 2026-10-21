@@ -205,3 +205,83 @@ async def test_legacy_hidden_without_admin_store(monkeypatch, auth_enabled):
         assert (await client.get("/v1/goal")).json() == {"runs": []}
         for suffix in ("", "/events"):
             assert (await client.get(f"/v1/goal/legacy{suffix}")).status_code == 404
+
+
+#: Fake ``automaton`` CLI mirroring the real goal path's artifact layout
+#: (``<workdir>/goal/<goal_id>/``). ``metadata.mode`` picks the behaviour:
+#: ``blocked`` writes an events artifact, ``goal-outcome.json`` and
+#: ``blocker.md`` and exits 3; ``completed`` writes only the outcome and
+#: exits 0; ``error`` exits 2 without writing anything, as the real CLI
+#: does on a ``goal run error`` (bad provider, unreachable model, ...).
+_SHARED_DIR_AUTOMATON = """#!/usr/bin/env python3
+import json, sys, uuid
+from pathlib import Path
+
+args = sys.argv[1:]
+contract = json.loads(Path(args[args.index("--contract") + 1]).read_text())
+workdir = Path(args[args.index("--workdir") + 1])
+mode = contract["metadata"]["mode"]
+secret = contract["metadata"]["secret"]
+if mode == "error":
+    print("goal run error: model unreachable")
+    sys.exit(2)
+goal_dir = workdir / "goal" / contract["goal_id"]
+goal_dir.mkdir(parents=True, exist_ok=True)
+events = workdir / "artifacts" / f"{uuid.uuid4()}.json"
+events.parent.mkdir(parents=True, exist_ok=True)
+events.write_text(json.dumps({"events": [{"content": secret}]}))
+payload = {"goal_id": contract["goal_id"], "end_state": secret, "artifact_path": str(events)}
+goal_dir.joinpath("goal-outcome.json").write_text(json.dumps(payload))
+if mode == "blocked":
+    goal_dir.joinpath("blocker.md").write_text("# Blocked\\n" + secret)
+print(json.dumps(payload))
+sys.exit(3 if mode == "blocked" else 0)
+"""
+
+
+@pytest.mark.parametrize("bob_mode", ["error", "completed"])
+async def test_same_goal_id_never_reads_another_owners_artifacts(
+    owner_api, monkeypatch, tmp_path, bob_mode
+):
+    """Goal ids are caller-chosen; a reused id must not surface another owner's run."""
+    client, _ = owner_api
+    fake = tmp_path / "automaton"
+    fake.write_text(_SHARED_DIR_AUTOMATON)
+    fake.chmod(0o755)
+    monkeypatch.setenv("HA_AUTOMATON_BIN", str(fake))
+
+    async def run_as(user, mode, secret):
+        response = await client.post(
+            "/v1/goal",
+            headers=_headers(user),
+            json={
+                "contract": {
+                    "goal_id": "shared-goal",
+                    "end_state": "done",
+                    "evidence_criteria": {"test_command": "true"},
+                    "metadata": {"mode": mode, "secret": secret},
+                },
+            },
+        )
+        assert response.status_code == 202
+        run_id = response.json()["run_id"]
+        for _ in range(200):
+            run = (await client.get(f"/v1/goal/{run_id}", headers=_headers(user))).json()
+            if run["status"] != "running":
+                return run_id, run
+            await asyncio.sleep(0.02)
+        raise AssertionError("goal run never finished")
+
+    alice_id, alice = await run_as("alice", "blocked", "alice-private-plan")
+    assert alice["status"] == "blocked"
+    assert "alice-private-plan" in alice["blocker_md"]
+
+    bob_id, bob = await run_as("bob", bob_mode, "bob-plan")
+    assert "alice-private-plan" not in json.dumps(bob)
+    events = await client.get(f"/v1/goal/{bob_id}/events", headers=_headers("bob"))
+    assert events.status_code == 200
+    assert "alice-private-plan" not in events.text
+
+    # Alice's own record is unaffected by Bob's run.
+    again = (await client.get(f"/v1/goal/{alice_id}", headers=_headers("alice"))).json()
+    assert "alice-private-plan" in again["blocker_md"]
