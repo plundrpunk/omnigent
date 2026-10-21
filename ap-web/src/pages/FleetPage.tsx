@@ -67,7 +67,8 @@ function deriveEdges(
     if (!parentAgent || !childAgent || parentAgent === childAgent) continue;
 
     const key = `${parentAgent}→${childAgent}`;
-    const spawned = agentNames.has(childAgent) || exec.status === "completed" || exec.status === "running";
+    const spawned =
+      agentNames.has(childAgent) || exec.status === "completed" || exec.status === "running";
     const kind: FleetEdge["kind"] =
       exec.status === "running"
         ? "running"
@@ -116,7 +117,10 @@ interface Placed extends FleetNode {
   y: number;
 }
 
-function place(nodes: FleetNode[], levels: Map<string, number>): { placed: Placed[]; width: number; height: number } {
+function place(
+  nodes: FleetNode[],
+  levels: Map<string, number>,
+): { placed: Placed[]; width: number; height: number } {
   const byLevel = new Map<number, FleetNode[]>();
   for (const n of nodes) {
     const lvl = levels.get(n.id) ?? 1;
@@ -212,7 +216,14 @@ export function FleetPage() {
       for (const id of [e.from, e.to]) {
         if (!known.has(id)) {
           known.add(id);
-          nodes.push({ id, label: id, alive: false, status: "transient", contextPct: 0, isRoot: false });
+          nodes.push({
+            id,
+            label: id,
+            alive: false,
+            status: "transient",
+            contextPct: 0,
+            isRoot: false,
+          });
         }
       }
     }
@@ -248,7 +259,6 @@ export function FleetPage() {
         </>
       }
     >
-
       {error && (
         <div className="mb-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           AMS unreachable: {error}
@@ -314,7 +324,12 @@ export function FleetPage() {
                   {n.alive && (
                     <circle cx={12} cy={NODE_H / 2} r={4} className="fill-emerald-500">
                       {!stale && (
-                        <animate attributeName="opacity" values="1;0.3;1" dur="2s" repeatCount="indefinite" />
+                        <animate
+                          attributeName="opacity"
+                          values="1;0.3;1"
+                          dur="2s"
+                          repeatCount="indefinite"
+                        />
                       )}
                     </circle>
                   )}
@@ -374,7 +389,10 @@ export function FleetPage() {
               ) : (
                 <ul className="space-y-2">
                   {selectedExecs.map((e) => (
-                    <li key={e.execution_id} className="rounded-md border border-border/60 p-2 text-xs">
+                    <li
+                      key={e.execution_id}
+                      className="rounded-md border border-border/60 p-2 text-xs"
+                    >
                       <div className="flex items-center justify-between">
                         <span className="font-mono">{e.execution_id.slice(0, 18)}</span>
                         <Badge
@@ -395,7 +413,9 @@ export function FleetPage() {
                       {(e.model || execTokenCount(e) != null) && (
                         <div className="mt-1 flex flex-wrap gap-x-3 text-muted-foreground">
                           {e.model && <span className="font-mono">{e.model}</span>}
-                          {execTokenCount(e) != null && <span>{execTokenCount(e)!.toLocaleString()} tok</span>}
+                          {execTokenCount(e) != null && (
+                            <span>{execTokenCount(e)!.toLocaleString()} tok</span>
+                          )}
                         </div>
                       )}
                       {execErrorText(e) && (

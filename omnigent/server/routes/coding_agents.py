@@ -74,9 +74,7 @@ def create_coding_agents_router(
             clear_coding_agent_cache()
         payload = await discover_coding_agents(with_models=with_models)
         if installed_only:
-            payload["agents"] = [
-                agent for agent in payload["agents"] if agent.get("installed")
-            ]
+            payload["agents"] = [agent for agent in payload["agents"] if agent.get("installed")]
         return payload
 
     @router.get("/coding-agents/acp")
@@ -107,18 +105,14 @@ def create_coding_agents_router(
         """
         require_user(request, auth_provider)
         if agent_key not in SPECS_BY_KEY:
-            raise HTTPException(
-                status_code=404, detail=f"Unknown coding agent: {agent_key}"
-            )
+            raise HTTPException(status_code=404, detail=f"Unknown coding agent: {agent_key}")
         if refresh:
             clear_coding_agent_cache()
         payload = await discover_coding_agents()
         for agent in payload["agents"]:
             if agent.get("key") == agent_key:
                 return agent
-        raise HTTPException(
-            status_code=404, detail=f"Unknown coding agent: {agent_key}"
-        )
+        raise HTTPException(status_code=404, detail=f"Unknown coding agent: {agent_key}")
 
     @router.get("/coding-agents/{agent_key}/acp/models")
     async def get_acp_models(

@@ -10,6 +10,7 @@ whose gates are red is reverted so the next contract starts clean.
 
     python3 scripts/run_phase0_chain.py b c d e f g
 """
+
 import json
 import pathlib
 import subprocess
@@ -19,7 +20,7 @@ import urllib.request
 
 REPO = pathlib.Path("/Users/drfoundryos/Documents/DevFolder/Omnigent")
 BRIDGE = "http://127.0.0.1:6767/v1/goal"
-BODY = pathlib.Path("/tmp/p0a.json")          # provider/model/limits/exec template
+BODY = pathlib.Path("/tmp/p0a.json")  # provider/model/limits/exec template
 JOURNAL = REPO / "contracts/aos/phase0.chain.json"
 POLL_S = 15
 MAX_WAIT_S = 3600
@@ -79,8 +80,7 @@ def main():
     letters = [a for a in args if not a.startswith("phase")]
     if not letters:
         letters = sorted(
-            p.stem[len(prefix)]
-            for p in (REPO / "contracts/aos").glob(f"{prefix}?.contract.json")
+            p.stem[len(prefix)] for p in (REPO / "contracts/aos").glob(f"{prefix}?.contract.json")
         )
     template = json.loads(BODY.read_text())
     results = []
@@ -106,9 +106,14 @@ def main():
         changed = dirty()
         print(f"[{letter}] {status} exit={code}  files={len(changed)}", flush=True)
 
-        entry = {"letter": letter, "goal_id": gid, "run_id": run_id,
-                 "status": status, "exit_code": code,
-                 "files": [c[3:] for c in changed]}
+        entry = {
+            "letter": letter,
+            "goal_id": gid,
+            "run_id": run_id,
+            "status": status,
+            "exit_code": code,
+            "files": [c[3:] for c in changed],
+        }
 
         if not changed:
             entry["outcome"] = "no-op"
@@ -118,12 +123,23 @@ def main():
             entry["gates"] = why
             if ok and status == "completed":
                 sh("git", "add", "-A", "ap-web")
-                msg = (f"feat(ap-web): {gid}\n\n"
-                       f"Authored by AOS. Gates verified locally: {why}.\n"
-                       f"Harness status: {status} (exit {code}).")
-                sh("git", "-c", "user.name=Drew",
-                   "-c", "user.email=andrewrutledge1@gmail.com",
-                   "commit", "-q", "-m", msg, "--no-verify")
+                msg = (
+                    f"feat(ap-web): {gid}\n\n"
+                    f"Authored by AOS. Gates verified locally: {why}.\n"
+                    f"Harness status: {status} (exit {code})."
+                )
+                sh(
+                    "git",
+                    "-c",
+                    "user.name=Drew",
+                    "-c",
+                    "user.email=andrewrutledge1@gmail.com",
+                    "commit",
+                    "-q",
+                    "-m",
+                    msg,
+                    "--no-verify",
+                )
                 entry["outcome"] = "committed"
                 print(f"[{letter}] COMMITTED ({why})", flush=True)
             elif ok:
@@ -132,9 +148,7 @@ def main():
                 # run's diff for human review instead of committing it.
                 review_dir = REPO / "contracts/aos/review"
                 review_dir.mkdir(parents=True, exist_ok=True)
-                (review_dir / f"{gid}.patch").write_text(
-                    sh("git", "diff", "ap-web").stdout
-                )
+                (review_dir / f"{gid}.patch").write_text(sh("git", "diff", "ap-web").stdout)
                 sh("git", "checkout", "--", "ap-web")
                 entry["outcome"] = "parked-for-review"
                 print(f"[{letter}] parked for review: {why}", flush=True)
@@ -144,14 +158,11 @@ def main():
                 print(f"[{letter}] reverted: {why}", flush=True)
 
         results.append(entry)
-        (REPO / f"contracts/aos/{prefix}.chain.json").write_text(
-            json.dumps(results, indent=2)
-        )
+        (REPO / f"contracts/aos/{prefix}.chain.json").write_text(json.dumps(results, indent=2))
 
     print("\n=== chain summary ===")
     for r in results:
-        print(f"  {r['letter']}  {r['goal_id']:<28} {r['status']:<10} "
-              f"{r.get('outcome')}")
+        print(f"  {r['letter']}  {r['goal_id']:<28} {r['status']:<10} {r.get('outcome')}")
 
 
 if __name__ == "__main__":

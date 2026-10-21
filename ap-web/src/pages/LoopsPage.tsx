@@ -297,7 +297,11 @@ export function LoopsPage() {
           <div className="rounded-xl border border-border bg-card p-4">
             <h2 className="mb-3 text-sm font-medium text-muted-foreground">Loop</h2>
             <div className="grid grid-cols-[1fr_110px] gap-2">
-              <Input value={loopName} onChange={(e) => setLoopName(e.target.value)} placeholder="loop name" />
+              <Input
+                value={loopName}
+                onChange={(e) => setLoopName(e.target.value)}
+                placeholder="loop name"
+              />
               <Input
                 type="number"
                 min={1}
@@ -316,9 +320,7 @@ export function LoopsPage() {
 
           {selected ? (
             <div className="rounded-xl border border-primary/40 bg-card p-4">
-              <h2 className="mb-3 text-sm font-medium text-muted-foreground">
-                Selected stage
-              </h2>
+              <h2 className="mb-3 text-sm font-medium text-muted-foreground">Selected stage</h2>
               <div className="space-y-2">
                 <div className="grid grid-cols-[1fr_150px] gap-2">
                   <Input

@@ -46,7 +46,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import urllib.error
 import urllib.request
 
@@ -112,13 +111,21 @@ def run(args: argparse.Namespace, command: list[str]) -> int:
 
     for gen in range(1, args.max_generations + 1):
         # ── birth ritual: register + inherit pending continuation ──
-        birth = _api(base, key, "/api/warden/birth", {
-            "agent_id": agent_id,
-            "agent_name": args.agent_name,
-            "metadata": {"milack": True, "generation": gen,
-                         "window_tokens": args.window_tokens,
-                         "rollover": args.rollover},
-        })
+        birth = _api(
+            base,
+            key,
+            "/api/warden/birth",
+            {
+                "agent_id": agent_id,
+                "agent_name": args.agent_name,
+                "metadata": {
+                    "milack": True,
+                    "generation": gen,
+                    "window_tokens": args.window_tokens,
+                    "rollover": args.rollover,
+                },
+            },
+        )
         inherited = birth.get("continuation") or {}
         if inherited:
             handoff = json.dumps(inherited, indent=2)[:3000]
@@ -127,8 +134,11 @@ def run(args: argparse.Namespace, command: list[str]) -> int:
         # ── prompt file: goal + inheritance + protocol ──
         prompt = (
             f"## Goal\n{args.goal}\n\n"
-            + (f"## Inherited handoff (from generation {gen - 1})\n{handoff}\n\n"
-               if handoff else "## Inherited handoff\nNone — you are generation 1.\n\n")
+            + (
+                f"## Inherited handoff (from generation {gen - 1})\n{handoff}\n\n"
+                if handoff
+                else "## Inherited handoff\nNone — you are generation 1.\n\n"
+            )
             + ROLLUP_INSTRUCTION
         )
         fd, prompt_file = tempfile.mkstemp(prefix=f"milack-{agent_id}-g{gen}-", suffix=".md")
@@ -136,8 +146,12 @@ def run(args: argparse.Namespace, command: list[str]) -> int:
             f.write(prompt)
 
         cmd = [prompt_file if c == "{PROMPT_FILE}" else c for c in command]
-        env = dict(os.environ, MILACK_PROMPT_FILE=prompt_file,
-                   MILACK_GENERATION=str(gen), MILACK_AGENT_ID=agent_id)
+        env = dict(
+            os.environ,
+            MILACK_PROMPT_FILE=prompt_file,
+            MILACK_GENERATION=str(gen),
+            MILACK_AGENT_ID=agent_id,
+        )
 
         log_path = os.path.join(args.log_dir, f"{agent_id}-gen{gen}.log")
         tokens = len(prompt) // 4  # inherited prompt counts against the window
@@ -146,8 +160,11 @@ def run(args: argparse.Namespace, command: list[str]) -> int:
 
         with open(log_path, "w") as log:
             child = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, env=env,
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
             )
 
             hb_stop = threading.Event()
@@ -155,24 +172,33 @@ def run(args: argparse.Namespace, command: list[str]) -> int:
             def heartbeat() -> None:
                 while not hb_stop.wait(HEARTBEAT_SECS):
                     pct = min(100.0, tokens / args.window_tokens * 100)
-                    _api(base, key, "/api/warden/heartbeat", {
-                        "agent_id": agent_id, "agent_name": args.agent_name,
-                        "status": "working", "context_pct": round(pct, 2),
-                        "metadata": {"milack": True, "generation": gen},
-                    })
+                    _api(
+                        base,
+                        key,
+                        "/api/warden/heartbeat",
+                        {
+                            "agent_id": agent_id,
+                            "agent_name": args.agent_name,
+                            "status": "working",
+                            "context_pct": round(pct, 2),
+                            "metadata": {"milack": True, "generation": gen},
+                        },
+                    )
 
             hb = threading.Thread(target=heartbeat, daemon=True)
             hb.start()
 
             assert child.stdout is not None
             for line in child.stdout:
-                log.write(line)          # full fidelity, no compression
+                log.write(line)  # full fidelity, no compression
                 buf.append(line)
                 tokens += max(1, len(line) // 4)
                 if tokens >= rollover_tokens:
                     stop_reason = "rollover"
-                    print(f"[milack] gen {gen}: {tokens} tokens "
-                          f"(~{tokens / args.window_tokens:.0%}) — rolling over")
+                    print(
+                        f"[milack] gen {gen}: {tokens} tokens "
+                        f"(~{tokens / args.window_tokens:.0%}) — rolling over"
+                    )
                     child.send_signal(signal.SIGINT)
                     try:
                         child.wait(timeout=GRACE_SECS)
@@ -194,32 +220,46 @@ def run(args: argparse.Namespace, command: list[str]) -> int:
         done = stop_reason == "exited" and child.returncode == 0
 
         # ── death ritual: memories + continuation, mark dead ──
-        _api(base, key, "/api/warden/death", {
-            "agent_id": agent_id,
-            "original_goal": args.goal,
-            "next_action": "goal complete" if done
-                           else "resume from handoff and continue the goal",
-            "handoff_notes": f"[{provenance}] {rollup}",
-            "context_pct": round(pct, 2),
-            "memories": [{
-                "title": f"milack {agent_id} gen {gen} full log",
-                "content": (f"Generation {gen} of {agent_id}. stop={stop_reason} "
+        _api(
+            base,
+            key,
+            "/api/warden/death",
+            {
+                "agent_id": agent_id,
+                "original_goal": args.goal,
+                "next_action": "goal complete"
+                if done
+                else "resume from handoff and continue the goal",
+                "handoff_notes": f"[{provenance}] {rollup}",
+                "context_pct": round(pct, 2),
+                "memories": [
+                    {
+                        "title": f"milack {agent_id} gen {gen} full log",
+                        "content": (
+                            f"Generation {gen} of {agent_id}. stop={stop_reason} "
                             f"rc={child.returncode} tokens~{tokens} "
                             f"({pct:.1f}%). Uncompressed log: {log_path}\n\n"
-                            f"Rollup [{provenance}]:\n{rollup}"),
-                "memory_tier": "episodic",
-                "tags": ["milack", agent_id, f"gen-{gen}", provenance],
-            }],
-        })
-        print(f"[milack] gen {gen} died ({stop_reason}, rc={child.returncode}, "
-              f"~{pct:.1f}% ctx, rollup: {provenance}) — log: {log_path}")
+                            f"Rollup [{provenance}]:\n{rollup}"
+                        ),
+                        "memory_tier": "episodic",
+                        "tags": ["milack", agent_id, f"gen-{gen}", provenance],
+                    }
+                ],
+            },
+        )
+        print(
+            f"[milack] gen {gen} died ({stop_reason}, rc={child.returncode}, "
+            f"~{pct:.1f}% ctx, rollup: {provenance}) — log: {log_path}"
+        )
 
         if done:
             print(f"[milack] goal complete after {gen} generation(s)")
             return 0
         if stop_reason == "exited":
-            print(f"[milack] child exited rc={child.returncode} before rollover — "
-                  "stopping (blocker, not rolling)")
+            print(
+                f"[milack] child exited rc={child.returncode} before rollover — "
+                "stopping (blocker, not rolling)"
+            )
             return 3
         handoff = rollup  # next generation inherits the high-leverage tokens
 
@@ -237,8 +277,11 @@ def main() -> int:
     r.add_argument("--rollover", type=float, default=0.60)
     r.add_argument("--max-generations", type=int, default=5)
     r.add_argument("--log-dir", default="/tmp/milack-logs")
-    r.add_argument("command", nargs=argparse.REMAINDER,
-                   help="-- command to run (use {PROMPT_FILE} for the prompt path)")
+    r.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="-- command to run (use {PROMPT_FILE} for the prompt path)",
+    )
     args = parser.parse_args()
     command = [c for c in args.command if c != "--"]
     if not command:

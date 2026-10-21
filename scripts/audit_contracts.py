@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Check the phase contracts for the two defects that just blocked the preflight."""
-import json, glob, os
+
+import glob
+import json
+import os
 
 NEG = ("no other", "nothing else", "was not modified", "absence of")
 

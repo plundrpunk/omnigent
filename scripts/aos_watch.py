@@ -10,21 +10,28 @@ code, and each gate verdict.
     python3 scripts/aos_watch.py <artifact-id>
     python3 scripts/aos_watch.py --once       # print history and exit
 """
+
+import glob
 import json
 import os
 import sys
 import time
-import glob
 
-ART_DIR = os.path.expanduser(
-    "~/Documents/DevFolder/harness-automaton/runs-goal/artifacts"
-)
+ART_DIR = os.path.expanduser("~/Documents/DevFolder/harness-automaton/runs-goal/artifacts")
 
 C = {
-    "planner": "\033[95m", "executor": "\033[96m", "critic": "\033[93m",
-    "verifier": "\033[92m", "revisor": "\033[91m", "governor": "\033[90m",
-    "synthesizer": "\033[94m", "optimizer": "\033[94m",
-    "tool": "\033[97m", "dim": "\033[2m", "off": "\033[0m", "bold": "\033[1m",
+    "planner": "\033[95m",
+    "executor": "\033[96m",
+    "critic": "\033[93m",
+    "verifier": "\033[92m",
+    "revisor": "\033[91m",
+    "governor": "\033[90m",
+    "synthesizer": "\033[94m",
+    "optimizer": "\033[94m",
+    "tool": "\033[97m",
+    "dim": "\033[2m",
+    "off": "\033[0m",
+    "bold": "\033[1m",
 }
 
 
@@ -63,8 +70,10 @@ def show(i, ev):
         mark = f"{C['verifier']}OK{C['off']}" if ok else f"{C['revisor']}FAIL{C['off']}"
         call = obj.get("call") if isinstance(obj.get("call"), dict) else {}
         what = call.get("command") or call.get("path") or ""
-        print(f"{head} {C['tool']}{obj.get('tool'):<11}{C['off']} {mark} "
-              f"exit={obj.get('exit_code')}  {str(what)[:90]}")
+        print(
+            f"{head} {C['tool']}{obj.get('tool'):<11}{C['off']} {mark} "
+            f"exit={obj.get('exit_code')}  {str(what)[:90]}"
+        )
         err = (obj.get("stderr") or "").strip()
         if err and not ok:
             print(f"      {C['revisor']}{err.splitlines()[0][:130]}{C['off']}")
@@ -73,8 +82,10 @@ def show(i, ev):
     # An executor turn
     if "done" in obj and "patch" in obj:
         calls = obj.get("tool_calls") or []
-        print(f"{head} done={obj.get('done')}  patch={list(obj.get('patch') or {})[:3]}  "
-              f"proposes {len(calls)} tool call(s)")
+        print(
+            f"{head} done={obj.get('done')}  patch={list(obj.get('patch') or {})[:3]}  "
+            f"proposes {len(calls)} tool call(s)"
+        )
         for c_ in calls[:6]:
             if isinstance(c_, dict):
                 d = c_.get("command") or c_.get("path") or ""

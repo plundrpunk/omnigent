@@ -7,6 +7,7 @@ exit codes -- was only visible by reading the artifact JSON. This lifts the
 card into its own component so it can hold expand state and follow the
 live event stream.
 """
+
 import pathlib
 import re
 import subprocess
@@ -135,15 +136,18 @@ src = src.replace(old_tail, new_tail)
 if not re.search(r'import \{[^}]*\buseState\b[^}]*\} from "react";', src):
     m = re.search(r'import \{([^}]*)\} from "react";', src)
     if m:
-        src = src.replace(m.group(0), f'import {{{m.group(1).rstrip()}, useState }} from "react";', 1)
+        src = src.replace(
+            m.group(0), f'import {{{m.group(1).rstrip()}, useState }} from "react";', 1
+        )
     else:
         src = 'import { useState } from "react";\n' + src
 
 PANEL.write_text(src, encoding="utf-8")
 print("WorkLoopPanel.tsx patched")
 
-r = subprocess.run(["npm", "--prefix", "ap-web", "run", "type-check"],
-                   capture_output=True, text=True)
+r = subprocess.run(
+    ["npm", "--prefix", "ap-web", "run", "type-check"], capture_output=True, text=True
+)
 print("type-check:", "PASS" if r.returncode == 0 else "FAIL")
 if r.returncode != 0:
     print((r.stdout + r.stderr)[-1500:])

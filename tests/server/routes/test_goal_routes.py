@@ -93,9 +93,7 @@ async def test_unconfigured_answers_503(
         assert "HA_AUTOMATON_BIN" in resp.json()["detail"]
 
 
-async def test_config_endpoint_reports_state(
-    client: httpx.AsyncClient, goal_env: Path
-) -> None:
+async def test_config_endpoint_reports_state(client: httpx.AsyncClient, goal_env: Path) -> None:
     resp = await client.get("/v1/goal/config")
     assert resp.status_code == 200
     assert resp.json() == {"configured": True}
@@ -106,11 +104,17 @@ async def test_config_endpoint_reports_state(
     [
         (None, "must be a JSON object"),
         ({"end_state": "x", "evidence_criteria": {"test_command": "t"}}, "goal_id"),
-        ({"goal_id": "../evil", "end_state": "x", "evidence_criteria": {"test_command": "t"}}, "goal_id"),
+        (
+            {"goal_id": "../evil", "end_state": "x", "evidence_criteria": {"test_command": "t"}},
+            "goal_id",
+        ),
         ({"goal_id": "g", "evidence_criteria": {"test_command": "t"}}, "end_state"),
         ({"goal_id": "g", "end_state": "x"}, "evidence_criteria"),
         ({"goal_id": "g", "end_state": "x", "evidence_criteria": {}}, "fail closed"),
-        ({"goal_id": "g", "end_state": "x", "evidence_criteria": {"required_files": []}}, "fail closed"),
+        (
+            {"goal_id": "g", "end_state": "x", "evidence_criteria": {"required_files": []}},
+            "fail closed",
+        ),
     ],
 )
 async def test_invalid_contracts_are_422(
@@ -174,9 +178,7 @@ async def test_unknown_exit_code_is_error_not_success(
     assert run["exit_code"] == 7
 
 
-async def test_list_filters_by_conversation(
-    client: httpx.AsyncClient, goal_env: Path
-) -> None:
+async def test_list_filters_by_conversation(client: httpx.AsyncClient, goal_env: Path) -> None:
     for conv in ("conv-a", "conv-b"):
         resp = await client.post(
             "/v1/goal",

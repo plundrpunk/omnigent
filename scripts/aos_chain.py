@@ -198,9 +198,7 @@ def run_phase(cfg: dict[str, Any], contract: dict[str, Any], root: Path) -> dict
 
 
 def git(root: Path, *args: str) -> str:
-    return subprocess.run(
-        ["git", *args], cwd=root, capture_output=True, text=True
-    ).stdout.strip()
+    return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True).stdout.strip()
 
 
 def commit_phase(root: Path, goal_id: str) -> str | None:
@@ -287,7 +285,9 @@ def main() -> int:
             cap = int(cfg["on_blocked"].get("max_remediations_per_phase", 2))
             if attempts < cap:
                 fix = author_remediation(contract, run.get("blocker_md") or "", attempts + 1)
-                out = root / phase["contract"].replace(".contract.json", f"-fix{attempts + 1}.contract.json")
+                out = root / phase["contract"].replace(
+                    ".contract.json", f"-fix{attempts + 1}.contract.json"
+                )
                 out.write_text(json.dumps(fix, indent=2), encoding="utf-8")
                 j.record(
                     kind="remediation",
@@ -308,7 +308,9 @@ def main() -> int:
                     exit_code=fix_run.get("exit_code"),
                 )
                 if fix_run.get("status") == "completed":
-                    sha = commit_phase(root, fix["goal_id"]) if phase.get("commit_on_pass") else None
+                    sha = (
+                        commit_phase(root, fix["goal_id"]) if phase.get("commit_on_pass") else None
+                    )
                     j.record(kind="commit", goal_id=fix["goal_id"], sha=sha)
                     log(f"  remediation passed{f' — committed {sha}' if sha else ''}")
                     j.cursor = j.cursor + 1

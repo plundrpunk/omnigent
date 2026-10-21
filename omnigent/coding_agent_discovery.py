@@ -35,9 +35,10 @@ import os
 import re
 import shutil
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from omnigent.native_coding_agents import native_coding_agent_for_terminal_name
 
@@ -356,9 +357,7 @@ def _parse_models(spec: CodingAgentSpec, stdout: str) -> list[ModelEntry]:
             if line.startswith("- "):
                 model_id = line[2:].strip()
                 if model_id:
-                    entries.append(
-                        ModelEntry(id=model_id, label=model_id, source="probe")
-                    )
+                    entries.append(ModelEntry(id=model_id, label=model_id, source="probe"))
         return entries
 
     # Default (opencode and anything else): one bare id per line.
@@ -404,9 +403,7 @@ async def probe_models(
         if spec.key == "aider":
             args.append(filter_term or ".")  # the flag requires a filter
         cwd = "/tmp" if spec.key == "aider" else None
-        code, out, err = await _run(
-            path, args, timeout=_MODEL_PROBE_TIMEOUT_S, cwd=cwd
-        )
+        code, out, err = await _run(path, args, timeout=_MODEL_PROBE_TIMEOUT_S, cwd=cwd)
         if code == 0 and out:
             models = _parse_models(spec, out)
         else:
@@ -441,9 +438,7 @@ async def _no_models() -> list[ModelEntry]:
     return []
 
 
-async def discover_agent(
-    spec: CodingAgentSpec, *, with_models: bool = True
-) -> dict[str, Any]:
+async def discover_agent(spec: CodingAgentSpec, *, with_models: bool = True) -> dict[str, Any]:
     """Build the full record for one coding agent on this machine.
 
     :param spec: The agent to inspect.

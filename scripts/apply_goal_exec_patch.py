@@ -4,22 +4,29 @@
 Idempotent: refuses to double-apply. Every replacement must match exactly
 once or the script aborts without touching the file.
 """
-import sys, pathlib, py_compile, tempfile, shutil
+
+import pathlib
+import py_compile
+import shutil
+import sys
+import tempfile
 
 P = pathlib.Path.home() / "Documents/DevFolder/Omnigent/omnigent/server/routes/goal.py"
 src = P.read_text(encoding="utf-8")
 
 if "HA_GOAL_EXEC_ROOTS" in src:
-    print("ALREADY APPLIED — no change"); sys.exit(0)
+    print("ALREADY APPLIED — no change")
+    sys.exit(0)
 
 EDITS = []
 
-EDITS.append((
-"""- ``HA_GOAL_WORKDIR`` — ``--workdir`` passed to the CLI (default
+EDITS.append(
+    (
+        """- ``HA_GOAL_WORKDIR`` — ``--workdir`` passed to the CLI (default
   ``runs-goal``); artifacts land in ``<workdir>/goal/<goal_id>/``.
 
 Truth rules (Drew's law):""",
-"""- ``HA_GOAL_WORKDIR`` — ``--workdir`` passed to the CLI (default
+        """- ``HA_GOAL_WORKDIR`` — ``--workdir`` passed to the CLI (default
   ``runs-goal``); artifacts land in ``<workdir>/goal/<goal_id>/``.
 - ``HA_GOAL_EXEC_ROOTS`` — ``os.pathsep``-separated absolute directories
   a run is permitted to execute in and write to. **Unset ⇒ every exec
@@ -34,15 +41,18 @@ before a process is ever spawned. The resolved settings are recorded on
 the run and returned by ``GET /v1/goal``, so a run can never write
 somewhere the record doesn't admit to.
 
-Truth rules (Drew's law):"""))
+Truth rules (Drew's law):""",
+    )
+)
 
-EDITS.append((
-'''_ARTIFACT_CAP_BYTES = 64 * 1024
+EDITS.append(
+    (
+        """_ARTIFACT_CAP_BYTES = 64 * 1024
 _STDERR_TAIL_CHARS = 8 * 1024
 
 
-def _automaton_bin() -> str:''',
-'''_ARTIFACT_CAP_BYTES = 64 * 1024
+def _automaton_bin() -> str:""",
+        """_ARTIFACT_CAP_BYTES = 64 * 1024
 _STDERR_TAIL_CHARS = 8 * 1024
 
 #: Sandbox modes forwarded to ``--exec-sandbox``. ``none`` is deliberately
@@ -57,12 +67,15 @@ _DEFAULT_EXEC_SANDBOX = "subprocess"
 _EXEC_COMMAND_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
-def _automaton_bin() -> str:'''))
+def _automaton_bin() -> str:""",
+    )
+)
 
-EDITS.append((
-'''def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()''',
-'''def _exec_roots() -> list[Path]:
+EDITS.append(
+    (
+        """def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()""",
+        '''def _exec_roots() -> list[Path]:
     """Absolute, symlink-resolved roots a run may execute inside.
 
     Empty when ``HA_GOAL_EXEC_ROOTS`` is unset — which is what makes the
@@ -159,15 +172,18 @@ def _validate_exec(spec: Any) -> dict[str, Any] | None:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()'''))
+    return datetime.now(timezone.utc).isoformat()''',
+    )
+)
 
-EDITS.append((
-'''    provider = run.get("provider")
+EDITS.append(
+    (
+        """    provider = run.get("provider")
     if provider:
         argv += ["--provider", provider]
     try:
-        proc = await asyncio.create_subprocess_exec(''',
-'''    provider = run.get("provider")
+        proc = await asyncio.create_subprocess_exec(""",
+        """    provider = run.get("provider")
     if provider:
         argv += ["--provider", provider]
     # Execution is opt-in. ``exec_spec`` was allowlist-validated at request
@@ -186,39 +202,50 @@ EDITS.append((
         if exec_spec.get("command"):
             argv += ["--command", exec_spec["command"]]
     try:
-        proc = await asyncio.create_subprocess_exec('''))
+        proc = await asyncio.create_subprocess_exec(""",
+    )
+)
 
-EDITS.append((
-'''            raise HTTPException(status_code=422, detail="provider must be a simple token")
-        if registry.running_count()''',
-'''            raise HTTPException(status_code=422, detail="provider must be a simple token")
+EDITS.append(
+    (
+        """            raise HTTPException(status_code=422, detail="provider must be a simple token")
+        if registry.running_count()""",
+        """            raise HTTPException(status_code=422, detail="provider must be a simple token")
         exec_spec = _validate_exec(body.get("exec"))
-        if registry.running_count()'''))
+        if registry.running_count()""",
+    )
+)
 
-EDITS.append((
-'''            "conversation_id": conversation_id,
+EDITS.append(
+    (
+        """            "conversation_id": conversation_id,
             "provider": provider,
-            "contract": contract,''',
-'''            "conversation_id": conversation_id,
+            "contract": contract,""",
+        """            "conversation_id": conversation_id,
             "provider": provider,
             # Recorded so the run record can never claim less access than
             # the subprocess actually got. ``None`` means reason-only.
             "exec": exec_spec,
-            "contract": contract,'''))
+            "contract": contract,""",
+    )
+)
 
 out = src
 for i, (old, new) in enumerate(EDITS, 1):
     n = out.count(old)
     if n != 1:
-        print(f"ABORT: edit {i} matched {n} times (expected exactly 1)"); sys.exit(1)
+        print(f"ABORT: edit {i} matched {n} times (expected exactly 1)")
+        sys.exit(1)
     out = out.replace(old, new)
 
 with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8") as t:
-    t.write(out); tmp = t.name
+    t.write(out)
+    tmp = t.name
 try:
     py_compile.compile(tmp, doraise=True)
 except py_compile.PyCompileError as e:
-    print("ABORT: patched file does not compile:", e); sys.exit(1)
+    print("ABORT: patched file does not compile:", e)
+    sys.exit(1)
 
 shutil.copy2(P, str(P) + ".bak")
 P.write_text(out, encoding="utf-8")

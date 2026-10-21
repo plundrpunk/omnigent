@@ -6,6 +6,7 @@ spoke, what it decided, every tool call and its exit code - sat in the run
 artifact on disk. This normalises those events into the same shape the
 terminal watcher prints, so the panel can render them live.
 """
+
 import pathlib
 import py_compile
 import tempfile
@@ -167,7 +168,7 @@ ROUTE = '''    @router.get("/goal/{run_id}/events")
 assert s.count("    return router\n") == 1
 s = s.replace("    return router\n", ROUTE + "\n")
 
-anchor = 'def _public(run: dict[str, Any]) -> dict[str, Any]:'
+anchor = "def _public(run: dict[str, Any]) -> dict[str, Any]:"
 assert s.count(anchor) == 1
 s = s.replace(anchor, HELPERS.lstrip("\n") + "\n" + anchor)
 

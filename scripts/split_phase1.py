@@ -19,6 +19,7 @@ gates after every contract:
 Brand invariant is a blocked condition on every contract: wordmark, wolf,
 gold-on-dark, and the "Let's do this thing!" hero are untouchable.
 """
+
 import json
 import pathlib
 
@@ -90,7 +91,7 @@ TAIL = (
     "absence with run_shell find/grep - empty output is positive evidence of "
     "absence.\n"
     "  - If you are challenged and asked to try again, RE-EMIT the complete "
-    "write_file tool_call. A response containing only {\"done\": true} is "
+    'write_file tool_call. A response containing only {"done": true} is '
     "never sufficient: proposals are not carried forward between turns.\n"
     "  - BASELINE: the suite already skips 1 test file "
     "(src/loadtest/streamRenderBench.run.test.ts) and 2 tests. Inherited "
@@ -316,8 +317,7 @@ for fx in FIXES:
         "evidence_criteria": {**GATE, "required_files": [primary]},
         "inspection_criteria": [
             fx["check"],
-            "Only the named files and, if needed, their co-located tests "
-            "were modified.",
+            "Only the named files and, if needed, their co-located tests were modified.",
             "No test was deleted, renamed away, or marked skip/todo/only. "
             "BASELINE: 1 skipped test file and 2 skipped tests are "
             "inherited and expected; only an increase is a failure.",

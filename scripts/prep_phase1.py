@@ -8,6 +8,7 @@ budget died. The semantic change is three lines and fully reviewable, so:
 restore the separator to HEAD's exact bytes, keep the real fix, and let
 the gates decide.
 """
+
 import pathlib
 import py_compile
 import subprocess
@@ -16,7 +17,9 @@ import subprocess
 target = pathlib.Path("ap-web/src/lib/ams.ts")
 orig = subprocess.run(
     ["git", "show", "HEAD:ap-web/src/lib/ams.ts"],
-    capture_output=True, text=True, check=True,
+    capture_output=True,
+    text=True,
+    check=True,
 ).stdout
 cur = target.read_text(encoding="utf-8")
 
@@ -58,9 +61,7 @@ else:
 
     old2 = '        cpath = REPO / f"contracts/aos/phase0{letter}.contract.json"\n'
     assert r.count(old2) == 1
-    r = r.replace(
-        old2, '        cpath = REPO / f"contracts/aos/{prefix}{letter}.contract.json"\n'
-    )
+    r = r.replace(old2, '        cpath = REPO / f"contracts/aos/{prefix}{letter}.contract.json"\n')
 
     old3 = "        JOURNAL.write_text(json.dumps(results, indent=2))\n"
     assert r.count(old3) == 1

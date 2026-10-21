@@ -6,6 +6,7 @@ payload gone. That is either an output-size limit somewhere in the codex
 path, or a JSON-assembly bug in the shim. This asks for a response of a
 known large size and reports exactly what comes back.
 """
+
 import json
 import subprocess
 import sys

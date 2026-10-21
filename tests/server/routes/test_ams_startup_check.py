@@ -27,7 +27,9 @@ async def test_unconfigured_warns_but_boots(monkeypatch, caplog, quiet_logger) -
     with caplog.at_level(logging.WARNING, logger="test.ams.startup"):
         result = await check_bridge_at_startup(logger=quiet_logger)
     assert result["state"] == "unconfigured"
-    assert any("NOT CONFIGURED" in r.message or "NOT CONFIGURED" in r.getMessage() for r in caplog.records)
+    assert any(
+        "NOT CONFIGURED" in r.message or "NOT CONFIGURED" in r.getMessage() for r in caplog.records
+    )
 
 
 async def test_unconfigured_aborts_when_required(monkeypatch, quiet_logger) -> None:
