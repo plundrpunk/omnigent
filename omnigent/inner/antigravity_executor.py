@@ -13,7 +13,7 @@ agent reuse, and a streaming :meth:`run_turn` mapping SDK events onto Omnigent
    harness only runs on hosts with glibc ≳ 2.36; older hosts surface an
    :class:`ExecutorError`.
 
-Default model is Gemini 3.5 Flash; the SDK can also drive Claude / GPT-OSS.
+Model selection defaults to the SDK when no explicit override is configured.
 
 Streaming model:
 
@@ -69,12 +69,10 @@ from .executor import (
     TurnCancelled,
     TurnComplete,
     classify_tool_result,
+    describe_exception,
 )
 
 logger = logging.getLogger(__name__)
-
-# Default model when neither spec nor provider pins one.
-_ANTIGRAVITY_DEFAULT_MODEL = "gemini-3.5-flash"
 
 # Sentinel the producer pushes when the step stream is exhausted, so the
 # consumer can distinguish "turn finished" from a queued event.
@@ -125,15 +123,16 @@ def _ensure_antigravity_sdk() -> ModuleType:
         app-boot crash.
     """
     try:
-        # importlib keeps the ``-> ModuleType`` return type clean regardless of
-        # whether the optional extra is installed at mypy time (a static import
-        # would resolve to ``Any`` and trip ``warn_return_any``).
+        # importlib keeps the ``-> ModuleType`` boundary explicit while leaving
+        # this optional integration lazy until the first turn.
         return importlib.import_module("google.antigravity")
     except ImportError as exc:
+        from omnigent.onboarding.antigravity_auth import ANTIGRAVITY_EXTRA
+        from omnigent.onboarding.extra_install import extra_install_display
+
         raise ImportError(
             "AntigravityExecutor requires the 'google-antigravity' package. "
-            "Install it with: pip install google-antigravity (or "
-            "pip install 'omnigent[antigravity]')."
+            f"Install it with: {extra_install_display(ANTIGRAVITY_EXTRA)}"
         ) from exc
 
 
@@ -296,6 +295,8 @@ class _AntigravitySessionState:
     :param agent_signature: ``(model, system_prompt, tool_signature)`` key; a
         change forces an agent rebuild. A model change thus resets the SDK
         conversation — fine since mid-session model switches are rare.
+        :meth:`interrupt_session` clears this to ``None`` so the next turn
+        rebuilds rather than reusing the cancelled conversation.
     :param pending_tools: Open tool calls keyed by call id, populated on
         :class:`ToolCallRequest` and drained by the ``PostToolCallHook``.
     :param active_queue: The current turn's event queue (the
@@ -309,7 +310,7 @@ class _AntigravitySessionState:
 
     agent: SDKAgent = None
     conversation: SDKConversation = None
-    agent_signature: tuple[str, str, str] | None = field(default=None)
+    agent_signature: tuple[str | None, str, str] | None = field(default=None)
     pending_tools: dict[str, _PendingTool] = field(default_factory=dict)
     active_queue: _EventQueue | None = field(default=None)
     last_usage: SDKUsage = None
@@ -332,9 +333,8 @@ class AntigravityExecutor(Executor):
         """Create an AntigravityExecutor.
 
         :param model: Default model when per-turn :attr:`ExecutorConfig.model`
-            is unset, e.g. ``"gemini-3.5-flash"`` (from
-            ``HARNESS_ANTIGRAVITY_MODEL``). ``None`` falls back to
-            :data:`_ANTIGRAVITY_DEFAULT_MODEL`.
+            is unset, typically from ``HARNESS_ANTIGRAVITY_MODEL``. ``None``
+            delegates model selection to the installed SDK.
         :param api_key: Direct Antigravity / Gemini API key (from
             ``HARNESS_ANTIGRAVITY_API_KEY``). ``None`` lets the SDK read its
             ambient ``GEMINI_API_KEY`` / ``ANTIGRAVITY_API_KEY``.
@@ -427,6 +427,25 @@ class AntigravityExecutor(Executor):
         then raises ``AntigravityCancelledError`` or yields a ``CANCELED``
         step, which the consumer surfaces as :class:`TurnCancelled`.
 
+        A cancelled SDK conversation carries aborted state, so reusing it for
+        the next turn would resume from that broken state. Invalidating the
+        cached agent signature forces the next :meth:`run_turn` through
+        :meth:`_ensure_agent`'s rebuild path — the same teardown the
+        error / signature-change path uses — which closes the stale agent and
+        opens a fresh agent + conversation (re-seeding prior history) before it
+        sends. The close is deferred to that path rather than awaited here so
+        it cannot race the still-running producer task and turn a clean cancel
+        into an :class:`ExecutorError`.
+
+        This deliberately departs from the peer executors, which call
+        ``close_session()`` eagerly on interrupt (see
+        :meth:`CursorExecutor.interrupt_session` and
+        :meth:`ClaudeSDKExecutor.interrupt_session`). Antigravity cannot do the
+        same: an eager close would race the still-live turn's producer task and
+        convert a clean :class:`TurnCancelled` into an :class:`ExecutorError`,
+        so we only invalidate the signature here and defer the rebuild (and
+        close) to the next turn.
+
         :param session_key: The Omnigent session id to interrupt.
         :returns: ``True`` if a live conversation was asked to cancel,
             ``False`` when the session has no open conversation.
@@ -437,6 +456,9 @@ class AntigravityExecutor(Executor):
         state.interrupt_requested = True
         with contextlib.suppress(Exception):
             await state.conversation.cancel()
+        # Drop the cached signature (not the agent itself — _ensure_agent needs
+        # the live agent reference to close it) so the next turn rebuilds.
+        state.agent_signature = None
         return True
 
     async def run_turn(
@@ -464,11 +486,7 @@ class AntigravityExecutor(Executor):
             terminal :class:`TurnComplete` / :class:`TurnCancelled` /
             :class:`ExecutorError`.
         """
-        model = (
-            (config.model if config and config.model else None)
-            or self._model_override
-            or (_ANTIGRAVITY_DEFAULT_MODEL)
-        )
+        model = (config.model if config and config.model else None) or self._model_override
         session_key = self._session_key(messages)
         prompt = _latest_user_text(messages)
 
@@ -480,7 +498,7 @@ class AntigravityExecutor(Executor):
                 tools=tools,
             )
         except ImportError as exc:
-            yield ExecutorError(message=str(exc), retryable=False)
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
         except Exception as exc:
             logger.exception("Antigravity agent construction failed")
@@ -544,6 +562,11 @@ class AntigravityExecutor(Executor):
             yield TurnCancelled(reason="user_cancelled", phase="model")
             return
         usage = self._extract_usage(state.last_usage)
+        # Stamp the resolved model onto the usage dict so the scaffold can
+        # price the turn via the MLflow catalog (same pattern as the
+        # claude-sdk and openai-agents-sdk executors).
+        if usage is not None:
+            usage["model"] = model
         # Notify in-process usage subscribers (and the auto-recorder) before the
         # terminal event, matching the peer SDK executors so antigravity turns
         # are not invisible to usage observers. No-op for an empty usage dict.
@@ -745,7 +768,7 @@ class AntigravityExecutor(Executor):
         self,
         session_key: str,
         *,
-        model: str,
+        model: str | None,
         system_prompt: str,
         tools: list[ToolSpec],
     ) -> tuple[_AntigravitySessionState, bool]:
@@ -757,7 +780,8 @@ class AntigravityExecutor(Executor):
         closes over it) stays valid.
 
         :param session_key: The Omnigent session id.
-        :param model: The resolved model id to pin, e.g. ``"gemini-3.5-flash"``.
+        :param model: The resolved model id to pin, or ``None`` to use the SDK
+            default.
         :param system_prompt: The agent's system instructions.
         :param tools: Omnigent tool specs to expose to the agent.
         :returns: ``(state, created)`` — the session's
@@ -772,8 +796,12 @@ class AntigravityExecutor(Executor):
         signature = (model, system_prompt, self._tool_signature(tools))
         state = self._session_states.get(session_key)
         if state is None:
+            # A brand-new session's state is NOT registered until the agent is
+            # fully built below, so a construction failure (bad creds, a host
+            # without the SDK's required glibc, SDK drift) leaves no dead,
+            # agent-less entry accumulating in ``_session_states`` turn after
+            # turn. A reused session is already registered.
             state = _AntigravitySessionState()
-            self._session_states[session_key] = state
 
         if state.agent is not None and state.agent_signature == signature:
             return state, False
@@ -786,16 +814,30 @@ class AntigravityExecutor(Executor):
         agent = await self._open_agent(
             state, model=model, system_prompt=system_prompt, tools=tools
         )
+        # Record the opened agent on the state BEFORE the (failure-prone)
+        # conversation access: ``_open_agent`` has already entered the agent's
+        # async context, which spawns the native ``localharness`` subprocess, so
+        # if anything after this point raises, the agent must still be reachable
+        # by ``close()`` / ``close_session()`` for teardown — otherwise that
+        # subprocess orphans. If wiring the conversation fails, reap it here.
         state.agent = agent
-        state.conversation = agent.conversation
+        try:
+            state.conversation = agent.conversation
+        except Exception:
+            await self._close_agent(agent)
+            state.agent = None
+            state.conversation = None
+            raise
         state.agent_signature = signature
+        # Register only once the agent is fully built (see the no-state branch).
+        self._session_states[session_key] = state
         return state, True
 
     async def _open_agent(
         self,
         state: _AntigravitySessionState,
         *,
-        model: str,
+        model: str | None,
         system_prompt: str,
         tools: list[ToolSpec],
     ) -> SDKAgent:
@@ -809,7 +851,8 @@ class AntigravityExecutor(Executor):
         :class:`ToolCallComplete` for every tool the agent runs.
 
         :param state: The session state the tool-completion hook closes over.
-        :param model: The resolved model id to pin.
+        :param model: The resolved model id to pin, or ``None`` to use the SDK
+            default.
         :param system_prompt: The agent's system instructions.
         :param tools: Omnigent tool specs to expose as callables.
         :returns: The opened SDK ``Agent``.
@@ -947,7 +990,7 @@ class AntigravityExecutor(Executor):
         self,
         antigravity: ModuleType,
         *,
-        model: str,
+        model: str | None,
         kwargs: _StrAnyDict,
     ) -> SDKConfig:
         """Build a ``LocalAgentConfig``, passing only supported optional fields.
@@ -956,14 +999,16 @@ class AntigravityExecutor(Executor):
         field the installed SDK doesn't accept, rather than crashing on drift.
 
         :param antigravity: The imported ``google.antigravity`` module.
-        :param model: The resolved model id to pin.
+        :param model: The resolved model id to pin, or ``None`` to use the SDK
+            default.
         :param kwargs: Base config kwargs (system instructions, tools, hooks).
         :returns: A ``LocalAgentConfig`` instance.
         """
         local_config_cls = antigravity.LocalAgentConfig
         supported = self._config_field_names(local_config_cls)
         candidate: _StrAnyDict = dict(kwargs)
-        candidate["model"] = model
+        if model is not None:
+            candidate["model"] = model
         if self._api_key:
             candidate["api_key"] = self._api_key
         if self._vertex:
@@ -1017,7 +1062,15 @@ class AntigravityExecutor(Executor):
         total_tokens = getattr(meta, "total_token_count", None)
         cached = getattr(meta, "cached_content_token_count", None)
         if prompt_tokens is not None:
-            usage["input_tokens"] = prompt_tokens
+            # Gemini's ``prompt_token_count`` is INCLUSIVE of
+            # ``cached_content_token_count``. ``compute_llm_cost`` expects
+            # ``input_tokens`` to be the NON-cached portion and prices
+            # ``cache_read_input_tokens`` additively, so pass the non-cached
+            # remainder here — otherwise the cached tokens are billed twice
+            # (once at the full input rate, once at the cache-read rate).
+            # Mirrors the qwen executor, which maps the same Gemini usage
+            # shape. Clamp so a malformed cached > prompt never goes negative.
+            usage["input_tokens"] = max(0, prompt_tokens - (cached or 0))
         if output_tokens is not None:
             usage["output_tokens"] = output_tokens
         if total_tokens is not None:

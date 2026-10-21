@@ -14,17 +14,19 @@ is the only production consumer; see designs/RUNNER_MCP.md.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import shlex
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import urlparse
 
 from anyio.streams.memory import (
     MemoryObjectReceiveStream,
@@ -110,7 +112,7 @@ def _resolve_databricks_token(profile: str) -> str:
         result = client.config.authenticate()
         # SDK returns either a dict (newer versions) or a callable
         # that produces headers (older versions).
-        headers: dict[str, str] = result if isinstance(result, dict) else result(None)  # type: ignore[assignment]
+        headers: dict[str, str] = result if isinstance(result, dict) else result(None)
         auth_header = headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             return auth_header[len("Bearer ") :]
@@ -341,14 +343,62 @@ _discovery_cache: TTLCache[str, list[McpToolDef]] = TTLCache(
 )
 
 
+def _is_sse_endpoint(url: str) -> bool:
+    """
+    Whether an HTTP MCP URL points at a legacy SSE endpoint.
+
+    True when the URL path's last segment is ``sse`` (e.g.
+    ``http://host/mcp/sse`` or a bare ``/sse``). Such servers speak
+    only the legacy SSE transport; the Streamable HTTP client hangs in
+    teardown when pointed at them, so :meth:`_open_http_transport`
+    routes these straight to the SSE client instead of trying — and
+    hanging on — Streamable HTTP first.
+
+    :param url: The configured MCP server URL.
+    :returns: ``True`` for an ``…/sse`` path, ``False`` otherwise.
+    """
+    return urlparse(url).path.rstrip("/").endswith("/sse")
+
+
+def _mapping_digest(mapping: Mapping[str, str] | None) -> str:
+    """
+    Digest a possibly-secret str→str mapping for use inside a cache key.
+
+    Order-insensitive: same entries in any insertion order digest
+    identically. An empty or ``None`` mapping digests to a stable
+    constant so keys stay comparable across processes.
+
+    :param mapping: The env / headers mapping, or ``None``.
+    :returns: A short hex digest, e.g. ``"9f86d081884c7d65"``.
+    """
+    items = sorted((mapping or {}).items())
+    payload = json.dumps(items, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def _cache_key(config: MCPServerConfig, cwd: Path | None = None) -> str:
     """
     Build a stable cache key for an MCP server config + stdio cwd.
 
-    Keys include the transport + identifying fields so that two
-    configs pointing at the same live server share the cache
-    entry and two configs pointing at different servers (same
-    name, different url / command / cwd) don't collide.
+    Invariant: the key contains every config field the SERVER can
+    observe — anything that can change what ``tools/list`` returns.
+    For stdio that is the spawned command line (``command`` /
+    ``args`` / ``cwd``) and the ``env`` overlay; for HTTP it is the
+    ``url`` and the request identity (``headers``, and
+    ``databricks_profile``, which resolves to an Authorization
+    header at connect() time). A server may register different
+    tools depending on any of these (an env-gated read-only mode, a
+    remote server that scopes tools per principal), and two configs
+    differing in one must never share a cached tools/list — the
+    second would silently inherit the first's tool surface until
+    the TTL expires. Fields the CLIENT applies after the response
+    (the ``tools:`` allowlist, ``timeout`` / ``retry``,
+    ``description``) stay out so same-server configs keep sharing
+    one entry. When adding a config field, decide which side of
+    that line it falls on.
+
+    The env / headers maps are folded in as a digest, not verbatim:
+    they routinely carry secrets, and cache keys end up in logs.
 
     :param config: The MCP server configuration.
     :param cwd: Optional stdio subprocess working directory;
@@ -358,8 +408,15 @@ def _cache_key(config: MCPServerConfig, cwd: Path | None = None) -> str:
     if config.transport == "stdio":
         args_part = shlex.join(config.args) if config.args else ""
         cwd_part = "" if cwd is None else str(cwd)
-        return f"stdio:{config.name}:{config.command}:{args_part}:{cwd_part}"
-    return f"http:{config.name}:{config.url}"
+        env_part = _mapping_digest(config.env)
+        return f"stdio:{config.name}:{config.command}:{args_part}:{cwd_part}:{env_part}"
+    headers_part = _mapping_digest(config.headers)
+    # databricks_profile resolves to an Authorization header at
+    # connect() time, so it is an identity field even though the
+    # static ``headers`` map doesn't show it. A profile name is not
+    # a secret; keyed verbatim.
+    profile_part = config.databricks_profile or ""
+    return f"http:{config.name}:{config.url}:{profile_part}:{headers_part}"
 
 
 def clear_discovery_cache() -> None:
@@ -855,10 +912,13 @@ class McpServerConnection:
         """
         Open an HTTP MCP transport — Streamable HTTP or legacy SSE.
 
-        Tries the Streamable HTTP transport first (the current MCP
-        spec default, used by Databricks MCP gateways and newer
-        servers). Falls back to legacy SSE if the Streamable HTTP
-        handshake fails, so older servers still work.
+        URLs whose path ends in ``/sse`` are routed straight to the
+        legacy SSE client (see :func:`_is_sse_endpoint`), since the
+        Streamable HTTP client hangs in teardown against SSE-only
+        servers. Otherwise tries the Streamable HTTP transport first
+        (the current MCP spec default, used by Databricks MCP gateways
+        and newer servers) and falls back to legacy SSE if the
+        Streamable HTTP handshake fails, so older servers still work.
 
         :param stack: The lifecycle task's exit stack.
         :returns: A ``(read_stream, write_stream)`` tuple of
@@ -876,6 +936,20 @@ class McpServerConnection:
             )
         timeout = self.config.timeout
         headers = self._resolve_http_headers()
+        if _is_sse_endpoint(self.config.url):
+            # Legacy-SSE servers (e.g. crawl4ai's /mcp/sse) hang the
+            # Streamable HTTP client in teardown, which would block the
+            # except-clause SSE fallback below from ever running. Route
+            # straight to SSE.
+            #
+            # Note: this routing is one-way and purely path-based, not
+            # capability-based. A server that speaks Streamable HTTP but
+            # happens to live at a /sse path is sent only to the SSE
+            # client, with no reverse fallback to Streamable HTTP. That
+            # is the intended trade-off: it matches the /sse convention
+            # and avoiding the teardown hang takes priority over covering
+            # a misnamed-endpoint case that is not known to occur.
+            return await self._open_sse_transport(stack, timeout, headers)
         try:
             return await self._open_streamable_http_transport(stack, timeout, headers)
         except Exception as exc:

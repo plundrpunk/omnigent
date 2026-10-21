@@ -1,4 +1,4 @@
-"""E2E tests for ``POST /v1/sessions/{id}/fork`` against a real LLM.
+"""E2E tests for ``POST /v1/sessions/{id}/fork`` (mock LLM).
 
 Exercises the fork flows the route/store unit tests can only mock:
 
@@ -11,7 +11,8 @@ Exercises the fork flows the route/store unit tests can only mock:
    and cannot produce codeword 2).
 3. **Fork + agent switch** (``agent_id``) — fork into a different
    built-in agent and verify the clone binds the target agent while
-   still carrying the source history.
+   still carrying the source history. (Skipped under mock LLM — needs
+   a built-in claude-sdk agent target.)
 
 All flows route through runner-bound sessions (the alpha runner-state
 contract), mirroring how the Web UI drives the fork: create → fork →
@@ -19,20 +20,25 @@ contract), mirroring how the Web UI drives the fork: create → fork →
 
 Usage::
 
-    pytest tests/e2e/test_sessions_fork_e2e.py \
-        --llm-api-key $LLM_API_KEY -v
+    pytest tests/e2e/test_sessions_fork_e2e.py -v
 """
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 import httpx
+import pytest
 
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
+    register_inline_agent,
+    reset_mock_llm,
     send_user_message_to_session,
+    set_fallback_mock_llm,
 )
 
 # The fork-switch TARGET. Only BUILT-IN agents (``session_id IS NULL``)
@@ -113,6 +119,30 @@ def _first_assistant_response_id(client: httpx.Client, session_id: str) -> str:
     raise AssertionError(f"no assistant message found in session {session_id!r}")
 
 
+def _register_mock_fork_agent(
+    client: httpx.Client,
+    mock_llm_server_url: str,
+    *,
+    prefix: str,
+) -> tuple[str, str]:
+    """Register an inline agent for mock-mode fork tests.
+
+    :returns: ``(agent_name, model)`` — the model doubles as the
+        keyed-queue key on the mock LLM server.
+    """
+    model = f"mock-fork-{prefix}-{uuid.uuid4().hex[:6]}"
+    agent_name = register_inline_agent(
+        client,
+        name=f"fork-{prefix}-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="You are a terse assistant. When asked to recall, repeat codewords exactly.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+    )
+    return agent_name, model
+
+
 def _seed_two_codeword_turns(
     client: httpx.Client,
     *,
@@ -171,10 +201,11 @@ def _fork_session(
     return fork
 
 
+@pytest.mark.compat_smoke
 def test_full_fork_replays_whole_history(
     http_client: httpx.Client,
-    coder_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     A full fork (no truncation) carries BOTH turns into the clone's
@@ -188,8 +219,21 @@ def test_full_fork_replays_whole_history(
       first turn (e.g. history-prompt building skips pre-fork items) →
       the agent can't produce the codewords (second assertion).
     """
+    reset_mock_llm(mock_llm_server_url)
+    agent_name, model = _register_mock_fork_agent(http_client, mock_llm_server_url, prefix="full")
+    # Two seed turns ("OK" each), then a post-fork recall turn.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": "OK"},
+            {"text": "OK"},
+            {"text": f"Your projects are {_CODEWORD_1} and {_CODEWORD_2}."},
+        ],
+        key=model,
+    )
+
     source_id = _seed_two_codeword_turns(
-        http_client, agent_name=coder_agent, runner_id=live_runner_id
+        http_client, agent_name=agent_name, runner_id=live_runner_id
     )
 
     fork = _fork_session(http_client, source_id, runner_id=live_runner_id)
@@ -221,10 +265,143 @@ def test_full_fork_replays_whole_history(
     )
 
 
+# Per-session run-config overrides on fork are new server-side behavior — an
+# older server ignores the new request fields and copies the source's settings
+# verbatim, so these assertions can't hold there.
+@pytest.mark.min_server_version("0.12.0")
+def test_fork_run_config_overrides_persist_on_clone(
+    http_client: httpx.Client,
+    live_runner_id: str,
+    mock_llm_server_url: str,
+) -> None:
+    """The fork dialog's model / effort / launch-arg picks land on the clone.
+
+    Drives exactly what the Web UI's clone dialog sends — ``model_override``,
+    ``reasoning_effort``, and ``terminal_launch_args`` in the fork body — and
+    reads them back off the clone's ``SessionResponse``.
+
+    **What breaks if wrong:**
+
+    - The route drops the new fields → the clone inherits the source's model
+      settings instead of the picks (first block).
+    - A cleared model/effort (``"default"``) isn't treated as a reset → the
+      clone keeps the source's override (second block).
+    - Omitting the fields no longer inherits → a plain fork silently loses the
+      source's settings (third block, guarding the old contract).
+    """
+    reset_mock_llm(mock_llm_server_url)
+    agent_name, model = _register_mock_fork_agent(http_client, mock_llm_server_url, prefix="cfg")
+    configure_mock_llm(mock_llm_server_url, [{"text": "OK"}, {"text": "OK"}], key=model)
+    source_id = _seed_two_codeword_turns(
+        http_client, agent_name=agent_name, runner_id=live_runner_id
+    )
+    # Give the source its own model settings so "inherit" is observable — a
+    # plain fork must carry these, an override must replace them.
+    patched = http_client.patch(
+        f"/v1/sessions/{source_id}",
+        json={"model_override": "source-model", "reasoning_effort": "low"},
+    )
+    patched.raise_for_status()
+
+    # Explicit picks win over the source's settings.
+    overridden = _fork_session(
+        http_client,
+        source_id,
+        runner_id=live_runner_id,
+        body={
+            "model_override": "picked-model",
+            "reasoning_effort": "high",
+            "terminal_launch_args": ["--permission-mode", "plan"],
+        },
+    )
+    assert overridden["model_override"] == "picked-model"
+    assert overridden["reasoning_effort"] == "high"
+    assert overridden["terminal_launch_args"] == ["--permission-mode", "plan"]
+
+    # A "default" clear alias resets model/effort to the agent default even
+    # though a same-agent fork would otherwise copy the source's.
+    cleared = _fork_session(
+        http_client,
+        source_id,
+        runner_id=live_runner_id,
+        body={"model_override": "default", "reasoning_effort": "default"},
+    )
+    assert cleared["model_override"] is None
+    assert cleared["reasoning_effort"] is None
+
+    # Omitting the fields keeps the pre-existing inherit behavior.
+    inherited = _fork_session(http_client, source_id, runner_id=live_runner_id)
+    assert inherited["model_override"] == "source-model"
+    assert inherited["reasoning_effort"] == "low"
+
+
+# Compaction-cursor remapping is server-side behavior introduced after v0.11.
+# A new runner paired with an old server must skip this new-server contract.
+@pytest.mark.compat_smoke
+@pytest.mark.min_server_version("0.12.0")
+def test_fork_preserves_compacted_context_boundary(
+    http_client: httpx.Client,
+    live_runner_id: str,
+    mock_llm_server_url: str,
+) -> None:
+    """Forking a compacted session remaps its cursor and remains executable."""
+    reset_mock_llm(mock_llm_server_url)
+    agent_name, model = _register_mock_fork_agent(
+        http_client, mock_llm_server_url, prefix="compacted"
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "OK"}, {"text": "OK"}, {"text": "context preserved"}],
+        key=model,
+    )
+    source_id = _seed_two_codeword_turns(
+        http_client, agent_name=agent_name, runner_id=live_runner_id
+    )
+    source = http_client.get(f"/v1/sessions/{source_id}").json()
+    boundary = next(
+        item
+        for item in source["items"]
+        if item.get("type") == "message" and (item.get("data") or {}).get("role") == "assistant"
+    )
+    compact = http_client.post(
+        f"/v1/sessions/{source_id}/events",
+        json={
+            "type": "compaction",
+            "data": {
+                "summary": f"The user mentioned {_CODEWORD_1}.",
+                "last_item_id": boundary["id"],
+                "token_count": 12,
+            },
+        },
+    )
+    assert compact.status_code == 202, compact.text
+
+    fork = _fork_session(http_client, source_id, runner_id=live_runner_id)
+    fork_items = fork["items"]
+    fork_compaction = next(item for item in fork_items if item.get("type") == "compaction")
+    fork_ids = {item["id"] for item in fork_items}
+    fork_boundary_id = fork_compaction["data"]["last_item_id"]
+    assert fork_boundary_id in fork_ids
+    assert fork_boundary_id != boundary["id"]
+
+    response_id = send_user_message_to_session(
+        http_client,
+        session_id=fork["id"],
+        content="Confirm that the compacted fork can continue.",
+    )
+    body = poll_session_until_terminal(http_client, session_id=fork["id"], response_id=response_id)
+    assert body["status"] == "completed", body.get("error")
+
+
+# Truncating a fork at a mid-conversation cutoff (dropping the post-cutoff turn)
+# is server-side behavior that shipped after v0.2.0 — a v0.2.0 server keeps the
+# post-cutoff turn, so main's test (unchanged) fails against it (server-behavior
+# co-evolution, not a regression). Skip against servers < 0.3.0.
+@pytest.mark.min_server_version("0.3.0")
 def test_fork_from_middle_truncates_context(
     http_client: httpx.Client,
-    coder_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """
     Forking at the FIRST assistant response drops the second turn.
@@ -244,8 +421,22 @@ def test_fork_from_middle_truncates_context(
       produce codeword 2 (it is NOT in the truncated context, so a
       correct fork cannot emit that exact token pair).
     """
+    reset_mock_llm(mock_llm_server_url)
+    agent_name, model = _register_mock_fork_agent(http_client, mock_llm_server_url, prefix="mid")
+    # Two seed turns ("OK" each), then a post-fork recall turn
+    # that only mentions codeword 1 (codeword 2 was truncated).
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": "OK"},
+            {"text": "OK"},
+            {"text": f"Your project is {_CODEWORD_1}."},
+        ],
+        key=model,
+    )
+
     source_id = _seed_two_codeword_turns(
-        http_client, agent_name=coder_agent, runner_id=live_runner_id
+        http_client, agent_name=agent_name, runner_id=live_runner_id
     )
     first_response_id = _first_assistant_response_id(http_client, source_id)
 
@@ -307,18 +498,33 @@ def _builtin_agent_id(client: httpx.Client, name: str) -> str:
     raise AssertionError(f"built-in agent {name!r} not registered on the server")
 
 
+# Carrying forked history across an agent switch (the recall turn is served
+# directly, with no separate replay request) is server-side behavior that
+# shipped after v0.2.0 — a v0.2.0 server doesn't carry it, so main's test fails
+# against it (co-evolution, not a regression). Skip against servers < 0.3.0.
+@pytest.mark.min_server_version("0.3.0")
 def test_fork_with_agent_switch_carries_history(
     http_client: httpx.Client,
     claude_coder_agent: str,
     live_runner_id: str,
+    using_mock_llm: bool,
+    mock_llm_server_url: str,
 ) -> None:
     """
     Forking with ``agent_id`` binds the TARGET agent and keeps history.
 
-    Forks a claude-coder-seeded session into the seeded
+    Forks a source-agent-seeded session into the seeded
     ``sdk-chat-builtin`` built-in (same provider family — the
     history-preserving switch the Web UI's picker offers). SDK targets
     replay the copied transcript as context.
+
+    In mock mode the source agent is an inline ``openai-agents`` agent
+    pointed at the mock LLM server, and the ``sdk-chat-builtin`` built-in
+    is wired to the mock server via ``executor.auth.base_url`` (seeded in
+    ``conftest._materialize_builtin_sdk_chat_spec``). The source agent's
+    queue is keyed by its unique model; the recall queue is claimed by a
+    token unique to the recall turn (content-routing ``match``) so a
+    stray request under the shared target model cannot drain it.
 
     **What breaks if wrong:**
 
@@ -327,8 +533,53 @@ def test_fork_with_agent_switch_carries_history(
     - The switch path drops the copied items → the codeword is missing
       from the fork's items / the agent can't recall it.
     """
+    if using_mock_llm:
+        uid = uuid.uuid4().hex[:6]
+        source_model = f"mock-fork-switch-src-{uid}"
+        source_agent = register_inline_agent(
+            http_client,
+            name=f"fork-switch-src-{uid}",
+            harness="openai-agents",
+            model=source_model,
+            profile="",
+            prompt="You are a terse assistant.",
+            mock_llm_base_url=f"{mock_llm_server_url}/v1",
+        )
+        # The sdk-chat-builtin built-in uses the SHARED model name
+        # "claude-sonnet-4-20250514", and the recall turn makes MORE than
+        # one call to it: newer claude-code follows the recall with a
+        # skills/system-reminder call. Two fragilities follow, both fixed
+        # here:
+        #   1. Keying the recall queue on the shared model name lets a
+        #      stray request under the same model drain it. Instead claim
+        #      the queue by a token unique to the recall turn (the #523
+        #      content-routing "match"), carried only in the recall
+        #      message, so only this turn's calls can draw it.
+        #   2. A single queued entry is consumed by the first recall call;
+        #      the follow-up call then falls through to the mock's default
+        #      "Mock LLM response", which becomes the final assistant text
+        #      and fails the assertion. A fallback on the same key answers
+        #      every recall-turn call with the codeword, robust to count.
+        recall_token = f"recall-{uid}"
+        recall_key = f"fork-tgt-{uid}"
+        reset_mock_llm(mock_llm_server_url)
+        configure_mock_llm(
+            mock_llm_server_url,
+            [{"text": "OK"}],
+            key=source_model,
+        )
+        configure_mock_llm(
+            mock_llm_server_url,
+            [{"text": _CODEWORD_1}],
+            key=recall_key,
+            match=recall_token,
+        )
+        set_fallback_mock_llm(mock_llm_server_url, key=recall_key, text=_CODEWORD_1)
+    else:
+        source_agent = claude_coder_agent
+
     source_id = create_runner_bound_session(
-        http_client, agent_name=claude_coder_agent, runner_id=live_runner_id
+        http_client, agent_name=source_agent, runner_id=live_runner_id
     )
     response_id = send_user_message_to_session(
         http_client,
@@ -355,10 +606,15 @@ def test_fork_with_agent_switch_carries_history(
     # History carried across the switch — items and live context.
     fork_text = _session_item_texts(http_client, fork["id"])
     assert _CODEWORD_1 in fork_text, f"switched fork lost the source history: {fork_text!r}"
+    recall_prompt = "What is the nickname of my project? Reply with just the nickname."
+    if using_mock_llm:
+        # Carry the recall-only token so this request claims its own mock
+        # queue regardless of the shared target model name.
+        recall_prompt = f"{recall_prompt} ({recall_token})"
     recall_id = send_user_message_to_session(
         http_client,
         session_id=fork["id"],
-        content="What is the nickname of my project? Reply with just the nickname.",
+        content=recall_prompt,
     )
     recall = poll_session_until_terminal(http_client, session_id=fork["id"], response_id=recall_id)
     assert recall["status"] == "completed", f"switched fork turn failed: {recall.get('error')}"

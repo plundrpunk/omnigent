@@ -43,7 +43,9 @@ def test_launch_resolves_configuration_without_losing_arguments(env, command):
     which.assert_called_once_with(command)
 
 
-def test_launch_missing_binary_explains_override():
+def test_launch_missing_binary_explains_override(monkeypatch):
+    # Isolate from a Pi CLI installed in a well-known location on this machine.
+    monkeypatch.setattr(pi, "resolve_cli_binary", lambda command, which: None)
     with pytest.raises(click.ClickException, match="OMNIGENT_PI_PATH"):
         pi.resolve_pi_executable(env={}, which=lambda command: None)
 
@@ -265,7 +267,11 @@ async def test_prepare_creates_or_resumes_then_binds_and_ensures_terminal(daemon
             client, b"bundle", terminal_launch_args=["--model", "test"]
         )
     boundaries["launch_or_reuse_daemon_runner"].assert_awaited_once_with(
-        client, host_id="host-1", session_id=expected_id, workspace="/repo"
+        client,
+        host_id="host-1",
+        session_id=expected_id,
+        workspace="/repo",
+        fresh=session_id is None,
     )
     boundaries["_bind_session_runner"].assert_awaited_once_with(client, expected_id, "runner-1")
     boundaries["_ensure_pi_terminal_on_runner"].assert_awaited_once_with(client, expected_id)

@@ -108,12 +108,16 @@ class History:
     def append(self, msg: Message) -> None:
         self.messages.append(msg)
 
-    def get_context_window(self, max_tokens: int | None = None) -> list[Message]:  # noqa: ARG002 — placeholder API; token-based trimming not yet implemented
-        """
-        Return messages that fit in the context window.
+    def get_context_window(self, max_tokens: int | None = None) -> list[Message]:  # noqa: ARG002
+        """Return the full message list.
 
-        For now, return all messages.  A real implementation would count tokens
-        and summarise older messages.
+        The *max_tokens* parameter is accepted for interface
+        compatibility but is intentionally ignored here.  Token-aware
+        context trimming (including tool-call pair integrity,
+        surgical clearing, and LLM summarization) is handled by the
+        layered compaction system in
+        :mod:`omnigent.runtime.compaction`, which operates on the
+        executor-facing message format with tiktoken-based counting.
         """
         return list(self.messages)
 
@@ -345,11 +349,16 @@ class ExecutorSpec:
     :param profile: Credentials profile name (typically a
         ``~/.databrickscfg`` profile), e.g. ``"<your-profile>"``.
         ``None`` when no profile override is needed.
+    :param auth: Parsed auth block from the YAML (e.g. api_key +
+        base_url). Carried through so the omnigent spec translator
+        can forward it into the child :class:`ExecutorSpec` without
+        re-reading raw YAML.
     """
 
     model: str | None = None
     harness: str | None = None
     profile: str | None = None
+    auth: object | None = None  # ApiKeyAuth | DatabricksAuth | None
 
 
 # ---------------------------------------------------------------------------
@@ -442,15 +451,59 @@ class CredentialProxyEntry:
 
 
 @dataclass
+class DatabricksProfileBinding:
+    """One Databricks ``~/.databrickscfg`` profile to proxy.
+
+    The host and OAuth/PAT token behind a profile are resolved in the
+    parent at runtime (via the ``databricks`` SDK) — never at parse time
+    and never inside the sandbox. The sandbox only ever sees a synthetic
+    ``oa_cred_*`` placeholder written into a materialized ``.databrickscfg``.
+
+    :param profile: The profile (section) name in ``~/.databrickscfg``,
+        e.g. ``"dbc-adb7b1a3-9097"``. Selected in the sandbox with
+        ``databricks --profile <name>`` (or as the default profile).
+    """
+
+    profile: str
+
+
+@dataclass
+class DatabricksProxySpec:
+    """Secretless proxy policy for the Databricks CLI.
+
+    Unlike the four host-keyed credential types, Databricks profiles bind
+    to a workspace host that is only known once the parent resolves the
+    profile at runtime, so they are carried here rather than in
+    :attr:`CredentialProxySpec.entries`.
+
+    :param profiles: The profiles to proxy. Only these profiles are
+        materialized into the sandbox ``.databrickscfg`` and swapped by
+        the egress proxy; every other profile is invisible to the sandbox.
+    :param default: Optional profile used when the CLI is invoked without
+        ``--profile`` (exported as ``DATABRICKS_CONFIG_PROFILE``). Must be
+        one of :attr:`profiles`.
+    :param config_env: Environment variable pointed at the materialized
+        config file (the Databricks CLI honors ``DATABRICKS_CONFIG_FILE``).
+    """
+
+    profiles: list[DatabricksProfileBinding]
+    default: str | None = None
+    config_env: str = "DATABRICKS_CONFIG_FILE"
+
+
+@dataclass
 class CredentialProxySpec:
     """Secretless credential-proxy policy for a sandbox.
 
     :param entries: Normalized per-host credential bindings. The real
         secrets stay in the parent; the sandbox only ever sees synthetic
         placeholders that the egress proxy rewrites.
+    :param databricks: Optional Databricks-CLI proxy policy (a list of
+        profiles). Resolved to per-workspace-host bindings at runtime.
     """
 
     entries: list[CredentialProxyEntry]
+    databricks: DatabricksProxySpec | None = None
 
 
 @dataclass
@@ -458,11 +511,12 @@ class OSEnvSandboxSpec:
     """Sandbox configuration for an OS environment."""
 
     # Backend identifier, e.g. ``"linux_bwrap"``,
-    # ``"darwin_seatbelt"``, or ``"none"``. The dataclass default of
-    # ``"linux_bwrap"`` is a safe sentinel for in-process construction
-    # (``OSEnvSandboxSpec(type=self.type_name)`` is the idiomatic call
-    # site); YAML parsers map a missing ``type:`` field to the platform
-    # default at parse time via
+    # ``"darwin_seatbelt"``, or ``"none"``. YAML also accepts ``"auto"``
+    # and resolves it to the platform default before constructing this value.
+    # The dataclass default of ``"linux_bwrap"`` is a safe sentinel for
+    # in-process construction (``OSEnvSandboxSpec(type=self.type_name)`` is
+    # the idiomatic call site); YAML parsers map a missing ``type:`` field to
+    # the platform default at parse time via
     # :func:`omnigent.inner.sandbox._default_sandbox_for_platform`,
     # which picks ``linux_bwrap`` on Linux (with ``bwrap`` on PATH)
     # and ``darwin_seatbelt`` on macOS.
@@ -583,6 +637,36 @@ class OSEnvSandboxSpec:
     # (untrusted source trees, supervisor-spawned forks) where an
     # unmasked dotfile past the cap would be an unacceptable leak.
     cwd_hidden_scan_overflow: str = "warn"
+    # Whether the dotfile / escaping-symlink masker recurses into
+    # subdirectories. ``False`` (default) scans only the immediate
+    # children of cwd and each ``read_paths`` / ``write_paths`` root —
+    # the top-level dotfiles (``.git``, ``.env``, ``.aws``, ``.ssh``,
+    # ...) that carry the overwhelming majority of secrets are still
+    # masked, but the walker no longer pays to descend the whole tree.
+    # This is the scalable default: a recursive walk of a medium/large
+    # project (or ``read_paths: ["~/"]``) visits enormous numbers of
+    # entries and routinely trips :attr:`cwd_hidden_scan_max_entries`.
+    #
+    # L6 (security trade-off): with the top-level-only default, a
+    # dotfile nested below the first level (e.g.
+    # ``cwd/services/api/.env`` or ``~/projects/foo/.netrc``) is NOT
+    # masked and stays readable by the sandboxed helper. Set this to
+    # ``True`` for untrusted source trees where a deeply-nested
+    # credential file would be an unacceptable leak; the cap /
+    # overflow knobs then bound the cost of the full walk.
+    cwd_hidden_scan_recursive: bool = False
+    # Explicit files/directories to hide from the sandboxed helper,
+    # regardless of whether their basename starts with ``.``. Each
+    # entry is a path string resolved like ``read_paths`` (``~`` is
+    # expanded; relative paths are taken against cwd; ``$VAR`` is NOT
+    # expanded). Directories are masked as an empty view, files as an
+    # empty file — the same masking the dotfile walker emits. Use this
+    # to hide a specific secret the name-based masker wouldn't catch
+    # (e.g. ``config/production.key``) or a deeply-nested dotfile
+    # without turning on full recursion. Applied on top of the
+    # dotfile mask in every mode. ``None`` and ``[]`` both mean "no
+    # explicit masks".
+    mask_paths: list[str] | None = None
     # Environment-variable allowlist for the helper subprocess, beyond
     # the always-passed minimal default (PATH/HOME/USER/LANG/LC_*/etc.;
     # see :data:`omnigent.inner.os_env._DEFAULT_ENV_PASSTHROUGH`).
@@ -694,6 +778,11 @@ class TerminalEnvSpec:
         MCP servers that construct Databricks SDK clients and let
         the SDK's auth resolver pick up the parent's profile
         instead of the explicit token they were given).
+    :param inherit_env: Whether the terminal process starts from the
+        parent process environment before applying ``env`` / ``env_unset``.
+        Defaults to ``True`` for backward compatibility. Set to ``False``
+        for native CLI integrations that must receive an explicit allowlisted
+        environment instead of ambient host secrets.
     :param os_env: OS environment backing this terminal, ``"inherit"``,
         or ``None`` to use the default caller process environment.
     :param allow_cwd_override: Whether launch callers may override cwd.
@@ -708,12 +797,19 @@ class TerminalEnvSpec:
     :param tmux_start_on_attach: Delay the terminal command until the
         first tmux client attaches. Used for TUIs that must query the
         real attached terminal during startup.
+    :param keep_alive_after_exit: Keep the private tmux server alive after
+        the pane's inner process exits (``remain-on-exit`` / ``exit-empty
+        off``), so a single CLI exit no longer reaps the server and cascades
+        into ``no server running``. Opt-in because it changes the
+        ``has-session``-means-alive contract; enabled for the claude-native
+        agent terminal (#540), whose liveness is decided by ``#{pane_dead}``.
     """
 
     command: str | None = None
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     env_unset: list[str] = field(default_factory=list)
+    inherit_env: bool = True
     os_env: OSEnvSpec | str | None = None
     allow_cwd_override: bool = False
     allow_sandbox_override: bool = False
@@ -722,6 +818,7 @@ class TerminalEnvSpec:
     session_prefix: str = "omni_"
     tmux_allow_passthrough: bool = False
     tmux_start_on_attach: bool = False
+    keep_alive_after_exit: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -768,11 +865,20 @@ class AgentDef:
     # sub-agent types. Session reads are always on. YAML key:
     # ``spawn:``.
     spawn: bool = False
+    # Authority for the agent to share the session it runs in, via
+    # sys_session_share — the SOLE enabler of that tool (independent of
+    # spawn / declared agents, and unrelated to server-API / CLI
+    # sharing). Raw YAML string from ``agent_session_sharing:`` — "none"
+    # (default, tool off), "non-public" (grant named users), or "public"
+    # (also allow __public__ anonymous read). Kept as a str here (inner
+    # datamodel has no spec.types dep); mapped to SharePolicy when
+    # translated to an AgentSpec.
+    agent_session_sharing: str = "none"
     os_env: OSEnvSpec | None = None
     terminals: dict[str, TerminalEnvSpec] = field(default_factory=dict)
     skills: SkillRegistry = field(default_factory=dict)
     # Materialized agent-bundle root on disk, when known. Used by
-    # the Claude SDK harness to expose ``<bundle>/skills/<name>/
+    # the Claude SDK harness to expose ``<bundle>/skills/<dir>/
     # SKILL.md`` files as plugin skills via the SDK's
     # ``--plugin-dir`` mechanism. Set by the AgentSpec → AgentDef
     # bridge from the spec's parsed ``skill_dir`` paths; left
@@ -810,61 +916,17 @@ class AgentDef:
 
 @dataclass
 class LabelSchemaRule:
-    """Schema and propagation constraints for a session label.
+    """Schema constraints for a session label.
 
-    ``monotonic`` controls both the write direction and child-to-parent
-    propagation:
-    - ``"max"``: value can only increase; child propagation takes the max.
-    - ``"min"``: value can only decrease; child propagation takes the min.
-    - ``"none"``: value can change freely; no child propagation.
+    Declares the set of allowed values for a label key.
+    Writes outside this set are silently dropped.
     """
 
     values: list[str] = field(default_factory=list)
-    monotonic: str = "none"  # "max", "min", or "none"
 
     def normalize(self, value: LabelValue) -> str | None:
         candidate = str(value)
         return candidate if candidate in self.values else None
 
-    def allows(self, current: str | None, new_value: str) -> bool:
-        if new_value not in self.values:
-            return False
-        if current is None:
-            return True
-        if current not in self.values:
-            return False
-
-        current_idx = self.values.index(current)
-        new_idx = self.values.index(new_value)
-        if self.monotonic == "max":
-            return new_idx >= current_idx
-        if self.monotonic == "min":
-            return new_idx <= current_idx
-        return True
-
-    def merged_with_child(self, parent_val: str | None, child_val: str | None) -> str | None:
-        """Merge parent and child values according to the monotonic rule."""
-        if self.monotonic == "none":
-            return None
-        if parent_val is None and child_val is None:
-            return None
-        if parent_val is None:
-            if child_val is None:
-                return None
-            if child_val not in self.values:
-                raise ValueError(f"Unknown child label value during propagation: {child_val!r}")
-            return child_val
-        if parent_val not in self.values:
-            raise ValueError(f"Unknown parent label value during propagation: {parent_val!r}")
-        if child_val is None:
-            return parent_val
-        if child_val not in self.values:
-            raise ValueError(f"Unknown child label value during propagation: {child_val!r}")
-
-        parent_idx = self.values.index(parent_val)
-        child_idx = self.values.index(child_val)
-        if self.monotonic == "max":
-            return self.values[max(parent_idx, child_idx)]
-        if self.monotonic == "min":
-            return self.values[min(parent_idx, child_idx)]
-        raise ValueError(f"Unknown monotonic mode: {self.monotonic!r}")
+    def allows(self, new_value: str) -> bool:
+        return new_value in self.values

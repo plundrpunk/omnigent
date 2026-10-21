@@ -2,18 +2,49 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import urllib.parse
 import webbrowser
 from collections.abc import Callable
 
-# Databricks workspace-hosted omnigent: the API proxy and the web UI are
-# mounted on different workspace paths. ``conversation_url`` maps the
-# server (API) base onto the UI mount so browser links land on the SPA
-# instead of the JSON API.
-WORKSPACE_API_PATH = "/api/2.0/omnigent"
-WORKSPACE_UI_PATH = "/omnigent"
+# The server-URL shape (API mount, UI mount, display mapping) lives in
+# ``omnigent.server_url`` — the one representation of a server URL. The
+# helpers below only borrow it to build browser links.
+from omnigent.server_url import WORKSPACE_UI_PATH, ServerUrl
+
+# Client-side SPA route for one conversation (see web/src/App.tsx's
+# ``c/:conversationId``). ``conversation_url`` appends it; ``strip_conversation_path``
+# is the inverse, for a URL copied out of the browser's address bar.
+_CONVERSATION_PATH_RE = re.compile(r"/c/[^/]+/?$")
+
+
+def strip_conversation_path(url: str) -> str:
+    """
+    Drop a trailing ``/c/<conversation_id>`` from a server URL.
+
+    The web UI's address bar shows ``<base>/c/<id>`` for an open
+    conversation, so that is what a user copies when asked for "the
+    omnigent URL". It is a client-side route, not a server mount: the SPA
+    catch-all answers ``GET <base>/c/<id>/v1/me`` with a ``200`` HTML shell,
+    so such a URL passes an auth probe and is accepted as a server, then
+    every real API call 404s because no router owns that prefix. Trimming
+    the route recovers the base the API actually lives on.
+
+    :param url: A server URL, possibly a copied conversation link, e.g.
+        ``"https://app.databricksapps.com/c/9bed9ec6"``.
+    :returns: The URL without the conversation route, e.g.
+        ``"https://app.databricksapps.com"``.
+    """
+    stripped = url.rstrip("/")
+    parsed = urllib.parse.urlsplit(stripped)
+    trimmed = _CONVERSATION_PATH_RE.sub("", parsed.path)
+    if trimmed == parsed.path:
+        return stripped
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, trimmed, parsed.query, parsed.fragment)
+    )
 
 
 def conversation_url(base_url: str, conversation_id: str) -> str:
@@ -32,17 +63,15 @@ def conversation_url(base_url: str, conversation_id: str) -> str:
     :returns: Browser URL, e.g. ``"http://127.0.0.1:6767/c/conv_abc123"``.
     """
     encoded_id = urllib.parse.quote(conversation_id, safe="")
-    parsed = urllib.parse.urlsplit(base_url.rstrip("/"))
-    if parsed.path == WORKSPACE_API_PATH:
-        from omnigent.cli_auth import load_databricks_org_id
-
-        org_id = load_databricks_org_id(base_url)
+    server = ServerUrl.from_api_base(base_url)
+    if server.is_workspace_hosted:
+        parsed = urllib.parse.urlsplit(server.api_base)
         return urllib.parse.urlunsplit(
             (
                 parsed.scheme,
                 parsed.netloc,
                 f"{WORKSPACE_UI_PATH}/c/{encoded_id}",
-                urllib.parse.urlencode({"o": org_id}) if org_id else "",
+                urllib.parse.urlencode({"o": server.org_id}) if server.org_id else "",
                 "",
             )
         )
@@ -73,6 +102,43 @@ def open_conversation_url(url: str) -> bool:
         )
         return completed.returncode == 0
     return webbrowser.open(url)
+
+
+# Stable prefix for the "session created" announcement line. Emitted on a
+# line of its own so a wrapper (dev/resolve.py, dev/repro.py, or the CI
+# workflows that tee the run log) can grep the conversation URL the moment
+# the session exists — before the turn finishes — without polling the
+# sessions API. Keep this literal in sync with any log-scraping consumer.
+SESSION_URL_ANNOUNCE_PREFIX = "Omnigent session: "
+
+
+def announce_conversation_url(
+    *,
+    base_url: str,
+    conversation_id: str,
+    echo: Callable[[str], None] | None = None,
+) -> str:
+    """
+    Print the conversation URL on its own line as soon as the session exists.
+
+    Independent of the browser-open preference: this always emits a stable,
+    greppable ``"Omnigent session: <url>"`` line so headless callers (CI
+    wrappers) can surface the session link immediately, even when no browser
+    is opened. Returns the URL so callers can also use it programmatically.
+
+    :param base_url: Omnigent server base URL, e.g. ``"http://127.0.0.1:6767"``.
+    :param conversation_id: Conversation id, e.g. ``"conv_abc123"``.
+    :param echo: Output sink for the announcement line. Defaults to stderr
+        via ``print`` so it never intermixes with a one-shot's stdout answer.
+    :returns: The conversation URL that was announced.
+    """
+    url = conversation_url(base_url, conversation_id)
+    line = f"{SESSION_URL_ANNOUNCE_PREFIX}{url}"
+    if echo is not None:
+        echo(line)
+    else:
+        print(line, file=sys.stderr, flush=True)
+    return url
 
 
 def open_conversation_link_if_enabled(

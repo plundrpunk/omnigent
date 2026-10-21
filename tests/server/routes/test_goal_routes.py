@@ -802,9 +802,9 @@ async def test_invalid_json_never_creates_run(goal_api, body: bytes) -> None:
         ({"limits": {"max_tokens": True}}, "positive integer"),
         ({"limits": {"max_tokens": 0}}, "positive integer"),
         ({"limits": {"max_tokens": 4_000_001}}, "ceiling"),
-        ({"base_url": "file:///tmp"}, "http(s)"),
-        ({"api_key_env": "secret-value"}, "NAME"),
-        ({"api_key_env": "GOAL_TEST_MISSING_KEY"}, "not set"),
+        ({"base_url": "file:///tmp"}, "not allowlisted"),
+        ({"api_key_env": "secret-value"}, "not allowlisted"),
+        ({"api_key_env": "GOAL_TEST_MISSING_KEY"}, "not set in the environment"),
         ({"role_models": []}, "JSON object"),
         ({"role_models": {"orchestrator": "model"}}, "unknown role"),
         ({"role_models": {"planner": "bad backend"}}, "provider:model"),
@@ -814,6 +814,7 @@ async def test_invalid_json_never_creates_run(goal_api, body: bytes) -> None:
 async def test_invalid_options_refuse_run(goal_api, monkeypatch, fields, detail) -> None:
     client, registry = goal_api
     monkeypatch.delenv("GOAL_TEST_MISSING_KEY", raising=False)
+    monkeypatch.setenv("OMNIGENT_GOAL_API_KEY_ENVS", "GOAL_TEST_MISSING_KEY")
     response = await client.post("/v1/goal", json={"contract": _contract(), **fields})
     assert response.status_code == 422
     assert detail in response.json()["detail"]
@@ -885,6 +886,8 @@ async def test_valid_options_are_recorded_and_forwarded(goal_api, goal_env, monk
     client, registry = goal_api
     monkeypatch.setenv("HA_GOAL_EXEC_ROOTS", str(goal_env))
     monkeypatch.setenv("GOAL_TEST_API_KEY", "test-secret")
+    monkeypatch.setenv("OMNIGENT_GOAL_API_KEY_ENVS", "GOAL_TEST_API_KEY")
+    monkeypatch.setenv("OMNIGENT_GOAL_BASE_URLS", "https://provider.invalid/v1")
     contract_paths = []
     captured = []
 
@@ -918,7 +921,7 @@ async def test_valid_options_are_recorded_and_forwarded(goal_api, goal_env, monk
         "workspace": str(goal_env.resolve()),
         "allow_write": True,
         "command": "shim",
-        "sandbox": "subprocess",
+        "sandbox": "docker",
     }
     run = await _wait_terminal(client, initial["run_id"])
     assert run["status"] == "completed"
@@ -934,7 +937,7 @@ async def test_valid_options_are_recorded_and_forwarded(goal_api, goal_env, monk
         "--base-url": "https://provider.invalid/v1",
         "--api-key-env": "GOAL_TEST_API_KEY",
         "--role-model": "planner=shim:model:high",
-        "--exec-sandbox": "subprocess",
+        "--exec-sandbox": "docker",
         "--exec-workspace": str(goal_env.resolve()),
         "--command": "shim",
     }.items():
@@ -977,14 +980,14 @@ async def test_invalid_outcome_artifact_preserves_stdout(
 
     workdir = goal_env / "absolute-workdir"
     monkeypatch.setenv("HA_GOAL_WORKDIR", str(workdir))
-    art = workdir / "goal" / "t-goal"
+    art = workdir / "runs" / "r1" / "goal" / "t-goal"
     art.mkdir(parents=True)
     (art / "goal-outcome.json").write_text(artifact)
     proc = AsyncMock()
     proc.returncode = None
     proc.communicate.return_value = (b'{"source":"stdout"}', b"x" * 9000)
     monkeypatch.setattr(goal.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc))
-    run = {"contract": _contract()}
+    run = {"run_id": "r1", "contract": _contract()}
     await goal._execute_goal_run(run)
     assert run["outcome"] == {"source": "stdout"}
     assert run["exit_code"] == -1
@@ -1074,8 +1077,8 @@ def test_artifact_fallback_selects_most_recent_file(tmp_path, monkeypatch) -> No
     from omnigent.server.routes.goal import _artifact_for
 
     monkeypatch.setenv("HA_GOAL_WORKDIR", str(tmp_path))
-    artifacts = tmp_path / "artifacts"
-    artifacts.mkdir()
+    artifacts = tmp_path / "runs" / "r1" / "artifacts"
+    artifacts.mkdir(parents=True)
     old = artifacts / "old.json"
     new = artifacts / "new.json"
     old.write_text("{}")
@@ -1083,8 +1086,9 @@ def test_artifact_fallback_selects_most_recent_file(tmp_path, monkeypatch) -> No
     (artifacts / "directory.json").mkdir()
     os.utime(old, (100, 100))
     os.utime(new, (200, 200))
-    assert _artifact_for({"outcome": {"artifact_path": str(tmp_path / "missing")}}) == new
-    assert _artifact_for({"outcome": {"artifact_path": str(old)}}) == old
+    missing = {"run_id": "r1", "outcome": {"artifact_path": str(tmp_path / "missing")}}
+    assert _artifact_for(missing) == new
+    assert _artifact_for({"run_id": "r1", "outcome": {"artifact_path": str(old)}}) == old
 
 
 @pytest.mark.parametrize(
@@ -1178,10 +1182,6 @@ def test_executor_event_bounds_detail_and_ignores_invalid_calls() -> None:
     assert event["summary"] == "z" * 399 + "\u2026"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Goal artifact fallback ignores started_at and can attach a previous run's events",
-)
 def test_artifact_fallback_does_not_attach_preexisting_run(tmp_path, monkeypatch) -> None:
     import os
 
@@ -1193,21 +1193,105 @@ def test_artifact_fallback_does_not_attach_preexisting_run(tmp_path, monkeypatch
     stale = artifact_dir / "previous-run.json"
     stale.write_text('{"events":[{"content":"previous run"}]}')
     os.utime(stale, (100, 100))
-    assert _artifact_for({"started_at": "2026-10-21T12:00:00+00:00"}) is None
+    assert _artifact_for({"run_id": "new", "started_at": "2026-10-21T12:00:00+00:00"}) is None
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Goal event fallback resolves relative workdir against server cwd, not HA_GOAL_CWD",
-)
 def test_running_events_resolve_workdir_against_harness_cwd(goal_env, monkeypatch) -> None:
     from omnigent.server.routes.goal import _artifact_for
 
     server_cwd = goal_env / "server"
     server_cwd.mkdir()
     monkeypatch.chdir(server_cwd)
-    artifact_dir = goal_env / "runs-goal" / "artifacts"
+    artifact_dir = goal_env / "runs-goal" / "runs" / "r1" / "artifacts"
     artifact_dir.mkdir(parents=True)
     artifact = artifact_dir / "current.json"
     artifact.write_text('{"events":[]}')
-    assert _artifact_for({"started_at": "2026-10-21T12:00:00+00:00"}) == artifact
+    assert _artifact_for({"run_id": "r1", "started_at": "2026-10-21T12:00:00+00:00"}) == artifact
+
+
+class _HeaderAuth:
+    """Minimal auth stub for multi-user goal-route tests."""
+
+    def get_user_id(self, request: Any) -> str | None:
+        return request.headers.get("x-test-user")
+
+
+class _AdminOnlyPermissionStore:
+    def __init__(self, admins: set[str] | None = None) -> None:
+        self._admins = admins or set()
+
+    def is_admin(self, user_id: str) -> bool:
+        return user_id in self._admins
+
+
+def _goal_client_for_exec_auth(
+    permission_store: _AdminOnlyPermissionStore | None,
+) -> httpx.AsyncClient:
+    from fastapi import FastAPI
+
+    from omnigent.server.routes.goal import create_goal_router
+
+    app = FastAPI()
+    app.include_router(
+        create_goal_router(
+            auth_provider=_HeaderAuth(),  # type: ignore[arg-type]
+            # No conversation_id is sent, so the session store is never read.
+            conversation_store=object() if permission_store is not None else None,  # type: ignore[arg-type]
+            permission_store=permission_store,  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
+
+
+def _exec_body(goal_env: Path, goal_id: str = "t-goal") -> dict[str, Any]:
+    return {
+        "contract": _contract(goal_id),
+        "exec": {"command": "automaton", "workspace": str(goal_env)},
+    }
+
+
+async def test_exec_requests_are_rejected_without_a_permission_store(
+    goal_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HA_GOAL_EXEC_ROOTS", str(goal_env))
+    async with _goal_client_for_exec_auth(None) as client:
+        resp = await client.post(
+            "/v1/goal", headers={"x-test-user": "alice@example.com"}, json=_exec_body(goal_env)
+        )
+    assert resp.status_code == 403
+    assert "admin check" in resp.json()["detail"]
+
+
+async def test_exec_requests_are_rejected_for_non_admin_users(
+    goal_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HA_GOAL_EXEC_ROOTS", str(goal_env))
+    async with _goal_client_for_exec_auth(_AdminOnlyPermissionStore()) as client:
+        resp = await client.post(
+            "/v1/goal", headers={"x-test-user": "alice@example.com"}, json=_exec_body(goal_env)
+        )
+    assert resp.status_code == 403
+    assert "admin users" in resp.json()["detail"]
+
+
+async def test_exec_requests_are_allowed_for_admin_users(
+    goal_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HA_GOAL_EXEC_ROOTS", str(goal_env))
+    headers = {"x-test-user": "alice@example.com"}
+    store = _AdminOnlyPermissionStore({"alice@example.com"})
+    async with _goal_client_for_exec_auth(store) as client:
+        resp = await client.post(
+            "/v1/goal", headers=headers, json=_exec_body(goal_env, "t-exec-admin")
+        )
+        assert resp.status_code == 202
+        run_id = resp.json()["run_id"]
+        for _ in range(100):
+            run = (await client.get(f"/v1/goal/{run_id}", headers=headers)).json()
+            if run["status"] != "running":
+                break
+            await asyncio.sleep(0.05)
+    assert run["status"] == "completed"
+    assert run["exec"]["workspace"] == str(goal_env.resolve())
+    assert run["exec"]["sandbox"] == "docker"

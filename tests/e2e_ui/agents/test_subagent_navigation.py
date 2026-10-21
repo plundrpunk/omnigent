@@ -34,7 +34,7 @@ from playwright.sync_api import Page, expect
 from tests.e2e_ui.agents.conftest import JokeSubagentsSession
 from tests.e2e_ui.conftest import open_right_rail
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _SUBAGENT_ROW = '[data-testid="subagent-row"]'
 _SUBAGENT_STATUS_DOT = '[data-testid="subagent-status-dot"]'
@@ -53,11 +53,9 @@ def _send(page: Page, text: str) -> None:
     page.get_by_role("button", name="Send", exact=True).click()
 
 
-# Nightly: several serial real-LLM turns (dispatch + two sub-agents +
-# auto-wake continuation), too heavy and 429-sensitive for the PR gate.
-# The 600s budget overrides the suite-wide 300s default for the same
-# reason test_two_agent_chat.py uses it: FMAPI backoff stacks
-# multiplicatively across the serial turns.
+# Nightly: this exercises the full dispatch + two-child + auto-wake UI
+# journey. Scripted LLM queues keep it deterministic, while the nightly
+# marker keeps the heavier multi-session browser coverage off the PR gate.
 @pytest.mark.nightly
 @pytest.mark.timeout(600)
 def test_two_joke_subagents_appear_and_navigate(
@@ -73,7 +71,7 @@ def test_two_joke_subagents_appear_and_navigate(
         page,
         "Please get one joke from comic_one and one joke from comic_two, "
         "then tell me both jokes exactly as they said them, including each "
-        "joke code.",
+        f"joke code. Routing marker: {chat.routing_token}",
     )
 
     # Both comedians' jokes (identified by their nonces) reached the

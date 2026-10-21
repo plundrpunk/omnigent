@@ -15,7 +15,6 @@ Two modes:
 from __future__ import annotations
 
 import argparse
-import logging
 
 
 def main() -> None:
@@ -44,26 +43,29 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(message)s",
-    )
+    from omnigent.process_logging import configure_process_logging
+
+    configure_process_logging("host", force=True)
 
     if args.local == bool(args.server):
         # Both or neither — the CLI always passes exactly one; fail loud.
         parser.error("exactly one of --server <url> or --local is required")
+
+    from omnigent.host.daemon_lifecycle import normalize_daemon_target
 
     if args.local:
         # The daemon owns the local server: start/reuse it, then connect.
         from omnigent.host.local_server import ensure_local_omnigent_server
 
         server_url = ensure_local_omnigent_server().url
+        daemon_target = normalize_daemon_target(None)
     else:
         server_url = args.server
+        daemon_target = normalize_daemon_target(args.server)
 
     from omnigent.host.connect import run_host_process
 
-    run_host_process(server_url=server_url)
+    run_host_process(server_url=server_url, daemon_target=daemon_target)
 
 
 if __name__ == "__main__":

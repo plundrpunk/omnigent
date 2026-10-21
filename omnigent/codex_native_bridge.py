@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import re
 import secrets
 import sys
 import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 import tomllib
@@ -18,6 +22,26 @@ CODEX_NATIVE_BRIDGE_DIR_ENV_VAR = "HARNESS_CODEX_NATIVE_BRIDGE_DIR"
 CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CODEX_NATIVE_REQUEST_SESSION_ID"
 
 _STATE_FILE = "state.json"
+_STATE_LOCK_FILE = "state.lock"
+_STARTUP_ERROR_FILE = "startup_error.json"
+# Per-MCP-server startup state mirrored from Codex's
+# ``mcpServer/startupStatus/updated`` notifications. Written by the
+# forwarder (and by ``wait_for_thread_started`` while it drains startup
+# events), read by the executor's first-turn gate and the runner's
+# Stop handler.
+_MCP_STARTUP_FILE = "mcp_startup.json"
+
+# Startup states mirrored from Codex's ``McpServerStartupState`` enum.
+MCP_STARTUP_STARTING = "starting"
+MCP_STARTUP_READY = "ready"
+MCP_STARTUP_FAILED = "failed"
+MCP_STARTUP_CANCELLED = "cancelled"
+MCP_STARTUP_STATES = frozenset(
+    {MCP_STARTUP_STARTING, MCP_STARTUP_READY, MCP_STARTUP_FAILED, MCP_STARTUP_CANCELLED}
+)
+# Top-level ``model_reasoning_effort = "<value>"`` line, capturing the value so
+# a model switch can clamp it to one the new model accepts (GLM has no xhigh).
+_EFFORT_KEY_RE = re.compile(r'^(\s*model_reasoning_effort\s*=\s*")([^"]*)("\s*(?:#.*)?)$')
 # Must match ``_CONFIG_FILE`` in ``claude_native_bridge.py`` because
 # ``serve-mcp`` reads this filename for the token.
 _MCP_CONFIG_FILE = "bridge.json"
@@ -56,6 +80,8 @@ class CodexNativeBridgeState:
         ``"0196..."``.
     :param codex_home: Private per-session ``CODEX_HOME`` path, e.g.
         ``"/home/user/.omnigent/codex-native/x/codex-home"``.
+    :param cwd: Native Codex thread working directory, e.g.
+        ``"/home/user/project"``.
     :param active_turn_id: Current Codex turn id, if one is running,
         e.g. ``"turn_abc123"``.
     """
@@ -65,6 +91,7 @@ class CodexNativeBridgeState:
     thread_id: str
     codex_home: str
     active_turn_id: str | None = None
+    cwd: str | None = None
 
 
 def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
@@ -168,8 +195,11 @@ def codex_mcp_config_overrides(
         ``['mcp_servers.omnigent.command="python"', ...]``.
     """
     python = python_executable or sys.executable
+    # -I: codex launches this MCP server in the workspace, so cwd must stay off
+    # sys.path or a workspace that is an omnigent checkout shadows the installed
+    # package. Matches every other bridge's serve-mcp invocation.
     args_toml = json.dumps(
-        ["-m", "omnigent.claude_native_bridge", "serve-mcp", "--bridge-dir", str(bridge_dir)]
+        ["-I", "-m", "omnigent.claude_native_bridge", "serve-mcp", "--bridge-dir", str(bridge_dir)]
     )
     return [
         f'mcp_servers.omnigent.command="{python}"',
@@ -213,6 +243,36 @@ def write_policy_hook_config(
     finally:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
+
+
+def update_policy_hook_auth_headers(
+    bridge_dir: Path,
+    headers: dict[str, str],
+) -> bool:
+    """Atomically replace ``ap_auth_headers`` in ``policy_hook.json``.
+
+    Returns ``True`` when the file existed and was updated.
+    """
+    path = bridge_dir / _POLICY_HOOK_FILE
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    payload["ap_auth_headers"] = dict(headers)
+    fd, tmp_name = tempfile.mkstemp(prefix=f"{_POLICY_HOOK_FILE}.", dir=str(bridge_dir))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+    return True
 
 
 def read_policy_hook_config(bridge_dir: Path) -> dict[str, object] | None:
@@ -274,35 +334,257 @@ def read_codex_config_model(bridge_dir: Path) -> str | None:
     config with no top-level ``model``) returns ``None``, so the caller falls
     back to the server-resolved model rather than crashing.
 
-    KNOWN LIMITATION — this file is SHARED across all codex sessions.
-    ``config.toml`` here is symlinked to the single real ``~/.codex/config.toml``
-    (see ``_CODEX_HOME_CONFIG_FILES`` /  ``_populate_codex_home_config`` in
-    ``omnigent.inner.codex_executor``). So the model returned is whatever the
-    LAST ``/model`` from ANY codex session wrote — it is NOT per-session.
-    Consequences for the cost gate: (1) one session's ``/model`` to a cheap
-    model makes a *different* session still on an EXPENSIVE model read the
-    cheap value and never get gated; (2) a freshly spawned session reads a
-    leftover value that may not match its own launch ``--model``. Acceptable
-    for single-user/local use; a hole under concurrent/multi-user codex
-    sessions. Fix (not yet done): copy config.toml per-session + seed it with
-    the session's launch model.
+    Per-session isolation: ``config.toml`` is **copied** (not symlinked)
+    into each session's private ``CODEX_HOME`` by
+    ``_populate_codex_home_config`` (see ``_CODEX_HOME_COPY_FILES`` in
+    ``omnigent.inner.codex_executor``), then seeded with the session's
+    launch model by ``_pin_codex_config_model`` in
+    ``omnigent.codex_native_app_server``. An in-TUI ``/model`` writes
+    only to that session's copy, so concurrent sessions do not interfere.
 
     :param bridge_dir: The session's native-Codex bridge directory.
     :returns: The top-level ``model`` from ``config.toml`` (e.g.
         ``"gpt-5.4"``), or ``None`` when undeterminable.
     """
-    config_path = codex_home_for_bridge_dir(bridge_dir) / "config.toml"
+    return read_codex_home_config_model(codex_home_for_bridge_dir(bridge_dir))
+
+
+def read_codex_home_config_model(codex_home: Path) -> str | None:
+    """
+    Read the active model straight from a session's ``CODEX_HOME``.
+
+    Same value and fail-safe behaviour as :func:`read_codex_config_model`,
+    for callers that hold the ``CODEX_HOME`` path (e.g. a live bridge
+    state) rather than the bridge directory.
+
+    :param codex_home: The session's private ``CODEX_HOME`` directory.
+    :returns: The top-level ``model`` from ``config.toml`` (e.g.
+        ``"gpt-5.4"``), or ``None`` when undeterminable.
+    """
     try:
-        data = tomllib.loads(config_path.read_text())
-    except (OSError, tomllib.TOMLDecodeError):
+        data = tomllib.loads((codex_home / "config.toml").read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         return None
     model = data.get("model")
     return model if isinstance(model, str) and model else None
 
 
-def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
+class DeveloperInstructionsReadState(str, Enum):
+    """Tri-state result of reading ``developer_instructions`` from ``config.toml``.
+
+    Distinguishes "the config genuinely has no instructions configured"
+    (safe to explicitly clear/serialize as ``None``) from "the config
+    couldn't be read right now" (must NOT be treated as absence — a
+    transient read failure must not wipe out live state a caller is trying
+    to preserve across a transition).
     """
-    Persist shared native Codex state atomically.
+
+    PRESENT = "present"
+    ABSENT = "absent"
+    UNREADABLE = "unreadable"
+
+
+@dataclass(frozen=True)
+class DeveloperInstructionsRead:
+    """Tri-state ``developer_instructions`` read result.
+
+    :param state: Which of the three states this read landed in.
+    :param value: The instructions text when ``state is PRESENT``; ``None``
+        otherwise.
+    """
+
+    state: DeveloperInstructionsReadState
+    value: str | None = None
+
+
+def read_codex_config_developer_instructions_state(bridge_dir: Path) -> DeveloperInstructionsRead:
+    """
+    Read the active ``developer_instructions`` from this session's private
+    Codex ``config.toml``, distinguishing absence from unreadability.
+
+    The top-level ``developer_instructions`` key is what
+    ``_sync_codex_developer_instructions`` (``codex_native_app_server.py``)
+    writes/removes; it is the current source of truth for what the running
+    app-server actually has configured, the same role
+    :func:`read_codex_config_model` plays for the model.
+
+    :param bridge_dir: The session's native-Codex bridge directory.
+    :returns: A tri-state read result — see :class:`DeveloperInstructionsReadState`.
+    """
+    return read_codex_config_developer_instructions_state_from_home(
+        codex_home_for_bridge_dir(bridge_dir)
+    )
+
+
+def read_codex_config_developer_instructions_state_from_home(
+    codex_home: Path,
+) -> DeveloperInstructionsRead:
+    """
+    Read the active ``developer_instructions`` given a ``CODEX_HOME`` path
+    directly, distinguishing absence from unreadability.
+
+    Variant of :func:`read_codex_config_developer_instructions_state` for
+    callers that already have the private ``CODEX_HOME`` (e.g.
+    ``CodexNativeBridgeState.codex_home``) rather than the bridge directory
+    it was derived from.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :returns: A tri-state read result — see :class:`DeveloperInstructionsReadState`.
+    """
+    config_path = codex_home / "config.toml"
+    try:
+        data = tomllib.loads(config_path.read_text())
+    except (FileNotFoundError, NotADirectoryError):
+        # No config file is a DEFINITE absence, not an unreadable value.
+        # ``_sync_codex_developer_instructions`` is the only writer of the
+        # key, and it writes it into this file or nowhere — so with the file
+        # gone there is nothing persisted to preserve, and a caller that
+        # sends no instructions overwrites nothing. UNREADABLE is for a value
+        # that might be there and cannot be seen; this is not that.
+        return DeveloperInstructionsRead(DeveloperInstructionsReadState.ABSENT)
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        # The file exists but its contents cannot be established — a
+        # permission error, unreadable bytes, or malformed TOML. Whatever it
+        # holds is undeterminable, so it stays UNREADABLE.
+        return DeveloperInstructionsRead(DeveloperInstructionsReadState.UNREADABLE)
+    if "developer_instructions" not in data:
+        return DeveloperInstructionsRead(DeveloperInstructionsReadState.ABSENT)
+    instructions = data["developer_instructions"]
+    if isinstance(instructions, str) and instructions.strip():
+        return DeveloperInstructionsRead(DeveloperInstructionsReadState.PRESENT, instructions)
+    # The key IS present but not a valid non-empty (non-whitespace) string.
+    # The writer
+    # (_sync_codex_developer_instructions in codex_native_app_server.py)
+    # only ever writes a non-empty string or deletes the key outright — it
+    # never writes an empty string or a non-string value — so this shape
+    # can only mean external/manual corruption of the config, not a genuine
+    # "no instructions configured" state. Treating it as ABSENT would let a
+    # plan-mode settings send serialize developer_instructions: null over a
+    # malformed-but-present value instead of refusing an undeterminable one.
+    return DeveloperInstructionsRead(DeveloperInstructionsReadState.UNREADABLE)
+
+
+def read_codex_config_developer_instructions(bridge_dir: Path) -> str | None:
+    """
+    Read the active ``developer_instructions`` from this session's private
+    Codex ``config.toml``, collapsing the tri-state read to ``Optional[str]``.
+
+    Convenience wrapper — collapses the tri-state to ``Optional[str]``.
+    Production callers use :func:`read_codex_config_developer_instructions_state`
+    directly when they need to distinguish ABSENT from UNREADABLE.
+
+    :param bridge_dir: The session's native-Codex bridge directory.
+    :returns: The top-level ``developer_instructions`` string, or ``None``
+        when undeterminable or genuinely absent.
+    """
+    result = read_codex_config_developer_instructions_state(bridge_dir)
+    return result.value
+
+
+def read_codex_config_developer_instructions_from_home(codex_home: Path) -> str | None:
+    """
+    Read the active ``developer_instructions`` given a ``CODEX_HOME`` path
+    directly, collapsing the tri-state read to ``Optional[str]``.
+
+    See :func:`read_codex_config_developer_instructions` for why no current
+    production caller uses this collapsed form.
+
+    :param codex_home: Private per-session ``CODEX_HOME`` directory.
+    :returns: The top-level ``developer_instructions`` string, or ``None``
+        when undeterminable or genuinely absent.
+    """
+    result = read_codex_config_developer_instructions_state_from_home(codex_home)
+    return result.value
+
+
+def write_codex_config_model(bridge_dir: Path, model: str) -> bool:
+    """
+    Upsert the top-level ``model`` key in this session's Codex ``config.toml``.
+
+    Companion writer to :func:`read_codex_config_model`, used when Omnigent
+    itself switches the running thread's model (web picker / intelligent
+    routing via ``thread/settings/update``). That RPC changes the live thread
+    but does NOT touch ``config.toml`` — while the forwarder's mirror and the
+    cost-gate hook both treat ``config.toml`` as the source of truth. Without
+    this write, the next ``turn/started`` re-reads the stale launch model and
+    mirrors it back to Omnigent as an ``external_model_change``, silently
+    reverting the switch. Writing the same top-level key an in-TUI ``/model``
+    writes keeps every reader consistent; a later in-TUI switch simply
+    overwrites it (last-wins, as for user switches).
+
+    Best-effort: an unreadable/unwritable file returns ``False`` — the live
+    thread already runs the new model, so failing the turn over a mirror
+    file would be worse than a temporarily stale mirror.
+
+    :param bridge_dir: The session's native-Codex bridge directory.
+    :param model: Model id to record, e.g. ``"gpt-5.6-luna"``.
+    :returns: ``True`` when the file was updated.
+    """
+    from omnigent.reasoning_effort import clamp_effort_for_model
+
+    config_path = codex_home_for_bridge_dir(bridge_dir) / "config.toml"
+    pin_line = f"model = {json.dumps(model)}"
+    try:
+        existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+        lines = existing.splitlines()
+        replaced = False
+        for i, line in enumerate(lines):
+            # Only the top-level table: stop at the first [section] header.
+            if line.startswith("["):
+                break
+            if re.match(r"^model\s*=", line):
+                lines[i] = pin_line
+                replaced = True
+                continue
+            # The config keeps the launch model's effort (e.g. the user's
+            # xhigh default), which the switched-to model may reject (GLM has
+            # no xhigh). Clamp it to a value the new model accepts so the next
+            # turn does not 400 on reasoning.effort.
+            effort_match = _EFFORT_KEY_RE.match(line)
+            if effort_match:
+                clamped = clamp_effort_for_model(effort_match.group(2), model)
+                if clamped and clamped != effort_match.group(2):
+                    lines[i] = f"{effort_match.group(1)}{clamped}{effort_match.group(3)}"
+        if not replaced:
+            lines.insert(0, pin_line)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def _bridge_state_lock(bridge_dir: Path) -> Iterator[None]:
+    """
+    Serialize bridge-state read/modify/write cycles across local processes.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: Context manager holding the bridge's process lock.
+    """
+    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - native Codex is POSIX-only today.
+        yield
+        return
+    fd = os.open(
+        bridge_dir / _STATE_LOCK_FILE,
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+        0o600,
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
+    """
+    Atomically replace bridge state while the caller holds its state lock.
 
     :param bridge_dir: Native Codex bridge directory.
     :param state: State payload to persist.
@@ -320,6 +602,7 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
                     "thread_id": state.thread_id,
                     "codex_home": state.codex_home,
                     "active_turn_id": state.active_turn_id,
+                    "cwd": state.cwd,
                 },
                 handle,
                 sort_keys=True,
@@ -329,6 +612,18 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
     finally:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
+
+
+def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
+    """
+    Persist shared native Codex state atomically under a process lock.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param state: State payload to persist.
+    :returns: None.
+    """
+    with _bridge_state_lock(bridge_dir):
+        _write_bridge_state_unlocked(bridge_dir, state)
 
 
 def clear_bridge_state(bridge_dir: Path) -> None:
@@ -345,10 +640,220 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     :param bridge_dir: Native Codex bridge directory.
     :returns: None.
     """
+    with _bridge_state_lock(bridge_dir):
+        for name in (
+            _STATE_FILE,
+            _STARTUP_ERROR_FILE,
+            _MCP_STARTUP_FILE,
+        ):
+            try:
+                (bridge_dir / name).unlink()
+            except FileNotFoundError:
+                continue
+
+
+def write_bridge_startup_error(bridge_dir: Path, message: str) -> None:
+    """
+    Record why a native Codex app-server never started its thread (issue #59).
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param message: Human-readable failure cause.
+    :returns: None.
+    """
     try:
-        (bridge_dir / _STATE_FILE).unlink()
-    except FileNotFoundError:
-        return
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = bridge_dir / _STARTUP_ERROR_FILE
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{_STARTUP_ERROR_FILE}.", dir=str(bridge_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"message": message}, handle, sort_keys=True)
+                handle.write("\n")
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    except OSError:
+        return  # best-effort; the real failure is already logged
+
+
+def read_bridge_startup_error(bridge_dir: Path) -> str | None:
+    """
+    Read a recorded native Codex startup-failure message, if any.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: The recorded failure cause, or ``None`` if absent/unreadable.
+    """
+    path = bridge_dir / _STARTUP_ERROR_FILE
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    message = raw.get("message")
+    return message if isinstance(message, str) and message else None
+
+
+def read_mcp_startup(bridge_dir: Path) -> dict[str, dict[str, str | None]]:
+    """
+    Read the recorded per-MCP-server startup state.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: Mapping of server name to its latest startup record, e.g.
+        ``{"safe": {"status": "starting", "error": None}}``. Empty when
+        no state has been recorded or the file is unreadable.
+    """
+    path = bridge_dir / _MCP_STARTUP_FILE
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    servers = raw.get("servers") if isinstance(raw, dict) else None
+    if not isinstance(servers, dict):
+        return {}
+    parsed: dict[str, dict[str, str | None]] = {}
+    for name, record in servers.items():
+        if not (isinstance(name, str) and name and isinstance(record, dict)):
+            continue
+        status = record.get("status")
+        if status not in MCP_STARTUP_STATES:
+            continue
+        error = record.get("error")
+        parsed[name] = {
+            "status": status,
+            "error": error if isinstance(error, str) and error else None,
+        }
+    return parsed
+
+
+def _write_mcp_startup(bridge_dir: Path, servers: dict[str, dict[str, str | None]]) -> None:
+    """
+    Persist the per-MCP-server startup map atomically (best-effort).
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param servers: Full startup map, e.g.
+        ``{"safe": {"status": "ready", "error": None}}``.
+    :returns: None.
+    """
+    try:
+        bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = bridge_dir / _MCP_STARTUP_FILE
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{_MCP_STARTUP_FILE}.", dir=str(bridge_dir))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"servers": servers}, handle, sort_keys=True)
+                handle.write("\n")
+            os.replace(tmp_name, path)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+    except OSError:
+        return  # best-effort; surfacing MCP state must never sink startup
+
+
+def update_mcp_server_startup(
+    bridge_dir: Path,
+    name: str,
+    status: str,
+    error: str | None = None,
+) -> dict[str, dict[str, str | None]]:
+    """
+    Record one Codex MCP-server startup update.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param name: MCP server name, e.g. ``"storage-console"``.
+    :param status: One of :data:`MCP_STARTUP_STATES`.
+    :param error: Failure detail when ``status == "failed"``, e.g.
+        ``"handshaking with MCP server failed"``. ``None`` otherwise.
+    :returns: The full startup map after the update.
+    """
+    servers = read_mcp_startup(bridge_dir)
+    servers[name] = {"status": status, "error": error}
+    _write_mcp_startup(bridge_dir, servers)
+    return servers
+
+
+def pending_mcp_servers(servers: dict[str, dict[str, str | None]]) -> list[str]:
+    """
+    Return the MCP servers still reported as ``starting``.
+
+    :param servers: Startup map from :func:`read_mcp_startup`.
+    :returns: Sorted server names whose latest status is ``starting``.
+    """
+    return sorted(
+        name for name, record in servers.items() if record.get("status") == MCP_STARTUP_STARTING
+    )
+
+
+def cancel_pending_mcp_startup(bridge_dir: Path) -> list[str]:
+    """
+    Mark every still-``starting`` MCP server as ``cancelled``.
+
+    Used by the Stop path so the executor's first-turn gate unblocks
+    immediately, even when Codex's own ``cancelled`` notifications are
+    delayed or lost.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: Sorted names of the servers that were flipped, e.g.
+        ``["storage-console"]``. Empty when nothing was pending.
+    """
+    servers = read_mcp_startup(bridge_dir)
+    pending = pending_mcp_servers(servers)
+    if not pending:
+        return []
+    for name in pending:
+        servers[name] = {"status": MCP_STARTUP_CANCELLED, "error": servers[name].get("error")}
+    _write_mcp_startup(bridge_dir, servers)
+    return pending
+
+
+def settle_pending_mcp_startup(bridge_dir: Path) -> tuple[dict[str, dict[str, str | None]], bool]:
+    """
+    Drop every still-``starting`` MCP server from the recorded map.
+
+    Codex delivers per-server terminal states (ready/failed) only to the
+    connection that owns the thread — never to Omnigent's observer
+    connection — so when a settle signal arrives (the thread went idle
+    after a turn, or the startup window elapsed) the round is known to be
+    over but the per-server outcomes are not. Unresolved entries are
+    removed rather than guessed; locally-known terminal states
+    (``cancelled`` from a Stop) are preserved.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: ``(map_after, changed)`` — the settled map and whether any
+        entry was dropped.
+    """
+    # The read→write below is not locked across processes: a runner Stop
+    # can flip an entry to ``cancelled`` in between, and this write drops
+    # it. Cosmetic only — both outcomes end the round, and the Stop path
+    # publishes its cancelled map independently.
+    servers = read_mcp_startup(bridge_dir)
+    pending = pending_mcp_servers(servers)
+    if not pending:
+        return servers, False
+    for name in pending:
+        servers.pop(name, None)
+    _write_mcp_startup(bridge_dir, servers)
+    return servers, True
+
+
+def mcp_startup_waiting_detail(servers: dict[str, dict[str, str | None]]) -> str | None:
+    """
+    Describe the MCP servers a startup wait is still blocked on.
+
+    :param servers: Startup map from :func:`read_mcp_startup`.
+    :returns: Text naming the pending servers, e.g.
+        ``"MCP startup still waiting on storage-console"``, or ``None``
+        when nothing is pending.
+    """
+    pending = pending_mcp_servers(servers)
+    if not pending:
+        return None
+    return f"MCP startup still waiting on {', '.join(pending)}"
 
 
 def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
@@ -372,8 +877,17 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
     thread_id = raw.get("thread_id")
     codex_home = raw.get("codex_home")
     active_turn_id = raw.get("active_turn_id")
-    required = (session_id, socket_path, thread_id, codex_home)
-    if not all(isinstance(value, str) and value for value in required):
+    cwd = raw.get("cwd")
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(socket_path, str)
+        or not socket_path
+        or not isinstance(thread_id, str)
+        or not thread_id
+        or not isinstance(codex_home, str)
+        or not codex_home
+    ):
         return None
     parsed_active_turn_id = (
         active_turn_id if isinstance(active_turn_id, str) and active_turn_id else None
@@ -384,6 +898,7 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
         thread_id=thread_id,
         codex_home=codex_home,
         active_turn_id=parsed_active_turn_id,
+        cwd=cwd if isinstance(cwd, str) and cwd else None,
     )
 
 
@@ -396,19 +911,21 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
         or ``None`` when no turn is running.
     :returns: None.
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        return
-    write_bridge_state(
-        bridge_dir,
-        CodexNativeBridgeState(
-            session_id=state.session_id,
-            socket_path=state.socket_path,
-            thread_id=state.thread_id,
-            codex_home=state.codex_home,
-            active_turn_id=active_turn_id,
-        ),
-    )
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            return
+        _write_bridge_state_unlocked(
+            bridge_dir,
+            CodexNativeBridgeState(
+                session_id=state.session_id,
+                socket_path=state.socket_path,
+                thread_id=state.thread_id,
+                codex_home=state.codex_home,
+                active_turn_id=active_turn_id,
+                cwd=state.cwd,
+            ),
+        )
 
 
 def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | None = None) -> None:
@@ -424,19 +941,21 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
         ``"turn_abc123"``, or ``None`` when no turn is running yet.
     :returns: None.
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        return
-    write_bridge_state(
-        bridge_dir,
-        CodexNativeBridgeState(
-            session_id=state.session_id,
-            socket_path=state.socket_path,
-            thread_id=thread_id,
-            codex_home=state.codex_home,
-            active_turn_id=active_turn_id,
-        ),
-    )
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            return
+        _write_bridge_state_unlocked(
+            bridge_dir,
+            CodexNativeBridgeState(
+                session_id=state.session_id,
+                socket_path=state.socket_path,
+                thread_id=thread_id,
+                codex_home=state.codex_home,
+                active_turn_id=active_turn_id,
+                cwd=state.cwd,
+            ),
+        )
 
 
 def clear_active_turn_id_if_matches(bridge_dir: Path, completed_turn_id: str | None) -> bool:
@@ -463,23 +982,25 @@ def clear_active_turn_id_if_matches(bridge_dir: Path, completed_turn_id: str | N
     :returns: ``True`` when bridge state was cleared or did not exist,
         ``False`` when a stale or ambiguous terminal event was ignored.
     """
-    state = read_bridge_state(bridge_dir)
-    if state is None:
-        return True
-    if completed_turn_id is None:
-        # No-id terminal mid-turn is ambiguous — ignore (clearing posts a premature idle).
-        if state.active_turn_id is not None:
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None:
+            return True
+        if completed_turn_id is None:
+            # No-id terminal mid-turn is ambiguous — ignore (clearing posts a premature idle).
+            if state.active_turn_id is not None:
+                return False
+        elif state.active_turn_id != completed_turn_id:
             return False
-    elif state.active_turn_id != completed_turn_id:
-        return False
-    write_bridge_state(
-        bridge_dir,
-        CodexNativeBridgeState(
-            session_id=state.session_id,
-            socket_path=state.socket_path,
-            thread_id=state.thread_id,
-            codex_home=state.codex_home,
-            active_turn_id=None,
-        ),
-    )
-    return True
+        _write_bridge_state_unlocked(
+            bridge_dir,
+            CodexNativeBridgeState(
+                session_id=state.session_id,
+                socket_path=state.socket_path,
+                thread_id=state.thread_id,
+                codex_home=state.codex_home,
+                active_turn_id=None,
+                cwd=state.cwd,
+            ),
+        )
+        return True

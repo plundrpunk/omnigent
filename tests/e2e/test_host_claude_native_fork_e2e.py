@@ -30,11 +30,9 @@ real ``$HOME`` — it cannot be relocated into CI. Set
 ``OMNIGENT_E2E_CLAUDE_NATIVE=1`` (with ``claude`` installed + logged
 in) to run::
 
-    OMNIGENT_E2E_CLAUDE_NATIVE=1 \
-    .venv/bin/python -m pytest tests/e2e/test_host_claude_native_fork_e2e.py \
-        --profile oss \
-        --llm-api-key "$(databricks auth token -p oss \
-            | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')" \
+    OMNIGENT_E2E_CLAUDE_NATIVE=1 \\
+    .venv/bin/python -m pytest tests/e2e/test_host_claude_native_fork_e2e.py \\
+        --llm-api-key "mock-key" \\
         -v
 """
 
@@ -55,7 +53,9 @@ import pytest
 
 from tests.e2e.conftest import (
     _CLAUDE_CODER_DIR,
+    configure_mock_llm,
     create_runner_bound_session,
+    reset_mock_llm,
     send_user_message_to_session,
     upload_agent,
 )
@@ -200,6 +200,41 @@ def _wait_for_external_session_id(client: httpx.Client, *, session_id: str, time
     raise AssertionError(
         f"Source session {session_id} never captured an external_session_id within "
         f"{timeout}s — the fork would have no source transcript to clone."
+    )
+
+
+def _wait_for_compaction_item(
+    client: httpx.Client,
+    *,
+    session_id: str,
+    timeout: float,
+) -> dict[str, object]:
+    """Wait until Claude Code's real ``/compact`` persists its boundary.
+
+    :param client: HTTP client pointed at the test server.
+    :param session_id: Source session being compacted.
+    :param timeout: Maximum seconds to wait for the transcript forwarder.
+    :returns: The flattened compaction item from ``GET /items``.
+    :raises AssertionError: If no compaction item appears in time.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        resp = client.get(
+            f"/v1/sessions/{session_id}/items",
+            params={"limit": 100, "order": "desc"},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        compaction = next(
+            (item for item in resp.json().get("data", []) if item.get("type") == "compaction"),
+            None,
+        )
+        if compaction is not None:
+            return dict(compaction)
+        time.sleep(POLL_INTERVAL_S)
+    raise AssertionError(
+        f"Claude Code /compact did not persist a compaction item for "
+        f"{session_id} within {timeout}s"
     )
 
 
@@ -405,6 +440,223 @@ def test_fork_resume_same_dir_carries_history(
             )
 
 
+def test_compacted_fork_remaps_boundary_and_continues_with_claude(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """A real Claude Code compaction remains valid after fork and resume.
+
+    Runs an actual Claude turn, invokes ``/compact`` in its live TUI,
+    waits for the hook/transcript forwarder to persist the boundary, and
+    forks through the public session API. The fork must remap the boundary
+    to one of its fresh item IDs, then its cloned Claude session must resume
+    and recall the pre-compaction marker.
+    """
+    workspace = tmp_path / "compacted-fork-workspace"
+    workspace.mkdir()
+    marker = f"COMPACT_FORK_{uuid.uuid4().hex[:6].upper()}"
+
+    with _workspaces_trusted_in_claude_config([workspace]):
+        with _host_daemon(tmp_path, live_server):
+            # 1. Launch a real Claude Code session and seed history that must
+            # survive both compaction and the subsequent fork.
+            host_id = _online_host_id(http_client, timeout=30.0)
+            agent_id = _claude_native_agent_id(http_client)
+            source_id = _create_native_session(
+                http_client,
+                agent_id=agent_id,
+                host_id=host_id,
+                workspace=workspace,
+            )
+            _send_user_message(
+                http_client,
+                session_id=source_id,
+                text=f"Remember {marker}. Reply with exactly ACK.",
+            )
+            _poll_for_assistant_marker(
+                http_client,
+                session_id=source_id,
+                marker="ACK",
+                timeout=180.0,
+            )
+            _wait_for_external_session_id(http_client, session_id=source_id, timeout=60.0)
+
+            # 2. Complete the second real turn Claude requires before it will
+            # accept /compact, even with substantial startup instructions.
+            second_ack = f"SECOND_ACK_{uuid.uuid4().hex[:6].upper()}"
+            _send_user_message(
+                http_client,
+                session_id=source_id,
+                text=f"Reply with exactly {second_ack}.",
+            )
+            _poll_for_assistant_marker(
+                http_client,
+                session_id=source_id,
+                marker=second_ack,
+                timeout=180.0,
+            )
+
+            # 3. Invoke Claude Code's real /compact flow and validate the
+            # source cursor before forking through the public session API.
+            compact = http_client.post(
+                f"/v1/sessions/{source_id}/events",
+                json={"type": "compact", "data": {}},
+                timeout=30.0,
+            )
+            assert compact.status_code == 202, (
+                f"compact request returned {compact.status_code}: {compact.text}"
+            )
+            assert compact.json() == {"queued": False}, (
+                f"compact request returned an unexpected acknowledgement: {compact.json()!r}"
+            )
+            source_compaction = _wait_for_compaction_item(
+                http_client,
+                session_id=source_id,
+                timeout=180.0,
+            )
+            source_summary = source_compaction.get("summary")
+            assert isinstance(source_summary, str) and source_summary.strip(), (
+                f"source compaction did not persist a non-empty summary: {source_compaction!r}"
+            )
+            source_boundary_id = source_compaction.get("last_item_id")
+            assert isinstance(source_boundary_id, str) and source_boundary_id, (
+                f"source compaction did not persist a string boundary: {source_compaction!r}"
+            )
+
+            source_items_resp = http_client.get(
+                f"/v1/sessions/{source_id}/items",
+                params={"limit": 100, "order": "asc"},
+                timeout=30.0,
+            )
+            source_items_resp.raise_for_status()
+            source_items = source_items_resp.json()["data"]
+            source_ids = {item["id"] for item in source_items}
+            assert len(source_ids) == len(source_items), "source item IDs must be unique"
+            assert source_boundary_id in source_ids, (
+                f"source compaction boundary {source_boundary_id!r} does not reference a "
+                f"source item; source IDs: {sorted(source_ids)!r}"
+            )
+            source_compactions = [
+                item for item in source_items if item.get("type") == "compaction"
+            ]
+            assert len(source_compactions) == 1, (
+                f"expected exactly one source compaction, got {len(source_compactions)}"
+            )
+
+            # 4. Fork the compacted session and prove every item received a
+            # fresh ID while type/response ordering and the cursor position
+            # were preserved exactly.
+            fork_id = _fork_session(
+                http_client,
+                source_id=source_id,
+                title=f"compacted clone of {source_id}",
+            )
+            assert fork_id != source_id, "fork endpoint returned the source session ID"
+            fork_items_resp = http_client.get(
+                f"/v1/sessions/{fork_id}/items",
+                params={"limit": 100, "order": "asc"},
+                timeout=30.0,
+            )
+            fork_items_resp.raise_for_status()
+            fork_items = fork_items_resp.json()["data"]
+            fork_ids = {item["id"] for item in fork_items}
+            assert len(fork_ids) == len(fork_items), "fork item IDs must be unique"
+            assert len(fork_items) == len(source_items), (
+                f"fork copied {len(fork_items)} items from a {len(source_items)}-item source"
+            )
+            assert source_ids.isdisjoint(fork_ids), (
+                f"fork reused source item IDs: {sorted(source_ids & fork_ids)!r}"
+            )
+
+            source_shape = [(item.get("type"), item.get("response_id")) for item in source_items]
+            fork_shape = [(item.get("type"), item.get("response_id")) for item in fork_items]
+            assert fork_shape == source_shape, (
+                "fork changed ordered item types/response IDs: "
+                f"source={source_shape!r}, fork={fork_shape!r}"
+            )
+
+            fork_compactions = [item for item in fork_items if item.get("type") == "compaction"]
+            assert len(fork_compactions) == 1, (
+                f"expected exactly one fork compaction, got {len(fork_compactions)}"
+            )
+            fork_compaction = fork_compactions[0]
+            assert fork_compaction.get("summary") == source_summary, (
+                "fork did not preserve the source compaction summary"
+            )
+            fork_boundary_id = fork_compaction.get("last_item_id")
+            assert isinstance(fork_boundary_id, str) and fork_boundary_id, (
+                f"fork compaction did not persist a string boundary: {fork_compaction!r}"
+            )
+            source_boundary_position = next(
+                index
+                for index, item in enumerate(source_items)
+                if item["id"] == source_boundary_id
+            )
+            expected_fork_boundary_id = fork_items[source_boundary_position]["id"]
+            assert fork_boundary_id == expected_fork_boundary_id, (
+                "fork compaction cursor did not map to the clone of the source boundary: "
+                f"expected {expected_fork_boundary_id!r} at position "
+                f"{source_boundary_position}, got {fork_boundary_id!r}"
+            )
+            assert fork_boundary_id != source_boundary_id, (
+                "fork compaction cursor still references the source item ID"
+            )
+
+            # 5. Resume the cloned real-Claude transcript and demand exact
+            # recall, proving the remapped compacted session remains usable.
+            _launch_runner(
+                http_client,
+                host_id=host_id,
+                session_id=fork_id,
+                workspace=workspace,
+                git=None,
+            )
+            _send_user_message(
+                http_client,
+                session_id=fork_id,
+                text=(
+                    "What marker did I ask you to remember before compaction? "
+                    "Reply with exactly that marker."
+                ),
+            )
+            text = _poll_for_assistant_marker(
+                http_client,
+                session_id=fork_id,
+                marker=marker,
+                timeout=180.0,
+            )
+            assert text.strip() == marker, (
+                f"resumed compacted fork should answer exactly {marker!r}, got {text!r}"
+            )
+
+            # Resuming the compacted transcript must consume its existing
+            # boundary, not run compaction again because older audit items
+            # remain stored on the fork.
+            resumed_items_resp = http_client.get(
+                f"/v1/sessions/{fork_id}/items",
+                params={"limit": 100, "order": "asc"},
+                timeout=30.0,
+            )
+            resumed_items_resp.raise_for_status()
+            resumed_compactions = [
+                item
+                for item in resumed_items_resp.json()["data"]
+                if item.get("type") == "compaction"
+            ]
+            assert len(resumed_compactions) == 1, (
+                "resuming the compacted fork unexpectedly persisted another compaction; "
+                f"got {len(resumed_compactions)}"
+            )
+            resumed_compaction = resumed_compactions[0]
+            assert resumed_compaction["id"] == fork_compaction["id"], (
+                "resume replaced the fork's original compaction record"
+            )
+            assert resumed_compaction.get("last_item_id") == fork_boundary_id, (
+                "resume changed the fork's remapped compaction boundary"
+            )
+
+
 def test_fork_resume_worktree_carries_history(
     live_server: str,
     http_client: httpx.Client,
@@ -446,7 +698,7 @@ def test_fork_sdk_source_into_native_builds_history(
     http_client: httpx.Client,
     tmp_path: Path,
     live_runner_id: str,
-    databricks_workspace_host: str | None,
+    mock_llm_server_url: str,
 ) -> None:
     """
     A claude-SDK source forked into claude-native recalls source history.
@@ -460,28 +712,38 @@ def test_fork_sdk_source_into_native_builds_history(
     native clone can't recall the source's code word.
 
     The SDK source runs on the SERVER's runner (``live_runner_id``) — which
-    holds the ``--profile`` gateway creds — while the native clone runs on
+    is wired to the mock LLM server — while the native clone runs on
     the host daemon (Claude CLI OAuth); the fork is independent of both.
 
     :param live_server: The test server URL.
     :param http_client: HTTP client pointed at the test server.
     :param tmp_path: Per-test temp dir.
     :param live_runner_id: The server fixture's runner id (runs the SDK
-        source turn).
-    :param databricks_workspace_host: Workspace host from ``--profile``
-        (``None`` for the api.openai.com path) — gates the bundle's model
-        rewrite.
+        source turn against the mock LLM).
+    :param mock_llm_server_url: Mock LLM server base URL (no ``/v1`` suffix).
     :returns: None.
     """
     workspace = tmp_path / "sdk_to_native_ws"
     workspace.mkdir()
     marker = f"FORKWORD_{uuid.uuid4().hex[:6].upper()}"
 
+    mock_model = "mock-claude-coder-sdk"
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": f"ACK — code word recorded: {marker}"},
+            {"text": marker},
+        ],
+        key=mock_model,
+    )
+
     # Register the claude-coder (claude-sdk, anthropic) agent as the SOURCE.
+    # No model rewrite needed — we use the mock model key directly.
     sdk_agent_name = upload_agent(
         http_client,
         _CLAUDE_CODER_DIR,
-        rewrite_model_for_databricks=databricks_workspace_host is not None,
+        rewrite_model_for_databricks=False,
     )
 
     # Only the native CLONE shows Claude's folder-trust dialog; the
