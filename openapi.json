@@ -3818,6 +3818,126 @@
         ]
       }
     },
+    "/v1/ams/management/status": {
+      "get": {
+        "operationId": "management_status_v1_ams_management_status_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Management Status V1 Ams Management Status Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Management Status",
+        "tags": [
+          "ams"
+        ]
+      }
+    },
+    "/v1/ams/management/{path}": {
+      "delete": {
+        "operationId": "management_unavailable_v1_ams_management__path__delete",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Management Unavailable V1 Ams Management  Path  Delete"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Management Unavailable",
+        "tags": [
+          "ams"
+        ]
+      },
+      "get": {
+        "operationId": "management_unavailable_v1_ams_management__path__get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Management Unavailable V1 Ams Management  Path  Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Management Unavailable",
+        "tags": [
+          "ams"
+        ]
+      },
+      "patch": {
+        "operationId": "management_unavailable_v1_ams_management__path__patch",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Management Unavailable V1 Ams Management  Path  Patch"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Management Unavailable",
+        "tags": [
+          "ams"
+        ]
+      },
+      "post": {
+        "operationId": "management_unavailable_v1_ams_management__path__post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Management Unavailable V1 Ams Management  Path  Post"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Management Unavailable",
+        "tags": [
+          "ams"
+        ]
+      },
+      "put": {
+        "operationId": "management_unavailable_v1_ams_management__path__put",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "title": "Response Management Unavailable V1 Ams Management  Path  Put"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Management Unavailable",
+        "tags": [
+          "ams"
+        ]
+      }
+    },
     "/v1/ams/{path}": {
       "get": {
         "description": "Forward a whitelisted GET to the AMS REST API.",

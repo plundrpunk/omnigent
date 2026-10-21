@@ -30,6 +30,11 @@ interface CodingAgentsResponse {
 
 const destinations = [
   {
+    name: "Memory & Handoffs",
+    path: "../memory",
+    description: "Inspect memories and pending continuations; review selected memory cleanup.",
+  },
+  {
     name: "System",
     path: "../system",
     description: `Review ${connectedApps} and ${proofOfWhatWasDone}.`,
