@@ -334,7 +334,7 @@ async def test_fleet_records_preserve_goal_run_contract(
     created = response.json()
     finished_at = "2026-10-21T12:00:00Z" if ams_status == "completed" else None
     outcome = {"result": "verbatim AMS outcome"}
-    receipt = {"receipt_id": "receipt-1"}
+    receipt = {"receipt_id": "receipt-1", "continuation_id": "continuation-1"}
     fleet_env["responses"].extend(
         [
             httpx.Response(
@@ -493,7 +493,11 @@ async def test_fleet_refresh_uses_ams_state(
     response = await client.post("/v1/goal", json={"contract": _contract(), "dispatch": "fleet"})
     run = response.json()
     assert run["contract"]["metadata"] == {"origin": "omnigent-aos"}
-    receipt = {"event_id": "receipt-1", "payload": {"status": "completed"}}
+    receipt = {
+        "event_id": "receipt-1",
+        "work_item_id": "continuation-1",
+        "payload": {"status": "completed"},
+    }
     upstream = {
         "status": state,
         "summary": "verbatim completion claim",
@@ -519,6 +523,7 @@ async def test_fleet_refresh_uses_ams_state(
     assert fleet_env["calls"][2]["params"] == {
         "session_id": "goal-queue:t-goal",
         "project": "fleet-autonomy",
+        "work_item_id": "continuation-1",
     }
     assert all(call["headers"] == {"X-API-Key": "fleet-test-key"} for call in fleet_env["calls"])
 
@@ -672,18 +677,93 @@ async def test_fleet_refresh_clears_stale_receipt_and_keeps_original_project(
     fleet_env["responses"].extend(
         [
             httpx.Response(200, json={"status": "claimed"}),
-            httpx.Response(200, json={"event_id": "receipt-1"}),
+            httpx.Response(
+                200, json={"event_id": "receipt-1", "continuation_id": "continuation-1"}
+            ),
             httpx.Response(200, json={"status": "completed"}),
             httpx.Response(403),
         ]
     )
     first = await client.get(f"/v1/goal/{run_id}")
-    assert first.json()["work_receipt"] == {"event_id": "receipt-1"}
+    assert first.json()["work_receipt"] == {
+        "event_id": "receipt-1",
+        "continuation_id": "continuation-1",
+    }
     second = await client.get(f"/v1/goal/{run_id}")
     assert second.json()["status"] == "completed"
     assert second.json()["work_receipt"] is None
     for call in (fleet_env["calls"][2], fleet_env["calls"][4]):
         assert call["params"]["project"] == "custom-project"
+
+
+async def test_fleet_receipt_for_another_continuation_is_not_attached(
+    client: httpx.AsyncClient, fleet_env: dict
+) -> None:
+    """The latest ``goal-queue:<goal_id>`` receipt may be an earlier run's, or
+    another Omnigent user's on the shared bridge key: never this run's evidence."""
+    response = await client.post("/v1/goal", json={"contract": _contract(), "dispatch": "fleet"})
+    fleet_env["responses"].extend(
+        [
+            httpx.Response(200, json={"status": "pending"}),
+            httpx.Response(
+                200,
+                json={
+                    "event_id": "earlier-receipt",
+                    "continuation_id": "continuation-0",
+                    "work_item_id": "continuation-0",
+                    "status": "completed",
+                },
+            ),
+        ]
+    )
+    refreshed = (await client.get(f"/v1/goal/{response.json()['run_id']}")).json()
+    assert refreshed["status"] == "queued"
+    assert refreshed["work_receipt"] is None
+
+
+async def test_fleet_summary_and_finish_time_come_from_ams_continuation(
+    client: httpx.AsyncClient, fleet_env: dict
+) -> None:
+    """AMS has no ``summary`` field: completion appends ``**Outcome:**`` to the
+    handoff notes, and ``completed_at`` is the terminal time."""
+    response = await client.post("/v1/goal", json={"contract": _contract(), "dispatch": "fleet"})
+    notes = (
+        "HA-GOALCONTRACT-JSON\n```json\n{}\n```\n\n---\n**Outcome:** "
+        "goal t-goal completed; finalization gate passed; work_receipt=r-1"
+    )
+    fleet_env["responses"].extend(
+        [
+            httpx.Response(
+                200,
+                json={
+                    "status": "completed",
+                    "handoff_notes": notes,
+                    "completed_at": "2026-10-21T21:00:00Z",
+                },
+            ),
+            httpx.Response(404),
+        ]
+    )
+    refreshed = (await client.get(f"/v1/goal/{response.json()['run_id']}")).json()
+    assert refreshed["status"] == "completed"
+    assert refreshed["summary"] == (
+        "goal t-goal completed; finalization gate passed; work_receipt=r-1"
+    )
+    assert refreshed["finished_at"] == "2026-10-21T21:00:00Z"
+
+
+async def test_fleet_expired_continuation_is_an_error_not_a_502(
+    client: httpx.AsyncClient, fleet_env: dict
+) -> None:
+    response = await client.post("/v1/goal", json={"contract": _contract(), "dispatch": "fleet"})
+    fleet_env["responses"].extend(
+        [httpx.Response(200, json={"status": "expired"}), httpx.Response(404)]
+    )
+    refreshed = await client.get(f"/v1/goal/{response.json()['run_id']}")
+    assert refreshed.status_code == 200
+    assert refreshed.json()["status"] == "error"
+    assert "expired" in refreshed.json()["error"]
+    assert refreshed.json()["summary"] is None
 
 
 @pytest.fixture()

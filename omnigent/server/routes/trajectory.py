@@ -49,6 +49,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes import ams
 from omnigent.server.routes._auth_helpers import require_access, require_user
+from omnigent.server.routes.goal import receipt_matches_continuation
 from omnigent.server.trajectory import (
     _SOURCE_PRIORITY,
     SCHEMA_VERSION,
@@ -65,8 +66,9 @@ from omnigent.stores.permission_store import PermissionStore
 
 logger = logging.getLogger(__name__)
 
-#: ``(session_id) -> receipt | None``; raises when AMS is unreachable.
-ReceiptFetcher = Callable[[str], Awaitable[Mapping[str, Any] | None]]
+#: ``(session_id, work_item_id=None) -> receipt | None``; raises when AMS is
+#: unreachable. ``work_item_id`` pins a shared session id to one run.
+ReceiptFetcher = Callable[..., Awaitable[Mapping[str, Any] | None]]
 
 #: A raw ``harness.receipt.v1`` payload paired with the exact entry it
 #: produced, so the receipt endpoint can scope-check the payload it returns.
@@ -99,16 +101,21 @@ def _ams_owners(user_id: str | None) -> frozenset[str] | None:
     return frozenset(owners)
 
 
-async def _default_receipt_fetcher(session_id: str) -> Mapping[str, Any] | None:
+async def _default_receipt_fetcher(
+    session_id: str, work_item_id: str | None = None
+) -> Mapping[str, Any] | None:
     """Latest AMS receipt for one session id (bridge credentials)."""
     base = ams._base_url()
     if not base:
         raise LookupError("unconfigured")
     key = ams._api_key()
+    params = {"session_id": session_id}
+    if work_item_id is not None:
+        params["work_item_id"] = work_item_id
     async with httpx.AsyncClient(timeout=ams._TIMEOUT_SECONDS) as client:
         resp = await client.get(
             f"{base}/api/v1/work-receipts/latest",
-            params={"session_id": session_id},
+            params=params,
             headers={"X-API-Key": key} if key else {},
         )
     if resp.status_code == 404:
@@ -295,17 +302,29 @@ def create_trajectory_router(
         }
 
         # ── AMS: receipts for this session's own ids ──
-        session_ids = [
-            conversation_id,
-            *sorted(
-                {f"goal-queue:{r['goal_id']}" for r in runs if isinstance(r.get("goal_id"), str)}
-            ),
-        ]
+        # ``goal-queue:<goal_id>`` is keyed by a caller-chosen goal id, so its
+        # latest receipt may be another run's (an earlier run, or another user
+        # sharing the AMS bridge key). Keep it only when it names the
+        # continuation of one of this session's own fleet runs.
+        goal_continuations: dict[str, set[str]] = {}
+        for r in runs:
+            if isinstance(r.get("goal_id"), str):
+                ids = goal_continuations.setdefault(f"goal-queue:{r['goal_id']}", set())
+                if isinstance(r.get("continuation_id"), str):
+                    ids.add(r["continuation_id"])
+        lookups: list[tuple[str, str | None]] = [(conversation_id, None)]
+        for session_id in sorted(goal_continuations):
+            # Only fleet runs (with a continuation) can own a goal-queue receipt.
+            lookups += [(session_id, cid) for cid in sorted(goal_continuations[session_id])]
         ams_status = "ok"
         ams_count = 0
-        for session_id in session_ids:
+        for session_id, work_item_id in lookups:
             try:
-                receipt = await fetch_receipt(session_id)
+                receipt = (
+                    await fetch_receipt(session_id, work_item_id=work_item_id)
+                    if work_item_id is not None
+                    else await fetch_receipt(session_id)
+                )
             except LookupError:
                 ams_status = "unconfigured"
                 break
@@ -314,6 +333,10 @@ def create_trajectory_router(
                 ams_status = "unreachable"
                 break
             if receipt is None:
+                continue
+            if work_item_id is not None and not receipt_matches_continuation(
+                receipt, work_item_id
+            ):
                 continue
             entry = normalize_work_receipt(receipt, conversation_id=conversation_id, source="ams")
             if entry is None:
