@@ -323,8 +323,10 @@ async def test_create_session_accepts_application_json(
     assert resp.json()["id"].startswith("conv_")
 
 
+@pytest.mark.parametrize("origin", [None, "http://test"])
 async def test_create_session_accepts_multipart_bundled_create(
     client: httpx.AsyncClient,
+    origin: str | None,
 ) -> None:
     """
     ``POST /v1/sessions`` with ``multipart/form-data`` still bundled-creates.
@@ -340,8 +342,20 @@ async def test_create_session_accepts_multipart_bundled_create(
         "/v1/sessions",
         data={"metadata": json.dumps({})},
         files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+        headers={"Origin": origin} if origin else {},
     )
     assert resp.status_code == 201, resp.text
     # The bundled-create response carries the new session id → multipart
     # routed to the bundled-create branch, not rejected at the gate.
     assert "session_id" in resp.json()
+
+
+async def test_cross_site_multipart_cannot_create_session(client: httpx.AsyncClient) -> None:
+    """A valid bundle submitted by a foreign page must fail before creation."""
+    response = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({})},
+        files={"bundle": ("agent.tar.gz", build_agent_bundle(name="csrf"), "application/gzip")},
+        headers={"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"},
+    )
+    assert response.status_code == 403

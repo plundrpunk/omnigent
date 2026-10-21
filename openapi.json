@@ -1,6 +1,19 @@
 {
   "components": {
     "schemas": {
+      "APIErrorResponse": {
+        "description": "The same envelope used by the application's OmnigentError handler.",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetail"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "APIErrorResponse",
+        "type": "object"
+      },
       "AddCommentRequest": {
         "description": "Request body for ``POST /sessions/{id}/comments``.\n\n:param path: File path relative to workspace root,\n    e.g. ``\"src/App.tsx\"``.\n:param body: The comment text.\n:param start_index: 0-based absolute character offset (inclusive)\n    within the file where the anchor range begins.\n:param end_index: 0-based absolute character offset (exclusive)\n    within the file where the anchor range ends.\n:param anchor_content: Plain-text snapshot of the selected range, used\n    to re-anchor the comment after file edits. ``None`` if not provided.",
         "properties": {
@@ -828,19 +841,6 @@
           "level"
         ],
         "title": "GrantPermissionRequest",
-        "type": "object"
-      },
-      "HTTPValidationError": {
-        "properties": {
-          "detail": {
-            "items": {
-              "$ref": "#/components/schemas/ValidationError"
-            },
-            "title": "Detail",
-            "type": "array"
-          }
-        },
-        "title": "HTTPValidationError",
         "type": "object"
       },
       "HeartbeatEvent": {
@@ -3548,46 +3548,6 @@
         },
         "title": "UsageDetails",
         "type": "object"
-      },
-      "ValidationError": {
-        "properties": {
-          "ctx": {
-            "title": "Context",
-            "type": "object"
-          },
-          "input": {
-            "title": "Input"
-          },
-          "loc": {
-            "items": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "integer"
-                }
-              ]
-            },
-            "title": "Location",
-            "type": "array"
-          },
-          "msg": {
-            "title": "Message",
-            "type": "string"
-          },
-          "type": {
-            "title": "Error Type",
-            "type": "string"
-          }
-        },
-        "required": [
-          "loc",
-          "msg",
-          "type"
-        ],
-        "title": "ValidationError",
-        "type": "object"
       }
     }
   },
@@ -3615,6 +3575,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Version"
@@ -3675,11 +3655,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Health"
@@ -3761,11 +3751,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Builtin Agents",
@@ -3790,6 +3790,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Ams Config",
@@ -3828,11 +3848,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Ams Proxy",
@@ -3869,11 +3899,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Ams Patch",
@@ -3910,11 +3950,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Ams Post",
@@ -3951,11 +4001,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Ams Put",
@@ -4017,11 +4077,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Coding Agents",
@@ -4046,6 +4116,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Acp Agents",
@@ -4096,11 +4186,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Coding Agent",
@@ -4157,11 +4257,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Acp Models",
@@ -4209,11 +4319,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Goals",
@@ -4236,6 +4356,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Start Goal",
@@ -4260,6 +4400,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Goal Config",
@@ -4300,11 +4460,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Goal",
@@ -4355,11 +4525,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Goal Events",
@@ -4390,6 +4570,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Hosts",
@@ -4430,11 +4630,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Host",
@@ -4519,11 +4729,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Host Filesystem Root",
@@ -4617,11 +4837,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Host Filesystem",
@@ -4672,11 +4902,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Launch Runner",
@@ -4713,6 +4953,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Info"
@@ -4730,6 +4990,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Me"
@@ -4751,6 +5031,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Policies",
@@ -4788,11 +5088,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Create Policy",
@@ -4833,11 +5143,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Delete Policy",
@@ -4876,11 +5196,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Policy",
@@ -4929,11 +5259,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Update Policy",
@@ -4958,6 +5298,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Registry",
@@ -4988,6 +5348,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Runners",
@@ -5037,11 +5417,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Runner Status",
@@ -5204,11 +5594,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Sessions",
@@ -5227,6 +5627,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Create Session",
@@ -5273,11 +5693,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Delete Session",
@@ -5332,11 +5762,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Session",
@@ -5381,11 +5821,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Update Session",
@@ -5424,11 +5874,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Session Agent",
@@ -5475,11 +5935,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Update Session Agent",
@@ -5517,11 +5987,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Session Agent Contents",
@@ -5564,11 +6044,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Set Auto Approve",
@@ -5660,11 +6150,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Child Sessions",
@@ -5724,11 +6224,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Comments",
@@ -5777,11 +6287,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Add Comment",
@@ -5832,11 +6352,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Send To Agent",
@@ -5886,11 +6416,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Delete Comment",
@@ -5948,11 +6488,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Update Comment",
@@ -5998,11 +6548,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Elicitation",
@@ -6058,11 +6618,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Resolve Elicitation",
@@ -6109,11 +6679,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Post Event",
@@ -6150,11 +6730,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Codex Elicitation Request Hook",
@@ -6191,11 +6781,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Claude Permission Request Hook",
@@ -6287,11 +6887,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Session Items",
@@ -6330,11 +6940,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Session Labels",
@@ -6371,11 +6991,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Mcp Proxy",
@@ -6412,11 +7042,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Session Owner",
@@ -6453,11 +7093,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Permissions",
@@ -6502,11 +7152,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Grant Permission",
@@ -6547,11 +7207,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Revoke Permission",
@@ -6592,11 +7262,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Policies",
@@ -6645,11 +7325,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Create Policy",
@@ -6686,11 +7376,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Evaluate Policy",
@@ -6740,11 +7440,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Delete Policy",
@@ -6792,11 +7502,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Policy",
@@ -6854,11 +7574,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Update Policy",
@@ -6913,11 +7643,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Session Resources",
@@ -6954,11 +7694,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Session Environments",
@@ -7004,11 +7754,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Session Environment",
@@ -7054,11 +7814,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Environment Filesystem Changes",
@@ -7113,11 +7883,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Read Environment File Diff",
@@ -7218,11 +7998,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Environment Root",
@@ -7277,11 +8067,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Delete Environment Path",
@@ -7389,11 +8189,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Read Or List Environment Path",
@@ -7446,11 +8256,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Edit Environment File",
@@ -7503,11 +8323,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Write Environment File",
@@ -7608,11 +8438,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Search Environment Files",
@@ -7658,11 +8498,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Run Environment Shell",
@@ -7754,11 +8604,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Session Files",
@@ -7803,11 +8663,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Upload Session File",
@@ -7853,11 +8723,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Delete Session File",
@@ -7901,11 +8781,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Session File",
@@ -7951,11 +8841,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Session File Content",
@@ -7992,11 +8892,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "List Session Terminals",
@@ -8031,11 +8941,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Create Session Terminal",
@@ -8081,11 +9001,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Delete Session Terminal",
@@ -8129,11 +9059,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Session Terminal",
@@ -8179,11 +9119,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Transfer Session Terminal",
@@ -8229,11 +9179,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Get Session Resource",
@@ -8285,11 +9245,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Stream Session",
@@ -8336,11 +9306,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Switch Session Agent",
@@ -8387,11 +9367,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "$ref": "#/components/schemas/APIErrorResponse"
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Invalid request"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/APIErrorResponse"
+                }
+              }
+            },
+            "description": "API error"
           }
         },
         "summary": "Fork Session",
