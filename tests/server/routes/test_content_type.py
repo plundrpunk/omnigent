@@ -136,3 +136,43 @@ def test_require_json_or_multipart_rejects_other_types(content_type: str | None)
     with pytest.raises(HTTPException) as exc_info:
         require_json_or_multipart_content_type(_request_with_content_type(content_type))
     assert exc_info.value.status_code == 415
+
+
+@pytest.mark.parametrize(
+    "headers,allowed",
+    [
+        ({}, True),  # SDK / CLI, no browser headers
+        ({"origin": "http://test"}, True),
+        ({"origin": "http://TEST:80"}, True),
+        ({"origin": "https://evil.example"}, False),
+        ({"origin": "http://test.evil.example"}, False),
+        ({"origin": "http://test:8000"}, False),
+        ({"origin": "https://test"}, False),
+        ({"origin": "null"}, False),
+        ({"origin": ""}, False),
+        ({"origin": "http://["}, False),
+        ({"sec-fetch-site": "cross-site"}, False),
+        ({"sec-fetch-site": "same-site"}, False),
+        ({"sec-fetch-site": "same-origin"}, True),
+    ],
+)
+def test_multipart_csrf_origin(headers: dict[str, str], allowed: bool) -> None:
+    """Browser multipart uploads require the same origin, before reading a body."""
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/sessions",
+            "server": ("test", 80),
+            "query_string": b"",
+            "headers": [(b"content-type", b"multipart/form-data; boundary=test")]
+            + [(key.encode(), value.encode()) for key, value in headers.items()],
+        }
+    )
+    if allowed:
+        require_json_or_multipart_content_type(request)
+    else:
+        with pytest.raises(HTTPException) as exc_info:
+            require_json_or_multipart_content_type(request)
+        assert exc_info.value.status_code == 403

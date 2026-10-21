@@ -681,9 +681,9 @@ async def test_managed_session_create_validator_errors_serialize_as_422(
 ) -> None:
     """
     A model_validator rejection (here: a path workspace on a managed
-    create) reaches the client as a REAL 422 whose ``detail[0].msg``
-    carries the message — the shape the web UI's describeCreateError
-    renders. Regression guard: ``exc.errors()`` used to embed the raw
+    create) reaches the client as a REAL 422 whose ``error.message``
+    carries the reason rendered by the web UI's describeCreateError.
+    Regression guard: ``exc.errors()`` used to embed the raw
     ``ValueError`` in ``ctx``, which JSONResponse cannot serialize, so
     every validator 422 on this route 500'd as ``internal_error``.
     """
@@ -692,11 +692,9 @@ async def test_managed_session_create_validator_errors_serialize_as_422(
         json={"agent_id": "ag_x", "host_type": "managed", "workspace": "/tmp/w"},
     )
     assert resp.status_code == 422, resp.text
-    detail = resp.json()["detail"]
-    # The list-of-errors shape with a human-readable msg is what
-    # describeCreateError picks the message from.
-    assert isinstance(detail, list) and len(detail) == 1
-    assert "takes a git repository URL" in detail[0]["msg"]
+    error = resp.json()["error"]
+    assert error["code"] == "invalid_input"
+    assert "takes a git repository URL" in error["message"]
 
 
 async def test_managed_session_create_without_config_fails_clearly(

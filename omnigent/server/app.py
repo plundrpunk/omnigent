@@ -33,6 +33,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.server.api_errors import register_api_error_handlers
 from omnigent.server.auth import AuthProvider
 from omnigent.server.managed_hosts import ManagedSandboxConfig
 from omnigent.server.mcp_pool import ServerMcpPool
@@ -966,6 +967,7 @@ def create_app(
             await _mcp_pool.shutdown_all()
 
     app = FastAPI(title="Automaton OS Server", lifespan=_lifespan)
+    register_api_error_handlers(app)
     from omnigent.runtime import telemetry
 
     telemetry.instrument_fastapi_app(app)
@@ -1892,6 +1894,10 @@ class _SPAStaticFiles(StaticFiles):
         await super().__call__(scope, receive, send)
 
     async def get_response(self, path: str, scope: Scope) -> Response:  # type: ignore[override]
+        # Unmatched API requests must never resolve to a bundled asset or
+        # the SPA shell, even when the UI build contains a v1 directory.
+        if path == "v1" or path.startswith("v1/"):
+            raise StarletteHTTPException(status_code=404, detail="Not Found")
         served_path = path
         try:
             response = await super().get_response(path, scope)
