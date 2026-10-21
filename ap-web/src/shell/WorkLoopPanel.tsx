@@ -14,7 +14,13 @@ import {
 
 import { Button } from "@/components/ui/button";
 import type { AnyBlock } from "@/lib/blocks";
-import { failedACheck, finished, needsYourOK, pausedForInput, proofOfWhatWasDone } from "@/lib/copy";
+import {
+  failedACheck,
+  finished,
+  needsYourOK,
+  pausedForInput,
+  proofOfWhatWasDone,
+} from "@/lib/copy";
 import { checkpointResumeCommand, type GoalRun } from "@/lib/goal";
 import { Link } from "@/lib/routing";
 import type { SessionStatus } from "@/lib/types";
@@ -447,76 +453,71 @@ function GoalRunCard({ run }: { run: GoalRun }) {
   const resume = checkpointResumeCommand(run.checkpoint);
   return (
     <>
-            <div
-              data-testid="goal-run-card"
-              className="rounded-md border border-border/70 p-2.5"
-            >
-              <div className="flex items-center justify-between gap-2">
-                <span className="truncate font-mono text-xs text-foreground" title={run.goal_id}>
-                  {run.goal_id}
-                </span>
-                <span
-                  className={cn(
-                    "inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
-                    meta.tone,
-                  )}
-                >
-                  {meta.spinning && <LoaderCircleIcon className="size-3 animate-spin" />}
-                  {meta.label}
-                </span>
-              </div>
-              <p className="mt-1 font-mono text-[10px] text-muted-foreground">
-                {goalExitLabel(run.exit_code)}
-                {run.provider ? ` · ${run.provider}` : ""}
-                {run.finished_at ? ` · finished ${run.finished_at}` : ""}
-              </p>
-              {run.error && (
-                <p className="mt-1.5 text-[11px] leading-4 text-destructive">{run.error}</p>
-              )}
-              {run.blocker_md && (
-                <div className="mt-1.5">
-                  <p className="text-[10px] font-medium uppercase tracking-wide text-destructive">
-                    Blocker (verbatim)
-                  </p>
-                  <pre className="mt-1 overflow-x-auto rounded bg-muted/40 p-2 font-mono text-[10px] leading-4 whitespace-pre-wrap text-foreground/90">
-                    {clipArtifact(run.blocker_md)}
-                  </pre>
-                </div>
-              )}
-              {run.status === "paused" && (
-                <div className="mt-1.5">
-                  <p className="text-[10px] font-medium uppercase tracking-wide text-warning">
-                    Resume command
-                  </p>
-                  <pre className="mt-1 overflow-x-auto rounded bg-muted/40 p-2 font-mono text-[10px] leading-4 whitespace-pre-wrap text-foreground/90">
-                    {resume ?? clipArtifact(run.checkpoint ?? "checkpoint.json not reported")}
-                  </pre>
-                </div>
-              )}
-              {run.outcome && (
-                <details className="mt-1.5">
-                  <summary className="cursor-pointer text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                    goal-outcome.json
-                  </summary>
-                  <pre className="mt-1 max-h-48 overflow-auto rounded bg-muted/40 p-2 font-mono text-[10px] leading-4 whitespace-pre-wrap text-foreground/90">
-                    {clipArtifact(JSON.stringify(run.outcome, null, 2), 2000)}
-                  </pre>
-                </details>
-              )}
-              <button
-                type="button"
-                data-testid="goal-run-detail-toggle"
-                onClick={() => setShowDetail((open) => !open)}
-                className="mt-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground"
-              >
-                {showDetail ? "Hide run detail" : "Show run detail"}
-              </button>
-              {showDetail && (
-                <div className="mt-1.5">
-                  <GoalRunEvents events={events} />
-                </div>
-              )}
-            </div>
+      <div data-testid="goal-run-card" className="rounded-md border border-border/70 p-2.5">
+        <div className="flex items-center justify-between gap-2">
+          <span className="truncate font-mono text-xs text-foreground" title={run.goal_id}>
+            {run.goal_id}
+          </span>
+          <span
+            className={cn(
+              "inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+              meta.tone,
+            )}
+          >
+            {meta.spinning && <LoaderCircleIcon className="size-3 animate-spin" />}
+            {meta.label}
+          </span>
+        </div>
+        <p className="mt-1 font-mono text-[10px] text-muted-foreground">
+          {goalExitLabel(run.exit_code)}
+          {run.provider ? ` · ${run.provider}` : ""}
+          {run.finished_at ? ` · finished ${run.finished_at}` : ""}
+        </p>
+        {run.error && <p className="mt-1.5 text-[11px] leading-4 text-destructive">{run.error}</p>}
+        {run.blocker_md && (
+          <div className="mt-1.5">
+            <p className="text-[10px] font-medium uppercase tracking-wide text-destructive">
+              Blocker (verbatim)
+            </p>
+            <pre className="mt-1 overflow-x-auto rounded bg-muted/40 p-2 font-mono text-[10px] leading-4 whitespace-pre-wrap text-foreground/90">
+              {clipArtifact(run.blocker_md)}
+            </pre>
+          </div>
+        )}
+        {run.status === "paused" && (
+          <div className="mt-1.5">
+            <p className="text-[10px] font-medium uppercase tracking-wide text-warning">
+              Resume command
+            </p>
+            <pre className="mt-1 overflow-x-auto rounded bg-muted/40 p-2 font-mono text-[10px] leading-4 whitespace-pre-wrap text-foreground/90">
+              {resume ?? clipArtifact(run.checkpoint ?? "checkpoint.json not reported")}
+            </pre>
+          </div>
+        )}
+        {run.outcome && (
+          <details className="mt-1.5">
+            <summary className="cursor-pointer text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              goal-outcome.json
+            </summary>
+            <pre className="mt-1 max-h-48 overflow-auto rounded bg-muted/40 p-2 font-mono text-[10px] leading-4 whitespace-pre-wrap text-foreground/90">
+              {clipArtifact(JSON.stringify(run.outcome, null, 2), 2000)}
+            </pre>
+          </details>
+        )}
+        <button
+          type="button"
+          data-testid="goal-run-detail-toggle"
+          onClick={() => setShowDetail((open) => !open)}
+          className="mt-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground"
+        >
+          {showDetail ? "Hide run detail" : "Show run detail"}
+        </button>
+        {showDetail && (
+          <div className="mt-1.5">
+            <GoalRunEvents events={events} />
+          </div>
+        )}
+      </div>
     </>
   );
 }
@@ -632,7 +633,9 @@ export function WorkLoopPanel({
             </span>
             <div className="min-w-0">
               <h2 className="text-sm font-semibold text-foreground">Work Loop</h2>
-              <p className="text-xs text-muted-foreground">Objective → run → verify → {proofOfWhatWasDone}</p>
+              <p className="text-xs text-muted-foreground">
+                Objective → run → verify → {proofOfWhatWasDone}
+              </p>
             </div>
           </div>
           <span

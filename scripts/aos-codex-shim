@@ -37,6 +37,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 # Models that the ChatGPT-account codex actually accepts. Anything else
@@ -62,6 +63,8 @@ def split_model(raw: str) -> tuple[str, str]:
     if sep and effort in VALID_EFFORTS:
         return (model or DEFAULT_MODEL), effort
     return raw, DEFAULT_EFFORT
+
+
 TIMEOUT = float(os.environ.get("AOS_SHIM_TIMEOUT", "600"))
 CODEX_BIN = os.environ.get("CODEX_BIN", "codex")
 
@@ -142,17 +145,16 @@ def main() -> int:
     except OSError:
         pass
     finally:
-        try:
+        with suppress(OSError):
             os.unlink(out_path)
-        except OSError:
-            pass
 
     if not text:
         # Never fabricate a completion. An empty answer is an error, and
         # the harness must see it as one.
         tail = (completed.stderr or completed.stdout or "").strip()[-800:]
-        print(f"shim: codex produced no message (rc={completed.returncode})\n{tail}",
-              file=sys.stderr)
+        print(
+            f"shim: codex produced no message (rc={completed.returncode})\n{tail}", file=sys.stderr
+        )
         return 4
 
     sys.stdout.write(text)

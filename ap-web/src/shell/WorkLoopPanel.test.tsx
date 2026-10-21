@@ -306,7 +306,9 @@ describe("GoalRunsSection", () => {
   it("preserves the null exit label and shows the raw checkpoint when no resume command is parseable", () => {
     render(
       <GoalRunsSection
-        runs={[{ ...baseRun, run_id: "r-4", status: "paused", exit_code: null, checkpoint: "raw text" }]}
+        runs={[
+          { ...baseRun, run_id: "r-4", status: "paused", exit_code: null, checkpoint: "raw text" },
+        ]}
       />,
     );
     expect(screen.getByText(/exit — · codex/)).toBeInTheDocument();

@@ -267,11 +267,7 @@ export function ModelsPage() {
       {error && (
         <div className="mb-3 flex items-center justify-between gap-3 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           <span>{error}</span>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setRefreshKey((k) => k + 1)}
-          >
+          <Button variant="outline" size="sm" onClick={() => setRefreshKey((k) => k + 1)}>
             Retry
           </Button>
         </div>
@@ -455,9 +451,7 @@ export function ModelsPage() {
                   ? "Saving — waiting for AMS to confirm…"
                   : "Applies immediately via PUT role-mappings; the diagram redraws from AMS-confirmed state only."}
               </p>
-              {saveError && (
-                <p className="mt-2 text-xs text-destructive">{saveError}</p>
-              )}
+              {saveError && <p className="mt-2 text-xs text-destructive">{saveError}</p>}
             </div>
           )}
 
@@ -493,9 +487,9 @@ export function ModelsPage() {
               Fleet teams → models
             </h2>
             <p className="text-xs text-muted-foreground">
-              Each team lead runs on its hand&apos;s default model. Assigning
-              here edits the hand&apos;s HAND.toml and restarts its container —
-              the change is load-bearing, not a display value.
+              Each team lead runs on its hand&apos;s default model. Assigning here edits the
+              hand&apos;s HAND.toml and restarts its container — the change is load-bearing, not a
+              display value.
             </p>
             {fleetNotice && (
               <p className="rounded-lg border border-primary/40 bg-primary/5 px-3 py-2 text-xs">
@@ -615,8 +609,8 @@ export function ModelsPage() {
               CLI agents on this host
             </h2>
             <p className="text-xs text-muted-foreground">
-              Locally installed coding CLIs. Their models feed the fleet
-              picker above; plan-backed CLIs run at no per-token cost.
+              Locally installed coding CLIs. Their models feed the fleet picker above; plan-backed
+              CLIs run at no per-token cost.
             </p>
             {cliAgents === null ? (
               <div className="flex items-center gap-2 py-4 text-muted-foreground">
@@ -625,10 +619,7 @@ export function ModelsPage() {
             ) : (
               <div className="grid gap-3 md:grid-cols-3">
                 {cliAgents.map((a) => (
-                  <div
-                    key={a.key}
-                    className="rounded-xl border border-border bg-card p-4"
-                  >
+                  <div key={a.key} className="rounded-xl border border-border bg-card p-4">
                     <div className="flex items-center justify-between gap-2">
                       <span className="truncate text-sm font-semibold">
                         {a.display_name ?? a.key}

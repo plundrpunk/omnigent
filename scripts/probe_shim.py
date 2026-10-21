@@ -6,6 +6,7 @@ payload gone. That is either an output-size limit somewhere in the codex
 path, or a JSON-assembly bug in the shim. This asks for a response of a
 known large size and reports exactly what comes back.
 """
+
 import json
 import subprocess
 import sys
@@ -50,7 +51,7 @@ print()
 
 try:
     obj = json.loads(out)
-except Exception as exc:
+except json.JSONDecodeError as exc:
     print(f"NOT VALID JSON  : {exc}")
     print("=> response was cut off mid-structure (size limit)")
     sys.exit(2)

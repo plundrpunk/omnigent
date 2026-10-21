@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """Dump the first N tool results in full so we can see why the executor stalled."""
-import json, sys
+
+import json
+import sys
 
 path = sys.argv[1]
 limit = int(sys.argv[2]) if len(sys.argv) > 2 else 6
-d = json.load(open(path))
+with open(path) as source:
+    d = json.load(source)
+
 
 def content_of(e):
     p = e.get("payload")
     if isinstance(p, dict) and "content" in p:
         return p["content"]
     return e.get("content")
+
 
 shown = 0
 for i, e in enumerate(d.get("events", [])):
@@ -19,7 +24,7 @@ for i, e in enumerate(d.get("events", [])):
         continue
     try:
         p = json.loads(c)
-    except Exception:
+    except json.JSONDecodeError:
         continue
     if not isinstance(p, dict) or "tool" not in p:
         continue

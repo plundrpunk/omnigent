@@ -32,19 +32,65 @@ interface Registry {
 }
 
 const REGISTRIES: Registry[] = [
-  { id: "agents", label: "Agents", blurb: "who's in the fleet", path: "/v1/ams/api/warden/agents", Icon: BotIcon },
-  { id: "skills", label: "Skills", blurb: "what they know how to do", path: "/v1/ams/api/v1/skills", Icon: SparklesIcon },
-  { id: "schedules", label: "Schedules", blurb: "what runs on its own", path: "/v1/ams/api/v1/schedules", Icon: CalendarClockIcon },
-  { id: "automata", label: routines, blurb: "reusable building blocks", path: "/v1/ams/api/v1/automata/", Icon: CogIcon },
-  { id: "goals", label: "Goals", blurb: "what we're working toward", path: "/v1/ams/api/v1/goals/dashboard", Icon: TargetIcon },
-  { id: "mcp", label: connectedApps, blurb: "connected tools", path: "/v1/ams/api/v1/mcp-servers", Icon: PlugIcon },
+  {
+    id: "agents",
+    label: "Agents",
+    blurb: "who's in the fleet",
+    path: "/v1/ams/api/warden/agents",
+    Icon: BotIcon,
+  },
+  {
+    id: "skills",
+    label: "Skills",
+    blurb: "what they know how to do",
+    path: "/v1/ams/api/v1/skills",
+    Icon: SparklesIcon,
+  },
+  {
+    id: "schedules",
+    label: "Schedules",
+    blurb: "what runs on its own",
+    path: "/v1/ams/api/v1/schedules",
+    Icon: CalendarClockIcon,
+  },
+  {
+    id: "automata",
+    label: routines,
+    blurb: "reusable building blocks",
+    path: "/v1/ams/api/v1/automata/",
+    Icon: CogIcon,
+  },
+  {
+    id: "goals",
+    label: "Goals",
+    blurb: "what we're working toward",
+    path: "/v1/ams/api/v1/goals/dashboard",
+    Icon: TargetIcon,
+  },
+  {
+    id: "mcp",
+    label: connectedApps,
+    blurb: "connected tools",
+    path: "/v1/ams/api/v1/mcp-servers",
+    Icon: PlugIcon,
+  },
 ];
 
 function extractRows(payload: unknown): Record<string, unknown>[] {
   if (Array.isArray(payload)) return payload as Record<string, unknown>[];
   if (payload && typeof payload === "object") {
     const obj = payload as Record<string, unknown>;
-    for (const key of ["data", "items", "results", "agents", "skills", "schedules", "automata", "goals", "servers"]) {
+    for (const key of [
+      "data",
+      "items",
+      "results",
+      "agents",
+      "skills",
+      "schedules",
+      "automata",
+      "goals",
+      "servers",
+    ]) {
       if (Array.isArray(obj[key])) return obj[key] as Record<string, unknown>[];
     }
     const arrays = Object.values(obj).filter(Array.isArray) as Record<string, unknown>[][];
@@ -54,7 +100,18 @@ function extractRows(payload: unknown): Record<string, unknown>[] {
 }
 
 function chooseColumns(rows: Record<string, unknown>[], max = 5): string[] {
-  const preferred = ["name", "agent_name", "title", "slug", "status", "alive", "last_heartbeat", "context_pct", "description", "cron_expression"];
+  const preferred = [
+    "name",
+    "agent_name",
+    "title",
+    "slug",
+    "status",
+    "alive",
+    "last_heartbeat",
+    "context_pct",
+    "description",
+    "cron_expression",
+  ];
   const seen = new Set<string>();
   for (const row of rows.slice(0, 20)) {
     for (const [k, v] of Object.entries(row)) {
@@ -63,7 +120,10 @@ function chooseColumns(rows: Record<string, unknown>[], max = 5): string[] {
       if (t === "string" || t === "number" || t === "boolean") seen.add(k);
     }
   }
-  return [...preferred.filter((k) => seen.has(k)), ...[...seen].filter((k) => !preferred.includes(k))].slice(0, max);
+  return [
+    ...preferred.filter((k) => seen.has(k)),
+    ...[...seen].filter((k) => !preferred.includes(k)),
+  ].slice(0, max);
 }
 
 function columnLabel(column: string): string {
@@ -87,7 +147,9 @@ function formatCell(value: unknown, column: string): string {
         ? Number(value)
         : Number.NaN;
   if (Number.isFinite(numericValue)) {
-    return Number.isInteger(numericValue) ? String(numericValue) : String(Math.round(numericValue * 10) / 10);
+    return Number.isInteger(numericValue)
+      ? String(numericValue)
+      : String(Math.round(numericValue * 10) / 10);
   }
   const s = String(value);
   return s.length > 100 ? `${s.slice(0, 97)}…` : s;
@@ -206,7 +268,12 @@ function DrillIn({ registry, onBack }: { registry: Registry; onBack: () => void 
 
       {pageCount > 1 && (
         <div className="flex flex-wrap items-center gap-1">
-          <Button variant="outline" size="sm" disabled={page === 0} onClick={() => setPage((p) => p - 1)}>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={page === 0}
+            onClick={() => setPage((p) => p - 1)}
+          >
             ←
           </Button>
           {Array.from({ length: pageCount }, (_, i) => (
@@ -259,7 +326,10 @@ function DrillIn({ registry, onBack }: { registry: Registry; onBack: () => void 
             <thead>
               <tr className="border-b border-border bg-card text-left">
                 {columns.map((col) => (
-                  <th key={col} className="whitespace-nowrap px-3 py-2 font-medium text-muted-foreground">
+                  <th
+                    key={col}
+                    className="whitespace-nowrap px-3 py-2 font-medium text-muted-foreground"
+                  >
                     {columnLabel(col)}
                   </th>
                 ))}

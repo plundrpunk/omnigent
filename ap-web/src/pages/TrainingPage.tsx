@@ -54,9 +54,7 @@ export function TrainingPage() {
 
   const summary = stats?.summary;
   const categories = [...(stats?.categories ?? [])].sort((a, b) =>
-    worstFirst
-      ? a.avg_success_rate - b.avg_success_rate
-      : b.total_executions - a.total_executions,
+    worstFirst ? a.avg_success_rate - b.avg_success_rate : b.total_executions - a.total_executions,
   );
   // Sub-50% categories, worst first — surfaced without any expanding.
   const needsAttention = [...(stats?.categories ?? [])]
@@ -109,7 +107,10 @@ export function TrainingPage() {
                 { label: `${run}s recorded`, value: summary.total_executions.toLocaleString() },
                 { label: routines, value: String(summary.total_automata) },
               ].map((c) => (
-                <div key={c.label} className="rounded-xl border border-border bg-card p-5 text-center">
+                <div
+                  key={c.label}
+                  className="rounded-xl border border-border bg-card p-5 text-center"
+                >
                   <div className="text-3xl font-semibold tabular-nums">{c.value}</div>
                   <div className="mt-1 text-xs text-muted-foreground">{c.label}</div>
                 </div>
@@ -119,9 +120,7 @@ export function TrainingPage() {
 
           {needsAttention.length > 0 && (
             <div className="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm">
-              <span className="font-semibold text-destructive">
-                Needs attention (below 50%):
-              </span>{" "}
+              <span className="font-semibold text-destructive">Needs attention (below 50%):</span>{" "}
               {needsAttention.map((c) => (
                 <Badge key={c.category} variant="destructive" className="mr-1">
                   {c.category} {pct(c.avg_success_rate)}
@@ -137,10 +136,7 @@ export function TrainingPage() {
                 {worstFirst ? "Sort by volume" : "Worst first"}
               </Button>
             </div>
-            <svg
-              viewBox={`0 0 640 ${categories.length * 30 + 8}`}
-              className="h-auto w-full"
-            >
+            <svg viewBox={`0 0 640 ${categories.length * 30 + 8}`} className="h-auto w-full">
               {categories.map((c, i) => {
                 const y = i * 30 + 4;
                 const w = Math.max(4, c.avg_success_rate * 380);
@@ -152,12 +148,21 @@ export function TrainingPage() {
                       : "fill-destructive/80";
                 return (
                   <g key={c.category}>
-                    <text x={148} y={y + 15} textAnchor="end" className="fill-foreground text-[12px]">
+                    <text
+                      x={148}
+                      y={y + 15}
+                      textAnchor="end"
+                      className="fill-foreground text-[12px]"
+                    >
                       {c.category}
                     </text>
                     <rect x={160} y={y + 4} width={380} height={14} rx={7} className="fill-muted" />
                     <rect x={160} y={y + 4} width={w} height={14} rx={7} className={color} />
-                    <text x={550} y={y + 15} className="fill-muted-foreground text-[11px] tabular-nums">
+                    <text
+                      x={550}
+                      y={y + 15}
+                      className="fill-muted-foreground text-[11px] tabular-nums"
+                    >
                       {pct(c.avg_success_rate)}
                     </text>
                     {c.avg_ci_width != null && c.avg_ci_width > 0 && (
@@ -186,11 +191,13 @@ export function TrainingPage() {
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-border bg-card text-left">
-                      {["category", routines, "successes", `${run}s`, "avg duration", ""].map((h) => (
-                        <th key={h} className="px-3 py-2 font-medium text-muted-foreground">
-                          {h}
-                        </th>
-                      ))}
+                      {["category", routines, "successes", `${run}s`, "avg duration", ""].map(
+                        (h) => (
+                          <th key={h} className="px-3 py-2 font-medium text-muted-foreground">
+                            {h}
+                          </th>
+                        ),
+                      )}
                     </tr>
                   </thead>
                   <tbody>
@@ -198,13 +205,19 @@ export function TrainingPage() {
                       <tr key={c.category} className="border-b border-border/50 last:border-0">
                         <td className="px-3 py-2 font-medium">{c.category}</td>
                         <td className="px-3 py-2 tabular-nums">{c.automata_count}</td>
-                        <td className="px-3 py-2 tabular-nums">{c.total_successes.toLocaleString()}</td>
-                        <td className="px-3 py-2 tabular-nums">{c.total_executions.toLocaleString()}</td>
+                        <td className="px-3 py-2 tabular-nums">
+                          {c.total_successes.toLocaleString()}
+                        </td>
+                        <td className="px-3 py-2 tabular-nums">
+                          {c.total_executions.toLocaleString()}
+                        </td>
                         <td className="px-3 py-2 tabular-nums">
                           {c.avg_duration_ms != null ? `${Math.round(c.avg_duration_ms)}ms` : "—"}
                         </td>
                         <td className="px-3 py-2">
-                          {c.avg_success_rate < 0.5 && <Badge variant="destructive">needs attention</Badge>}
+                          {c.avg_success_rate < 0.5 && (
+                            <Badge variant="destructive">needs attention</Badge>
+                          )}
                         </td>
                       </tr>
                     ))}
@@ -213,7 +226,8 @@ export function TrainingPage() {
               </div>
             )}
             <p className="mt-3 text-xs text-muted-foreground">
-              Each promotion {stopsIfCheckFails} and {needsYourOK} — {proofOfWhatWasDone}, not vibes.
+              Each promotion {stopsIfCheckFails} and {needsYourOK} — {proofOfWhatWasDone}, not
+              vibes.
             </p>
           </div>
         </div>

@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """Show what the executor actually emitted, so we can see why `done` never lands."""
-import json, sys, re
+
+import json
+import sys
 
 path = sys.argv[1]
-d = json.load(open(path))
+with open(path) as source:
+    d = json.load(source)
 ev = d.get("events", [])
 print(f"events: {len(ev)}")
 print(f"artifact status: {d.get('status')}")
 print()
+
 
 def content_of(e):
     p = e.get("payload")
     if isinstance(p, dict) and "content" in p:
         return p["content"]
     return e.get("content")
+
 
 for i, e in enumerate(ev):
     c = content_of(e)
@@ -24,7 +29,7 @@ for i, e in enumerate(ev):
         continue
     try:
         parsed = json.loads(s)
-    except Exception:
+    except json.JSONDecodeError:
         continue
     if not isinstance(parsed, dict):
         continue

@@ -278,9 +278,7 @@ export function ApprovalCard({
         className="size-3.5 accent-primary"
       />
       Accept all future requests in this session
-      {autoApproveError ? (
-        <span className="text-destructive">({autoApproveError})</span>
-      ) : null}
+      {autoApproveError ? <span className="text-destructive">({autoApproveError})</span> : null}
     </label>
   ) : null;
   const binaryButtons = (

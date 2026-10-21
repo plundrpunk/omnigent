@@ -46,13 +46,8 @@ export interface GoalEventPage {
  * @returns the page, or `null` when the bridge is unconfigured (503) --
  *   callers must render that as absence, not as "no events".
  */
-export async function fetchGoalEvents(
-  runId: string,
-  since = 0,
-): Promise<GoalEventPage | null> {
-  const resp = await hostFetch(
-    `/v1/goal/${encodeURIComponent(runId)}/events?since=${since}`,
-  );
+export async function fetchGoalEvents(runId: string, since = 0): Promise<GoalEventPage | null> {
+  const resp = await hostFetch(`/v1/goal/${encodeURIComponent(runId)}/events?since=${since}`);
   if (resp.status === 503) return null;
   if (!resp.ok) throw new Error(`goal bridge answered HTTP ${resp.status}`);
   const body: unknown = await resp.json().catch(() => null);
