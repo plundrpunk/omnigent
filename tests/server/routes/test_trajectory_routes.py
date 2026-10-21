@@ -69,10 +69,16 @@ class _FakeAms:
     def __init__(self) -> None:
         self.receipts: dict[str, dict[str, Any]] = {}
         self.calls: list[str] = []
+        self.work_items: list[str | None] = []
         self.fail = False
 
-    async def __call__(self, session_id: str) -> dict[str, Any] | None:
+    async def __call__(
+        self, session_id: str, work_item_id: str | None = None
+    ) -> dict[str, Any] | None:
+        # Behaves like an AMS build without work_item_id support: the
+        # session's latest receipt comes back whatever work item was asked.
         self.calls.append(session_id)
+        self.work_items.append(work_item_id)
         if self.fail:
             raise RuntimeError("AMS down")
         return self.receipts.get(session_id)
@@ -204,6 +210,8 @@ def seeded(
                 "goal_id": goal,
                 "conversation_id": conv,
                 "owner": owner,
+                # goal-queue receipts are joined to a run by its continuation.
+                "continuation_id": "wi-1",
                 "status": "completed",
                 "exit_code": 0,
                 "started_at": "2026-10-21T10:00:00+00:00",
@@ -305,6 +313,33 @@ async def test_receipts_for_unmapped_ams_user_are_dropped(
     owners = {e["owner"] for e in body["entries"] if e["owner"]}
     assert owners == {"drew"}
     assert body["scope"]["dropped"] >= 1
+
+
+async def test_goal_queue_receipt_for_another_continuation_is_dropped(
+    client: httpx.AsyncClient, seeded: dict[str, str], fake_ams: _FakeAms
+) -> None:
+    """``goal-queue:<goal_id>`` is keyed by a caller-chosen id.
+
+    Another user sharing the AMS bridge key (same mapped AMS owner) can run
+    the same goal id; their receipt is the session's "latest" but names a
+    different continuation, so it must not join this session's timeline.
+    """
+    fake_ams.receipts["goal-queue:g-1"] = _receipt(
+        OTHER_RECEIPT_ID, "drew", "goal-queue:g-1", entered_by="carol"
+    ) | {"work_item_id": "cont-carol", "continuation_id": "cont-carol"}
+    resp = await client.get(f"/v1/trajectory/{seeded['alice']}", headers={"X-Test-User": ALICE})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "goal-queue:g-1" in fake_ams.calls
+    assert "wi-1" in fake_ams.work_items  # the lookup is pinned to the run
+    assert OTHER_RECEIPT_ID not in json.dumps(body["entries"])
+    assert "carol" not in json.dumps(body)
+    assert body["sources"]["ams"]["count"] == 0
+    link = await client.get(
+        f"/v1/trajectory/{seeded['alice']}/receipts/{OTHER_RECEIPT_ID}",
+        headers={"X-Test-User": ALICE},
+    )
+    assert link.status_code == 404
 
 
 async def test_goal_filter_narrows_to_goal_entries(

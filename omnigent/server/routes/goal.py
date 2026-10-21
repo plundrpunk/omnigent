@@ -545,6 +545,43 @@ async def _enqueue_fleet_goal(
     }
 
 
+#: AMS ``complete_continuation`` appends ``\n\n---\n**Outcome:** <summary>``
+#: to ``handoff_notes``; it has no separate summary field.
+_OUTCOME_MARKER = "**Outcome:**"
+_SUMMARY_CAP_CHARS = 2000
+
+
+def _continuation_summary(continuation: Mapping[str, Any]) -> str | None:
+    """The runner's completion summary, quoted verbatim from AMS.
+
+    Prefers an explicit ``summary`` field; otherwise the last ``**Outcome:**``
+    block AMS appended to ``handoff_notes``. ``None`` when AMS has neither.
+    """
+    explicit = continuation.get("summary")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit[:_SUMMARY_CAP_CHARS]
+    notes = continuation.get("handoff_notes")
+    if not isinstance(notes, str) or _OUTCOME_MARKER not in notes:
+        return None
+    tail = notes.rsplit(_OUTCOME_MARKER, 1)[1].strip()
+    return tail[:_SUMMARY_CAP_CHARS] or None
+
+
+def receipt_matches_continuation(receipt: Any, continuation_id: Any) -> bool:
+    """Whether a work receipt was written for exactly this continuation.
+
+    ``goal-queue:<goal_id>`` session ids are keyed by a caller-chosen goal id,
+    so the latest receipt for that session can belong to an earlier run, or
+    to another Omnigent user who shares the AMS bridge key. Only a receipt
+    naming the run's own continuation is that run's evidence.
+    """
+    if not isinstance(receipt, Mapping) or not isinstance(continuation_id, str):
+        return False
+    if not continuation_id:
+        return False
+    return continuation_id in (receipt.get("continuation_id"), receipt.get("work_item_id"))
+
+
 async def _refresh_fleet_goal(run: dict[str, Any]) -> None:
     continuation = await _fleet_request(
         "GET", f"continuations/{quote(run['continuation_id'], safe='')}"
@@ -555,15 +592,22 @@ async def _refresh_fleet_goal(run: dict[str, Any]) -> None:
         "in_progress": "running",
         "completed": "completed",
         "failed": "blocked",
+        # AMS expired the continuation before any runner claimed it.
+        "expired": "error",
     }
     state = continuation.get("status") if isinstance(continuation, dict) else None
     if not isinstance(state, str) or state not in statuses:
         raise HTTPException(status_code=502, detail="AMS returned an unknown continuation status")
     run.update(
         status=statuses[state],
-        summary=continuation.get("summary"),
+        summary=_continuation_summary(continuation),
         outcome=continuation.get("outcome"),
         finished_at=continuation.get("completed_at"),
+        error=(
+            "AMS expired the goal continuation before a fleet runner claimed it"
+            if state == "expired"
+            else None
+        ),
     )
     # Receipts are supporting evidence, never the authority for run status.
     try:
@@ -573,11 +617,16 @@ async def _refresh_fleet_goal(run: dict[str, Any]) -> None:
             params={
                 "session_id": f"goal-queue:{run['goal_id']}",
                 "project": run["project"],
+                # Pins the lookup to this run on AMS builds that support it;
+                # older builds ignore it and the match check below decides.
+                "work_item_id": run["continuation_id"],
             },
         )
     except HTTPException:
         receipt = None
-    run["work_receipt"] = receipt or None
+    run["work_receipt"] = (
+        receipt if receipt_matches_continuation(receipt, run["continuation_id"]) else None
+    )
 
 
 async def _execute_goal_run(run: dict[str, Any]) -> None:
