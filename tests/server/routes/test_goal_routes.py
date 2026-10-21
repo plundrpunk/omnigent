@@ -10,7 +10,6 @@ in failure cases to prove the route never infers success from prose.
 from __future__ import annotations
 
 import asyncio
-import json
 import stat
 from pathlib import Path
 
@@ -90,7 +89,8 @@ async def test_unconfigured_answers_503(
     for method, url in (("post", "/v1/goal"), ("get", "/v1/goal"), ("get", "/v1/goal/x")):
         resp = await getattr(client, method)(url, **({"json": {}} if method == "post" else {}))
         assert resp.status_code == 503
-        assert "HA_AUTOMATON_BIN" in resp.json()["detail"]
+        assert resp.json()["error"]["code"] == "service_unavailable"
+        assert "HA_AUTOMATON_BIN" in resp.json()["error"]["message"]
 
 
 async def test_config_endpoint_reports_state(
@@ -119,7 +119,8 @@ async def test_invalid_contracts_are_422(
     """An empty or path-hostile gate never reaches the subprocess."""
     resp = await client.post("/v1/goal", json={"contract": contract})
     assert resp.status_code == 422
-    assert fragment in json.dumps(resp.json()["detail"])
+    assert resp.json()["error"]["code"] == "invalid_input"
+    assert fragment in resp.json()["error"]["message"]
 
 
 async def test_completed_run_reads_outcome_artifact(

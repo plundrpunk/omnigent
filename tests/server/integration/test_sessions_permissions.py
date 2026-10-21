@@ -2487,8 +2487,8 @@ async def test_create_session_rejects_other_users_host(
     assert resp.status_code == 403, (
         f"Bob targeting Alice's host should be 403, got {resp.status_code}: {resp.text}"
     )
-    assert resp.json().get("detail") == "not your host", (
-        f"403 should come from the host-owner check, got detail={resp.json().get('detail')!r}"
+    assert resp.json()["error"] == {"code": "forbidden", "message": "not your host"}, (
+        f"403 should come from the host-owner check, got {resp.json()!r}"
     )
     # The ownership check fired before the host.stat round-trip: nothing
     # was ever enqueued to Alice's host connection.

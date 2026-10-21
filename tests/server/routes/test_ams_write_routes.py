@@ -10,7 +10,6 @@ wire.
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 import httpx
@@ -187,10 +186,10 @@ async def test_write_unconfigured_is_503(
     assert resp.status_code == 503
 
 
-async def test_ams_error_passes_through_verbatim(
+async def test_ams_error_preserves_status_and_message(
     client: httpx.AsyncClient, ams_env: list[dict[str, Any]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AMS 400s (e.g. unregistered provider) surface as themselves."""
+    """AMS 400s retain their status and message in the standard envelope."""
 
     class _ErrClient:
         def __init__(self, **kwargs: Any) -> None: ...
@@ -209,4 +208,5 @@ async def test_ams_error_passes_through_verbatim(
     monkeypatch.setattr(httpx, "AsyncClient", _ErrClient)
     resp = await client.put("/v1/ams/api/v1/llm-providers/role-mappings", json={"agent": "nope"})
     assert resp.status_code == 400
-    assert "not registered" in json.dumps(resp.json()["detail"])
+    assert resp.json()["error"]["code"] == "invalid_input"
+    assert "not registered" in resp.json()["error"]["message"]

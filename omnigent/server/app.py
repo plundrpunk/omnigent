@@ -33,6 +33,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
+from omnigent.server.api_errors import register_api_error_handlers
 from omnigent.server.auth import AuthProvider
 from omnigent.server.managed_hosts import ManagedSandboxConfig
 from omnigent.server.mcp_pool import ServerMcpPool
@@ -965,6 +966,7 @@ def create_app(
             await _mcp_pool.shutdown_all()
 
     app = FastAPI(title="Automaton OS Server", lifespan=_lifespan)
+    register_api_error_handlers(app)
     from omnigent.runtime import telemetry
 
     telemetry.instrument_fastapi_app(app)
