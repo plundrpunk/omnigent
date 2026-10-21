@@ -94,14 +94,16 @@ async def _wait_terminal(client: httpx.AsyncClient, run_id: str) -> dict:
 async def test_unconfigured_answers_503(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """No env ⇒ 503 with a pointer at the knobs, on every endpoint."""
+    """No env ⇒ 503 on creation/listing; unknown IDs still return 404."""
     monkeypatch.delenv("HA_AUTOMATON_BIN", raising=False)
     monkeypatch.delenv("HA_GOAL_CWD", raising=False)
-    for method, url in (("post", "/v1/goal"), ("get", "/v1/goal"), ("get", "/v1/goal/x")):
+    for method, url in (("post", "/v1/goal"), ("get", "/v1/goal")):
         resp = await getattr(client, method)(url, **({"json": {}} if method == "post" else {}))
         assert resp.status_code == 503
         assert resp.json()["error"]["code"] == "service_unavailable"
         assert "HA_AUTOMATON_BIN" in resp.json()["error"]["message"]
+    for suffix in ("", "/events"):
+        assert (await client.get(f"/v1/goal/x{suffix}")).status_code == 404
 
 
 async def test_config_endpoint_reports_state(client: httpx.AsyncClient, goal_env: Path) -> None:
@@ -944,7 +946,7 @@ async def test_events_unknown_and_absent_artifact(goal_api, monkeypatch, goal_en
     client, registry = goal_api
     monkeypatch.setenv("HA_GOAL_WORKDIR", str(goal_env / "runs"))
     assert (await client.get("/v1/goal/unknown/events")).status_code == 404
-    registry.create({"run_id": "run", "status": "running", "started_at": "now"})
+    registry.create({"run_id": "run", "owner": "local", "status": "running", "started_at": "now"})
     assert (await client.get("/v1/goal/run/events")).json() == {
         "run_id": "run",
         "status": "running",
@@ -966,6 +968,7 @@ async def test_events_pagination_preserves_indices_and_recovers_torn_reads(
     registry.create(
         {
             "run_id": "run",
+            "owner": "local",
             "status": "running",
             "started_at": "now",
             "outcome": {"artifact_path": str(artifact)},
