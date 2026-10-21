@@ -5,7 +5,8 @@ through the harness' fail-closed gate:
 
 - ``POST /v1/goal`` — validate a goal contract, start
   ``automaton goal --contract <tmp> --workdir <dir> --json`` in the
-  background, answer ``202`` with a run record.
+  background, or enqueue through AMS with ``dispatch: fleet``; answer
+  ``202`` with a run record.
 - ``GET /v1/goal`` — list runs (optionally filtered by
   ``conversation_id``), newest first.
 - ``GET /v1/goal/{run_id}`` — one run, including the parsed
@@ -20,6 +21,9 @@ Configuration comes from the server environment:
   harness-automaton checkout). Unset ⇒ 503.
 - ``HA_GOAL_WORKDIR`` — ``--workdir`` passed to the CLI (default
   ``runs-goal``); artifacts land in ``<workdir>/goal/<goal_id>/``.
+- Fleet dispatch uses the existing AMS bridge configuration and
+  ``AOS_FLEET_GOAL_PROJECT`` (default ``fleet-autonomy``). The daemon
+  controls the workspace; fleet requests cannot supply an ``exec`` block.
 - ``HA_GOAL_EXEC_ROOTS`` — ``os.pathsep``-separated absolute directories
   a run is permitted to execute in and write to. **Unset ⇒ every exec
   request is refused with 422.** A run can only ever touch a path that
@@ -33,29 +37,35 @@ before a process is ever spawned. The resolved settings are recorded on
 the run and returned by ``GET /v1/goal``, so a run can never write
 somewhere the record doesn't admit to.
 
-Truth rules (Drew's law): the run status comes *only* from the CLI exit
+Truth rules (Drew's law): local run status comes *only* from the CLI exit
 code (0=completed / 3=blocked / 6=paused / 2=setup_error); outcome data
 comes *only* from the CLI's JSON payload and on-disk artifacts, quoted
 verbatim. Nothing is inferred, nothing is synthesized; absence is
 reported as absence.
+Fleet status comes only from AMS continuation state; summary, outcome,
+and work receipts are quoted from AMS without inferring completion.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping
 import os
 import re
 import tempfile
 import uuid
+from collections.abc import Mapping
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 
 from omnigent.server.auth import AuthProvider
+from omnigent.server.routes import ams
 from omnigent.server.routes._auth_helpers import require_user
 
 #: CLI exit code → run status. Anything else is an ``error`` (never a
@@ -364,7 +374,9 @@ def _validate_contract(contract: Any) -> dict[str, Any]:
         )
     end_state = contract.get("end_state")
     if not isinstance(end_state, str) or not end_state.strip():
-        raise HTTPException(status_code=422, detail="contract.end_state must be a non-empty string")
+        raise HTTPException(
+            status_code=422, detail="contract.end_state must be a non-empty string"
+        )
     gate = contract.get("evidence_criteria")
     if not isinstance(gate, dict) or not any(gate.get(k) for k in _GATE_KEYS):
         raise HTTPException(
@@ -433,7 +445,109 @@ class GoalRunRegistry:
         return sorted(runs, key=lambda r: r["started_at"], reverse=True)
 
     def running_count(self) -> int:
-        return sum(1 for r in self._runs.values() if r["status"] == "running")
+        return sum(
+            1 for r in self._runs.values()
+            if r["status"] == "running" and r.get("dispatch") != "fleet"
+        )
+
+
+async def _fleet_request(method: str, path: str, **kwargs: Any) -> Any:
+    """Call AMS with bridge credentials, keeping upstream errors private."""
+    base = ams._base_url()
+    if not base:
+        raise HTTPException(
+            status_code=503,
+            detail="AMS bridge not configured — set AMS_BASE_URL (and AMS_API_KEY).",
+        )
+    key = ams._api_key()
+    try:
+        async with httpx.AsyncClient(timeout=ams._TIMEOUT_SECONDS) as client:
+            response = await client.request(
+                method, f"{base}/api/v1/{path}",
+                headers={"X-API-Key": key} if key else {}, **kwargs,
+            )
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="AMS unreachable") from None
+    if not response.is_success:
+        raise HTTPException(status_code=502, detail=f"AMS HTTP {response.status_code}")
+    try:
+        return response.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="AMS returned a non-JSON response") from None
+
+
+async def _enqueue_fleet_goal(
+    contract: dict[str, Any], conversation_id: str | None
+) -> dict[str, Any]:
+    metadata = contract.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=422, detail="contract.metadata must be a JSON object")
+    metadata = {**metadata, "origin": "omnigent-aos"}
+    if conversation_id is not None:
+        metadata["omnigent_conversation_id"] = conversation_id
+    contract = {**contract, "metadata": metadata}
+    project = os.environ.get("AOS_FLEET_GOAL_PROJECT") or "fleet-autonomy"
+    continuation = await _fleet_request("POST", "continuations/", json={
+        "original_goal": contract["end_state"][:500],
+        "next_action": "goal-queue daemon: run the embedded goal contract with automaton goal",
+        "handoff_notes": (
+            "HA-GOALCONTRACT-JSON\n```json\n"
+            + json.dumps(contract, indent=2, sort_keys=True) + "\n```"
+        ),
+        "project": project,
+        "task_type": "goal",
+        "agent_id": "omnigent-aos",
+        "blockers": [],
+        "remaining_subtasks": [],
+        "priority_memories": [],
+    })
+    continuation_id = (
+        continuation.get("continuation_id") if isinstance(continuation, dict) else None
+    )
+    if not isinstance(continuation_id, str) or not continuation_id:
+        raise HTTPException(status_code=502, detail="AMS returned no continuation_id")
+    return {
+        "run_id": str(uuid.uuid4()),
+        "goal_id": contract["goal_id"],
+        "conversation_id": conversation_id,
+        "contract": contract,
+        "dispatch": "fleet",
+        "status": "queued",
+        "continuation_id": continuation_id,
+        "project": project,
+        "outcome": None,
+        "summary": None,
+        "work_receipt": None,
+        "started_at": _now_iso(),
+        "finished_at": None,
+    }
+
+
+async def _refresh_fleet_goal(run: dict[str, Any]) -> None:
+    continuation = await _fleet_request(
+        "GET", f"continuations/{quote(run['continuation_id'], safe='')}"
+    )
+    statuses = {
+        "pending": "queued", "claimed": "running", "in_progress": "running",
+        "completed": "completed", "failed": "blocked",
+    }
+    state = continuation.get("status") if isinstance(continuation, dict) else None
+    if not isinstance(state, str) or state not in statuses:
+        raise HTTPException(status_code=502, detail="AMS returned an unknown continuation status")
+    run.update(
+        status=statuses[state],
+        summary=continuation.get("summary"),
+        outcome=continuation.get("outcome"),
+        finished_at=continuation.get("completed_at"),
+    )
+    # Receipts are supporting evidence, never the authority for run status.
+    try:
+        receipt = await _fleet_request("GET", "work-receipts/latest", params={
+            "session_id": f"goal-queue:{run['goal_id']}", "project": run["project"],
+        })
+    except HTTPException:
+        receipt = None
+    run["work_receipt"] = receipt or None
 
 
 async def _execute_goal_run(run: dict[str, Any]) -> None:
@@ -504,10 +618,8 @@ async def _execute_goal_run(run: dict[str, Any]) -> None:
         )
         return
     finally:
-        try:
+        with suppress(OSError):
             os.unlink(contract_path)
-        except OSError:
-            pass
 
     workdir = Path(_goal_workdir())
     if not workdir.is_absolute():
@@ -561,23 +673,41 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
     async def goal_config(request: Request) -> dict[str, Any]:
         """Report whether the bridge is configured (never leaks paths)."""
         require_user(request, auth_provider)
-        return {"configured": bool(_automaton_bin() and _goal_cwd())}
+        modes = []
+        if _automaton_bin() and _goal_cwd():
+            modes.append("local")
+        if ams._base_url():
+            modes.append("fleet")
+        return {"configured": bool(modes), "modes": modes}
 
     @router.post("/goal", status_code=202)
     async def start_goal(request: Request) -> dict[str, Any]:
         """Validate the contract and start a background goal run."""
         require_user(request, auth_provider)
-        _require_configured()
         try:
             body = await request.json()
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise HTTPException(status_code=422, detail="request body must be JSON") from None
         if not isinstance(body, dict):
             raise HTTPException(status_code=422, detail="request body must be a JSON object")
+        dispatch = body.get("dispatch", "local")
+        if dispatch not in ("local", "fleet"):
+            raise HTTPException(status_code=422, detail="dispatch must be local or fleet")
+        if dispatch == "local":
+            _require_configured()
         contract = _validate_contract(body.get("contract"))
         conversation_id = body.get("conversation_id")
         if conversation_id is not None and not isinstance(conversation_id, str):
             raise HTTPException(status_code=422, detail="conversation_id must be a string")
+        if dispatch == "fleet":
+            if "exec" in body:
+                raise HTTPException(
+                    status_code=422,
+                    detail="exec is not allowed for fleet dispatch; the daemon sets the workspace",
+                )
+            run = await _enqueue_fleet_goal(contract, conversation_id)
+            registry.create(run)
+            return _public(run)
         provider = body.get("provider")
         if provider is not None and (
             not isinstance(provider, str) or not re.match(r"^[A-Za-z0-9._-]+$", provider)
@@ -631,15 +761,20 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
     async def list_goals(request: Request, conversation_id: str | None = None) -> dict[str, Any]:
         """List runs, newest first; empty list means exactly that."""
         require_user(request, auth_provider)
-        _require_configured()
+        if not ams._base_url():
+            _require_configured()
         return {"runs": [_public(r) for r in registry.list(conversation_id)]}
 
     @router.get("/goal/{run_id}")
     async def get_goal(run_id: str, request: Request) -> dict[str, Any]:
         """One run by id."""
         require_user(request, auth_provider)
-        _require_configured()
         run = registry.get(run_id)
+        if run is not None and run.get("dispatch") == "fleet":
+            await _refresh_fleet_goal(run)
+            return _public(run)
+        if not ams._base_url():
+            _require_configured()
         if run is None:
             raise HTTPException(status_code=404, detail=f"unknown goal run: {run_id}")
         return _public(run)
@@ -654,8 +789,11 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
         rather than re-fetching the whole run each time.
         """
         require_user(request, auth_provider)
-        _require_configured()
         run = registry.get(run_id)
+        if run is not None and run.get("dispatch") == "fleet":
+            await _refresh_fleet_goal(run)
+            return {"run_id": run_id, "status": run["status"], "events": [], "total": 0}
+        _require_configured()
         if run is None:
             raise HTTPException(status_code=404, detail=f"unknown goal run: {run_id}")
 

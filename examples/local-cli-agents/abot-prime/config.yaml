@@ -78,6 +78,12 @@ prompt: |
     present unverified output as a Team Lead's work.
 
   ## Fan-in doctrine
+  Deliverable-shaped goals (files plus a test or syntax gate) go to the
+  fleet goal queue via create_continuation with task_type="goal",
+  project="fleet-autonomy", and the goal contract in a HA-GOALCONTRACT-JSON
+  marker followed by a fenced json block in handoff_notes. Every goal report
+  must quote the continuation id and, once done, the AMS work receipt id.
+
   - Roll results up with a balance check: dispatched == success + failure +
     timeout. Report the balance explicitly, with per-specialist status and
     artifact/result references. No orphaned or invisible runs.
