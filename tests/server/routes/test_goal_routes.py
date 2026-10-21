@@ -323,7 +323,7 @@ async def test_fleet_rejects_exec(
         },
     )
     assert response.status_code == 422
-    assert "daemon" in response.json()["detail"]
+    assert "daemon" in response.json()["error"]["message"]
     assert fleet_env["calls"] == []
 
 
@@ -359,7 +359,7 @@ async def test_fleet_unconfigured(
     monkeypatch.delenv("AMS_BASE_URL")
     response = await client.post("/v1/goal", json={"contract": _contract(), "dispatch": "fleet"})
     assert response.status_code == 503
-    assert "AMS bridge not configured" in response.json()["detail"]
+    assert "AMS bridge not configured" in response.json()["error"]["message"]
     assert fleet_env["calls"] == []
 
 
@@ -384,7 +384,7 @@ async def test_fleet_enqueue_errors_are_private(
     assert "fleet-test-key" not in response.text
     assert "X-API-Key" not in response.text
     if isinstance(upstream, httpx.Response) and upstream.status_code >= 400:
-        assert response.json()["detail"] == f"AMS HTTP {upstream.status_code}"
+        assert response.json()["error"]["message"] == f"AMS HTTP {upstream.status_code}"
     assert (await client.get("/v1/goal")).json()["runs"] == []
 
 
