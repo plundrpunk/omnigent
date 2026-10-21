@@ -49,7 +49,7 @@ def parsed(ev):
         return None, c
     try:
         return json.loads(c), c
-    except Exception:
+    except json.JSONDecodeError:
         return None, c
 
 
@@ -120,8 +120,9 @@ def main():
     seen = 0
     while True:
         try:
-            d = json.load(open(path))
-        except Exception:
+            with open(path) as source:
+                d = json.load(source)
+        except (OSError, ValueError):
             time.sleep(1)
             continue
         ev = d.get("events", [])

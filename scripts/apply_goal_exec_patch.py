@@ -208,9 +208,11 @@ EDITS.append(
 
 EDITS.append(
     (
-        """            raise HTTPException(status_code=422, detail="provider must be a simple token")
+        """            raise HTTPException(status_code=422, detail="provider"""
+        """ must be a simple token")
         if registry.running_count()""",
-        """            raise HTTPException(status_code=422, detail="provider must be a simple token")
+        """            raise HTTPException(status_code=422, detail="provider"""
+        """ must be a simple token")
         exec_spec = _validate_exec(body.get("exec"))
         if registry.running_count()""",
     )

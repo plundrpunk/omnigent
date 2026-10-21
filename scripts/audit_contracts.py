@@ -11,7 +11,8 @@ for f in sorted(glob.glob("contracts/aos/*.json")):
     name = os.path.basename(f)
     if name == "chain.json":
         continue
-    c = json.load(open(f))
+    with open(f) as source:
+        c = json.load(source)
     ec = c.get("evidence_criteria", {}) or {}
     insp = c.get("inspection_criteria", []) or []
     neg = [x for x in insp if any(n in x.lower() for n in NEG)]

@@ -177,6 +177,7 @@ def author_remediation(contract: dict[str, Any], blocker_md: str, attempt: int) 
 
 def run_phase(cfg: dict[str, Any], contract: dict[str, Any], root: Path) -> dict[str, Any]:
     """Start one goal run and block until the bridge reports it terminal."""
+    del root  # Kept for callers; execution uses the configured workspace.
     d = cfg["defaults"]
     payload: dict[str, Any] = {"contract": contract}
     for key in ("provider", "model", "exec", "limits"):

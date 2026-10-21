@@ -159,6 +159,7 @@ class ACPClient:
         self._request_timeout = request_timeout
 
         self._proc: asyncio.subprocess.Process | None = None
+        self._stderr_task: asyncio.Task[None] | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._next_id = 0
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
@@ -202,7 +203,7 @@ class ACPClient:
             raise ACPError(f"failed to spawn ACP agent {self._argv[0]!r}: {exc}") from exc
 
         self._reader_task = asyncio.create_task(self._read_loop())
-        asyncio.create_task(self._drain_stderr())
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def close(self) -> None:
         """Terminate the agent, killing the process group on every path."""

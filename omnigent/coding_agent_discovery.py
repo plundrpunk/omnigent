@@ -36,6 +36,7 @@ import re
 import shutil
 import time
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -299,10 +300,8 @@ async def _run(
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        try:
+        with suppress(ProcessLookupError):
             proc.kill()
-        except ProcessLookupError:
-            pass
         return 124, "", f"timed out after {timeout}s"
     return (
         proc.returncode or 0,
@@ -491,7 +490,7 @@ async def discover_coding_agents(*, with_models: bool = True) -> dict[str, Any]:
     )
 
     agents: list[dict[str, Any]] = []
-    for spec, result in zip(CODING_AGENT_SPECS, results):
+    for spec, result in zip(CODING_AGENT_SPECS, results, strict=False):
         if isinstance(result, BaseException):
             logger.warning("coding agent %s discovery failed: %s", spec.key, result)
             agents.append(

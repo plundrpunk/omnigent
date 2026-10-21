@@ -109,6 +109,22 @@ def run(args: argparse.Namespace, command: list[str]) -> int:
     rollover_tokens = int(args.window_tokens * args.rollover)
     handoff = ""
 
+    def heartbeat() -> None:
+        while not hb_stop.wait(HEARTBEAT_SECS):
+            pct = min(100.0, tokens / args.window_tokens * 100)
+            _api(
+                base,
+                key,
+                "/api/warden/heartbeat",
+                {
+                    "agent_id": agent_id,
+                    "agent_name": args.agent_name,
+                    "status": "working",
+                    "context_pct": round(pct, 2),
+                    "metadata": {"milack": True, "generation": gen},
+                },
+            )
+
     for gen in range(1, args.max_generations + 1):
         # ── birth ritual: register + inherit pending continuation ──
         birth = _api(
@@ -168,22 +184,6 @@ def run(args: argparse.Namespace, command: list[str]) -> int:
             )
 
             hb_stop = threading.Event()
-
-            def heartbeat() -> None:
-                while not hb_stop.wait(HEARTBEAT_SECS):
-                    pct = min(100.0, tokens / args.window_tokens * 100)
-                    _api(
-                        base,
-                        key,
-                        "/api/warden/heartbeat",
-                        {
-                            "agent_id": agent_id,
-                            "agent_name": args.agent_name,
-                            "status": "working",
-                            "context_pct": round(pct, 2),
-                            "metadata": {"milack": True, "generation": gen},
-                        },
-                    )
 
             hb = threading.Thread(target=heartbeat, daemon=True)
             hb.start()

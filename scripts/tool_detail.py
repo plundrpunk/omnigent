@@ -6,7 +6,8 @@ import sys
 
 path = sys.argv[1]
 limit = int(sys.argv[2]) if len(sys.argv) > 2 else 6
-d = json.load(open(path))
+with open(path) as source:
+    d = json.load(source)
 
 
 def content_of(e):
@@ -23,7 +24,7 @@ for i, e in enumerate(d.get("events", [])):
         continue
     try:
         p = json.loads(c)
-    except Exception:
+    except json.JSONDecodeError:
         continue
     if not isinstance(p, dict) or "tool" not in p:
         continue

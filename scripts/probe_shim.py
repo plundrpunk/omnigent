@@ -51,7 +51,7 @@ print()
 
 try:
     obj = json.loads(out)
-except Exception as exc:
+except json.JSONDecodeError as exc:
     print(f"NOT VALID JSON  : {exc}")
     print("=> response was cut off mid-structure (size limit)")
     sys.exit(2)

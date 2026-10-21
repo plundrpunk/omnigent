@@ -48,7 +48,7 @@ def poll(run_id: str) -> dict:
                 d = json.load(r)
             if d.get("status") not in ("running", None):
                 return d
-        except Exception:
+        except (OSError, ValueError):
             pass
         time.sleep(POLL_S)
         waited += POLL_S
@@ -64,14 +64,14 @@ def gates_green() -> tuple[bool, str]:
     tv = sh("npm", "--prefix", "ap-web", "test")
     out = tv.stdout + tv.stderr
     if tv.returncode != 0:
-        line = [l for l in out.splitlines() if "Tests " in l or "failed" in l][-2:]
-        return False, "tests failed: " + " | ".join(l.strip() for l in line)
+        line = [text for text in out.splitlines() if "Tests " in text or "failed" in text][-2:]
+        return False, "tests failed: " + " | ".join(text.strip() for text in line)
     return True, "type-check + suite green"
 
 
 def dirty() -> list[str]:
     out = sh("git", "status", "--porcelain", "ap-web").stdout.strip()
-    return [l for l in out.splitlines() if l.strip()]
+    return [text for text in out.splitlines() if text.strip()]
 
 
 def main():

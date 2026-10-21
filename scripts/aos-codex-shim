@@ -37,6 +37,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 # Models that the ChatGPT-account codex actually accepts. Anything else
@@ -144,10 +145,8 @@ def main() -> int:
     except OSError:
         pass
     finally:
-        try:
+        with suppress(OSError):
             os.unlink(out_path)
-        except OSError:
-            pass
 
     if not text:
         # Never fabricate a completion. An empty answer is an error, and

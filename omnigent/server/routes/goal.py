@@ -49,6 +49,7 @@ import re
 import tempfile
 import uuid
 from collections.abc import Mapping
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -505,10 +506,8 @@ async def _execute_goal_run(run: dict[str, Any]) -> None:
         )
         return
     finally:
-        try:
+        with suppress(OSError):
             os.unlink(contract_path)
-        except OSError:
-            pass
 
     workdir = Path(_goal_workdir())
     if not workdir.is_absolute():

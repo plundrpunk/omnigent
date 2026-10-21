@@ -3,8 +3,10 @@
 
 import json
 import sys
+from contextlib import suppress
 
-d = json.load(open(sys.argv[1]))
+with open(sys.argv[1]) as source:
+    d = json.load(source)
 
 
 def norm(c):
@@ -48,10 +50,8 @@ def deep(o, depth=0):
     if isinstance(o, dict):
         for v in o.values():
             if isinstance(v, str) and v.strip().startswith(("{", "[")):
-                try:
+                with suppress(json.JSONDecodeError):
                     deep(json.loads(v), depth + 1)
-                except Exception:
-                    pass
             else:
                 deep(v, depth + 1) if isinstance(v, (dict, list)) else None
     elif isinstance(o, list):

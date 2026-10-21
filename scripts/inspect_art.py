@@ -5,7 +5,8 @@ import json
 import sys
 
 path = sys.argv[1]
-d = json.load(open(path))
+with open(path) as source:
+    d = json.load(source)
 ev = d.get("events", [])
 print(f"events: {len(ev)}")
 print(f"artifact status: {d.get('status')}")
@@ -28,7 +29,7 @@ for i, e in enumerate(ev):
         continue
     try:
         parsed = json.loads(s)
-    except Exception:
+    except json.JSONDecodeError:
         continue
     if not isinstance(parsed, dict):
         continue
