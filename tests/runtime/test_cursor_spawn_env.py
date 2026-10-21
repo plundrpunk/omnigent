@@ -44,11 +44,14 @@ def _make_spec(
     model: str | None = "gpt-5",
     name: str = "test-cursor",
     auth: ApiKeyAuth | DatabricksAuth | None = None,
+    permission_mode: str | None = None,
 ) -> AgentSpec:
     """Build a minimal cursor :class:`AgentSpec` for the spawn-env tests."""
     config: dict[str, object] = {"harness": "cursor"}
     if model is not None:
         config["model"] = model
+    if permission_mode is not None:
+        config["permission_mode"] = permission_mode
     return AgentSpec(
         spec_version=1,
         name=name,
@@ -102,6 +105,15 @@ def test_ambient_cursor_api_key_used_when_no_spec_auth(monkeypatch: pytest.Monke
     assert env["HARNESS_CURSOR_API_KEY"] == "crsr_ambient"
 
 
+def test_ambient_cursor_api_key_stripped_before_forwarding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A padded ambient ``CURSOR_API_KEY`` is cleaned before reaching the SDK."""
+    monkeypatch.setenv("CURSOR_API_KEY", "\ncrsr_ambient\n")
+    env = _build_cursor_spawn_env(_make_spec(auth=None))
+    assert env["HARNESS_CURSOR_API_KEY"] == "crsr_ambient"
+
+
 def test_spec_api_key_wins_over_ambient(monkeypatch: pytest.MonkeyPatch) -> None:
     """An explicit spec api-key auth takes precedence over an ambient key."""
     monkeypatch.setenv("CURSOR_API_KEY", "crsr_ambient")
@@ -114,6 +126,18 @@ def test_skills_filter_always_set() -> None:
     falls back to ``"all"`` and overrides an explicit ``skills: none``."""
     env = _build_cursor_spawn_env(_make_spec())
     assert "HARNESS_CURSOR_SKILLS_FILTER" in env
+
+
+def test_permission_mode_threads_into_env_var() -> None:
+    """``executor.config.permission_mode`` sets ``HARNESS_CURSOR_PERMISSION_MODE``."""
+    env = _build_cursor_spawn_env(_make_spec(permission_mode="default"))
+    assert env["HARNESS_CURSOR_PERMISSION_MODE"] == "default"
+
+
+def test_no_permission_mode_omits_env_var() -> None:
+    """Absent ``permission_mode`` leaves the harness wrap on its ``auto`` default."""
+    env = _build_cursor_spawn_env(_make_spec())
+    assert "HARNESS_CURSOR_PERMISSION_MODE" not in env
 
 
 def test_name_threads_into_agent_name_env_var() -> None:
@@ -150,6 +174,16 @@ def test_stored_cursor_key_used_when_spec_has_no_auth(
     """A CURSOR_API_KEY registered via ``omnigent setup`` flows when the spec
     declares no auth — so a user need not export it in every shell."""
     monkeypatch.setenv("CURSOR_KEY_SRC", "crsr_stored_123")
+    _write_cursor_config(tmp_path, "env:CURSOR_KEY_SRC")
+    env = _build_cursor_spawn_env(_make_spec(auth=None))
+    assert env["HARNESS_CURSOR_API_KEY"] == "crsr_stored_123"
+
+
+def test_stored_env_cursor_key_stripped_before_forwarding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A padded ``env:`` cursor key resolves cleanly before SDK forwarding."""
+    monkeypatch.setenv("CURSOR_KEY_SRC", "\ncrsr_stored_123\n")
     _write_cursor_config(tmp_path, "env:CURSOR_KEY_SRC")
     env = _build_cursor_spawn_env(_make_spec(auth=None))
     assert env["HARNESS_CURSOR_API_KEY"] == "crsr_stored_123"
@@ -198,6 +232,32 @@ def test_databricks_auth_does_not_adopt_stored_cursor_key(
     monkeypatch.setenv("CURSOR_KEY_SRC", "crsr_stored_123")
     _write_cursor_config(tmp_path, "env:CURSOR_KEY_SRC")
     env = _build_cursor_spawn_env(_make_spec(auth=DatabricksAuth(profile="oss")))
+    assert "HARNESS_CURSOR_API_KEY" not in env
+
+
+def test_empty_stored_env_key_is_omitted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A configured ``env:CURSOR_API_KEY`` ref pointing at an EMPTY var is omitted.
+
+    ``resolve_secret``'s ``env:`` branch only raises on an *unset* variable, so
+    an exported-but-empty ``CURSOR_API_KEY=""`` resolves to ``""`` — which the
+    cursor layer folds to ``None``. The builder must therefore write no
+    ``HARNESS_CURSOR_API_KEY`` (the ambient fallback reads the same empty var
+    and is also skipped), agreeing with ``cursor_api_key_configured() is False``
+    rather than forwarding a blank credential.
+    """
+    monkeypatch.setenv("CURSOR_API_KEY", "")
+    _write_cursor_config(tmp_path, "env:CURSOR_API_KEY")
+    env = _build_cursor_spawn_env(_make_spec(auth=None))
+    assert "HARNESS_CURSOR_API_KEY" not in env
+
+
+def test_whitespace_only_stored_env_key_is_omitted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A configured ``env:`` ref pointing at an all-whitespace var is omitted."""
+    monkeypatch.setenv("CURSOR_API_KEY", "   \n\t  ")
+    _write_cursor_config(tmp_path, "env:CURSOR_API_KEY")
+    env = _build_cursor_spawn_env(_make_spec(auth=None))
     assert "HARNESS_CURSOR_API_KEY" not in env
 
 

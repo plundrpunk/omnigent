@@ -26,12 +26,17 @@ Usage
     python3 scripts/aos_chain.py contracts/aos/chain.json --dry-run  # plan only
 
 The journal lives next to the chain file as ``<chain_id>.journal.json``.
+
+Model ids are not stored in the chain file: ``${AOS_CHAIN_MODEL}`` and
+``${AOS_CHAIN_MODEL_HIGH}`` are expanded from the environment at load time,
+and an unset variable stops the chain before anything is posted.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -172,6 +177,20 @@ def author_remediation(contract: dict[str, Any], blocker_md: str, attempt: int) 
     return remediated
 
 
+def expand_env(value: Any) -> Any:
+    """Expand ``${VAR}`` in every string of a loaded chain; unset vars fail loudly."""
+    if isinstance(value, dict):
+        return {k: expand_env(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [expand_env(v) for v in value]
+    if isinstance(value, str) and "${" in value:
+        expanded = os.path.expandvars(value)
+        if "${" in expanded:
+            raise SystemExit(f"aos_chain: unset environment variable in {value!r}")
+        return expanded
+    return value
+
+
 # ------------------------------------------------------------- running
 
 
@@ -225,7 +244,7 @@ def main() -> int:
     args = ap.parse_args()
 
     chain_path = args.chain.resolve()
-    cfg = json.loads(chain_path.read_text(encoding="utf-8"))
+    cfg = expand_env(json.loads(chain_path.read_text(encoding="utf-8")))
     root = Path(cfg["workspace"])
     journal_path = chain_path.with_name(f"{cfg['chain_id']}.journal.json")
 

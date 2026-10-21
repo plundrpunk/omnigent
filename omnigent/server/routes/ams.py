@@ -49,6 +49,7 @@ Configuration comes from the server environment:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -134,26 +135,64 @@ def _api_key() -> str:
 def _path_allowed(path: str) -> bool:
     """Whitelist check on a *normalized* path.
 
-    Rejects traversal (`..`), absolute paths, empty/dot segments, and
-    scheme-ish prefixes so `api/v1/skills/../../admin` can't ride a
-    whitelisted prefix past the check (K3 review finding).
+    Rejects traversal (`..`), absolute paths, empty/dot segments, and a
+    scheme-ish first segment so `api/v1/skills/../../admin` can't ride a
+    whitelisted prefix past the check (K3 review finding). Colons later in
+    the path stay legal: AMS agent ids such as ``team:worker`` contain them.
     """
-    if path.startswith("/") or "//" in path or "\\" in path or ":" in path:
+    if path.startswith("/") or "//" in path or "\\" in path:
         return False
     segments = path.rstrip("/").split("/")  # tolerate one trailing slash
+    if ":" in segments[0]:
+        return False
     if any(seg in ("", ".", "..") for seg in segments):
         return False
     return any(path == p or path.startswith(p + "/") for p in _ALLOWED_GET_PREFIXES)
 
 
-def create_ams_router(auth_provider: AuthProvider | None = None) -> APIRouter:
+def create_ams_router(
+    auth_provider: AuthProvider | None = None,
+    permission_store: Any | None = None,
+) -> APIRouter:
     """Build the AMS bridge router.
 
     :param auth_provider: Auth provider used to identify the requesting
         user. ``None`` in single-user mode (endpoint is open).
+    :param permission_store: Store providing ``is_admin``. Required in
+        multi-user mode for the write table; without it every write is
+        refused rather than allowed.
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
+
+    async def _require_admin(request: Request) -> str | None:
+        """Writes reach shared AMS state, so they are admin-only.
+
+        The bridge forwards with one server-side service key, so AMS sees the
+        server rather than the end user. Every authenticated user editing
+        model assignments, agent directives, automata and schedules is not an
+        access model. Until the bridge forwards user identity, writes are
+        restricted to admins.
+        """
+        user = require_user(request, auth_provider)
+        if auth_provider is None:
+            # Single-user mode: the only caller is the operator.
+            return user
+        if permission_store is None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "AMS writes require an admin check, and no permission "
+                    "store is configured on this server."
+                ),
+            )
+        is_admin = await asyncio.to_thread(permission_store.is_admin, user)
+        if not is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail="AMS writes are restricted to admin users.",
+            )
+        return user
 
     @router.get("/ams/config")
     async def ams_config(request: Request) -> dict[str, Any]:
@@ -239,7 +278,7 @@ def create_ams_router(auth_provider: AuthProvider | None = None) -> APIRouter:
         return any(m == method and rx.match(path) for m, rx in _ALLOWED_WRITE_ROUTES)
 
     async def _forward_write(method: str, path: str, request: Request) -> Any:
-        user = require_user(request, auth_provider)
+        user = await _require_admin(request)
         base = _base_url()
         if not base:
             raise HTTPException(

@@ -26,6 +26,8 @@ import re
 import httpx
 from playwright.sync_api import Page, expect
 
+from tests.e2e_ui.conftest import configure_mock_llm
+
 # Two distinct code words with no shared substring, so the kept/dropped
 # assertions can't satisfy each other. Only the KEPT word is part of the
 # turn the fork copies; the DROPPED word lives in the turn after the fork
@@ -41,6 +43,7 @@ def test_fork_from_middle_truncates_history(
     page: Page,
     seeded_session: tuple[str, str],
     runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """Fork from the first turn — the clone carries only history up to it.
 
@@ -61,9 +64,20 @@ def test_fork_from_middle_truncates_history(
         clone unbound, so a message would otherwise have no runner).
     """
     base_url, session_id = seeded_session
+
+    # Content-route the recall turn so the mock echoes the kept marker.
+    # Turns 1 & 2 ("reply with just OK") hit the generic fallback ("Mock LLM
+    # response.") which is enough for the fork-point anchor assertions.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": _KEPT_MARKER}],
+        key="fork-recall",
+        match="What code word did I ask you to remember",
+    )
+
     page.goto(f"{base_url}/c/{session_id}")
 
-    composer = page.get_by_placeholder("Ask the agent anything…")
+    composer = page.get_by_placeholder("Send a message…")
     expect(composer).to_be_visible()
 
     # Turn 1 (KEPT): plant the first code word and wait for its reply so the
@@ -99,7 +113,7 @@ def test_fork_from_middle_truncates_history(
     # Land in a DIFFERENT session — a URL still on the source means
     # navigation never fired; a visible dialog means the fork call failed.
     expect(page).to_have_url(
-        re.compile(rf"/c/(?!{re.escape(session_id)})conv_[0-9a-f]+"),
+        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"),
         timeout=30_000,
     )
     expect(dialog).not_to_be_visible()
@@ -128,7 +142,7 @@ def test_fork_from_middle_truncates_history(
     # (2) Recall: ask the clone what it was told to remember. The reply must
     # echo the kept word and never the dropped one. The copied OK reply is
     # the only assistant bubble so far; the recall answer is the second.
-    fork_composer = page.get_by_placeholder("Ask the agent anything…")
+    fork_composer = page.get_by_placeholder("Send a message…")
     expect(fork_composer).to_be_visible()
     fork_composer.fill("What code word did I ask you to remember? Reply with the code word only.")
     page.get_by_role("button", name="Send", exact=True).click()

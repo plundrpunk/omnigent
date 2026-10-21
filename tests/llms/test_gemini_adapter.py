@@ -1,17 +1,25 @@
 """Tests for llms.adapters.gemini — translation logic."""
 
+import asyncio
 import json
 
+import httpx
 import pytest
 
+from omnigent.llms._responses_to_chat import chat_stream_to_response_events
 from omnigent.llms.adapters.gemini import (
+    GeminiAdapter,
     _chat_to_gemini,
     _convert_tools,
     _extract_usage,
+    _gemini_stream_chunk_to_chat,
     _gemini_to_chat,
     _normalize_finish_reason,
     _translate_part_to_gemini,
 )
+from omnigent.llms.errors import ContextWindowExceededError
+from omnigent.llms.types import FunctionCallOutput
+from omnigent.runtime.llm_retry import classify_llm_error
 
 # ── Request translation ──────────────────────────────────
 
@@ -307,6 +315,65 @@ def test_string_user_content_becomes_text_part() -> None:
     assert payload["contents"][0]["parts"] == [{"text": "Hello"}]
 
 
+# ── Streaming ─────────────────────────────────────────────
+
+
+def _parallel_function_call_chunk() -> dict:
+    """A single Gemini stream chunk with two parallel function calls."""
+    return {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"functionCall": {"name": "get_weather", "args": {"city": "London"}}},
+                        {"functionCall": {"name": "get_time", "args": {"tz": "UTC"}}},
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ],
+        "usageMetadata": {},
+    }
+
+
+def test_stream_parallel_function_calls_get_distinct_indices() -> None:
+    """
+    Parallel ``functionCall`` parts in one chunk must each receive a
+    distinct ``tool_calls`` index. A fixed index of 0 makes the downstream
+    accumulator collapse them into one call with concatenated arguments.
+    """
+    chunks = list(_gemini_stream_chunk_to_chat(_parallel_function_call_chunk()))
+    indices = [
+        tc["index"]
+        for chunk in chunks
+        for choice in chunk["choices"]
+        for tc in (choice["delta"].get("tool_calls") or [])
+    ]
+    assert indices == [0, 1]
+
+
+async def test_stream_parallel_function_calls_survive_accumulation() -> None:
+    """
+    Two parallel Gemini function calls in a streamed response are assembled
+    into two separate, uncorrupted ``FunctionCallOutput``s — matching what the
+    non-streaming path produces for the same content.
+    """
+
+    async def _chunks():
+        for chunk in _gemini_stream_chunk_to_chat(_parallel_function_call_chunk()):
+            yield chunk
+
+    events = [e async for e in chat_stream_to_response_events(_chunks(), model="gemini-test")]
+    response = events[-1].response
+    calls = [o for o in response.output if isinstance(o, FunctionCallOutput)]
+
+    assert len(calls) == 2
+    by_name = {c.name: c for c in calls}
+    assert json.loads(by_name["get_weather"].arguments) == {"city": "London"}
+    assert json.loads(by_name["get_time"].arguments) == {"tz": "UTC"}
+
+
 # ── Streaming chunk translation ──────────────────────────
 
 
@@ -500,3 +567,62 @@ def test_file_data_without_data_uri_raises() -> None:
     }
     with pytest.raises(ValueError, match="data: URI"):
         _translate_part_to_gemini(part)
+
+
+# ── Streaming error body buffering ───────────────────────
+
+
+def test_streamed_400_overflow_classified_as_context_window_exceeded(
+    serve_streamed_response,
+) -> None:
+    """
+    A streamed HTTP 400 buffers the error body before raising so
+    ``classify_llm_error`` can detect context-window overflow.
+
+    Without the ``aread()`` guard in ``_stream_request`` the body of a
+    streamed error response is never read; ``exc.response.text`` then
+    raises ``ResponseNotRead``, degrades to
+    ``"<unreadable response body>"``, and a genuine overflow 400 is
+    misclassified as a plain ``PermanentLLMError`` — the workflow's
+    compact-and-retry path never fires.
+
+    Failure meaning: the guard has been removed and streaming Gemini
+    (and Vertex, which inherits ``_stream_request``) overflow errors
+    no longer trigger compaction.
+    """
+    overflow_body = json.dumps(
+        {
+            "error": {
+                "code": 400,
+                "message": (
+                    "The input token count (1194139) exceeds the maximum"
+                    " number of tokens allowed (1048576)."
+                ),
+                "status": "INVALID_ARGUMENT",
+            }
+        }
+    ).encode()
+    serve_streamed_response(400, overflow_body)
+
+    adapter = GeminiAdapter()
+
+    async def _run() -> Exception:
+        gen = adapter._stream_request(
+            "https://fake-host/v1beta/models/gemini-test:streamGenerateContent",
+            {},
+            {"contents": []},
+        )
+        try:
+            async for _ in gen:
+                pass
+        except httpx.HTTPStatusError as exc:
+            return classify_llm_error(exc, [429, 500, 502, 503])
+        raise AssertionError("Expected HTTPStatusError was not raised")
+
+    err = asyncio.run(_run())
+
+    assert isinstance(err, ContextWindowExceededError)
+    assert err.max_context_tokens == 1048576
+    assert err.actual_tokens == 1194139
+    assert err.detail is not None
+    assert "input token count" in (err.detail.response_body or "")

@@ -205,6 +205,80 @@ def test_cache_key_stdio_args_changes_key() -> None:
     assert key_prod != key_dev
 
 
+def _stdio_config_with_env(env: dict[str, str]) -> MCPServerConfig:
+    """A stdio config fixed in every field except the ``env`` overlay."""
+    return MCPServerConfig(
+        name="my-mcp",
+        transport="stdio",
+        command="my-mcp",
+        args=["run"],
+        env=env,
+    )
+
+
+def test_cache_key_stdio_env_changes_key() -> None:
+    """
+    Different ``env`` overlays on an otherwise-identical stdio
+    config produce different cache keys — a server's registered
+    tool surface can depend on its env (e.g. a read-only gate
+    like ``MY_MCP_READONLY``).
+
+    What breaks if this fails: an orchestrator that declares a
+    read-only variant of a server (``READONLY=1``) and a
+    sub-agent that declares the full variant (``READONLY=0``),
+    identical command/args, share one cache entry; whichever
+    connects first pins the tools/list, so a sub-agent dispatched
+    within the TTL sees the read-only surface and its remaining
+    tools silently vanish.
+    """
+    key_ro = _cache_key(_stdio_config_with_env({"MY_MCP_READONLY": "1"}))
+    key_rw = _cache_key(_stdio_config_with_env({"MY_MCP_READONLY": "0"}))
+    assert key_ro != key_rw
+    # Same mapping (any insertion order) still shares one entry.
+    assert _cache_key(_stdio_config_with_env({"A": "1", "B": "2"})) == _cache_key(
+        _stdio_config_with_env({"B": "2", "A": "1"})
+    )
+    # Secrets never appear verbatim in the key (keys reach logs).
+    key_secret = _cache_key(_stdio_config_with_env({"TOKEN": "sk-hunter2"}))
+    assert "sk-hunter2" not in key_secret
+
+
+def _http_config(
+    headers: dict[str, str] | None = None,
+    databricks_profile: str | None = None,
+) -> MCPServerConfig:
+    """An HTTP config fixed in every field except headers / profile."""
+    return MCPServerConfig(
+        name="remote",
+        transport="http",
+        url="https://mcp.example.com/sse",
+        headers=headers or {},
+        databricks_profile=databricks_profile,
+    )
+
+
+def test_cache_key_http_headers_and_profile_change_key() -> None:
+    """
+    Different HTTP ``headers`` (e.g. different Authorization
+    bearers) or a different ``databricks_profile`` produce
+    different cache keys, and header values never appear verbatim
+    in the key.
+
+    What breaks if this fails: two agents pointing at one MCP URL
+    with different credentials share a cached tools/list even when
+    the server scopes its tool surface by principal —
+    ``databricks_profile`` resolves to an Authorization header at
+    connect() time, so it is an identity field too.
+    """
+    key_a = _cache_key(_http_config(headers={"Authorization": "Bearer tok_a"}))
+    key_b = _cache_key(_http_config(headers={"Authorization": "Bearer tok_b"}))
+    assert key_a != key_b
+    assert "tok_a" not in key_a
+    assert _cache_key(_http_config(databricks_profile="oss")) != _cache_key(
+        _http_config(databricks_profile="prod")
+    )
+
+
 def test_cache_key_stdio_and_http_do_not_collide() -> None:
     """
     A stdio server named ``my-mcp`` and an HTTP server named
@@ -1334,14 +1408,14 @@ async def test_http_connect_passes_url_to_transport() -> None:
     """
     config = MCPServerConfig(
         name="test-http",
-        url="https://mcp.example.com/sse",
+        url="https://mcp.example.com/mcp",
     )
 
     with _mock_http_transport() as captured:
         conn = McpServerConnection(config=config)
         await conn.connect()
 
-    assert captured.transport_kwargs["url"] == "https://mcp.example.com/sse"
+    assert captured.transport_kwargs["url"] == "https://mcp.example.com/mcp"
 
     await conn.close()
 
@@ -1406,10 +1480,15 @@ async def test_http_falls_back_to_sse_when_streamable_fails() -> None:
     would fail to connect. If ``streamablehttp_client`` is not
     tried first, Streamable HTTP servers (e.g. Databricks MCP
     gateways) would get the wrong transport.
+
+    A non-``/sse`` URL is used on purpose: an ``…/sse`` URL is routed
+    straight to the SSE client by ``_is_sse_endpoint`` and would bypass
+    Streamable HTTP entirely, so it would not exercise the fallback this
+    test guards.
     """
     config = MCPServerConfig(
         name="test-sse-fallback",
-        url="http://legacy-mcp.example.com/sse",
+        url="http://legacy-mcp.example.com/mcp",
         headers={"Authorization": "Bearer tok"},
     )
 
@@ -1442,7 +1521,7 @@ async def test_http_falls_back_to_sse_when_streamable_fails() -> None:
     with patch(
         "omnigent.tools.mcp.streamablehttp_client",
         side_effect=RuntimeError("server returned text/html, not application/json"),
-    ):
+    ) as mock_streamable:
         with patch(
             "omnigent.tools.mcp.sse_client",
             side_effect=_capturing_sse,
@@ -1454,8 +1533,13 @@ async def test_http_falls_back_to_sse_when_streamable_fails() -> None:
                 conn = McpServerConnection(config=config)
                 tools = await conn.connect()
 
+    # Streamable HTTP was tried first and failed, so the fallback ran.
+    assert mock_streamable.called, (
+        "Streamable HTTP must be tried first for a non-/sse URL; if it was "
+        "skipped, the SSE fallback this test guards was never exercised"
+    )
     # Fallback reached sse_client with the correct URL and headers.
-    assert captured_sse_kwargs["url"] == "http://legacy-mcp.example.com/sse", (
+    assert captured_sse_kwargs["url"] == "http://legacy-mcp.example.com/mcp", (
         "SSE fallback must receive the same URL as the original config"
     )
     assert captured_sse_kwargs["headers"] == {"Authorization": "Bearer tok"}, (
@@ -2335,3 +2419,83 @@ async def test_call_tool_with_elicitation_raises_on_second_mrtr() -> None:
     )
 
     await conn.close()
+
+
+# ── _is_sse_endpoint / legacy-SSE routing ────────────────
+
+
+def test_is_sse_endpoint_detects_sse_paths() -> None:
+    """
+    URLs whose path ends in a ``/sse`` segment are legacy-SSE
+    endpoints (e.g. crawl4ai's ``/mcp/sse``). The Streamable HTTP
+    client hangs in teardown against such a server, so the transport
+    router must detect these and use the SSE client directly.
+    """
+    from omnigent.tools.mcp import _is_sse_endpoint
+
+    assert _is_sse_endpoint("http://h:1/mcp/sse")
+    assert _is_sse_endpoint("http://h:1/mcp/sse/")  # trailing slash
+    assert _is_sse_endpoint("http://h:1/sse")
+    assert not _is_sse_endpoint("http://h:1/mcp")
+    assert not _is_sse_endpoint("http://h:1/")
+    assert not _is_sse_endpoint("http://h:1")
+    assert not _is_sse_endpoint("http://h:1/mcp/sse-events")  # not a /sse segment
+
+
+@pytest.mark.asyncio()
+async def test_open_http_transport_routes_sse_url_straight_to_sse() -> None:
+    """
+    An ``…/sse`` URL goes directly to the SSE transport.
+
+    The Streamable HTTP client hangs in teardown against an SSE-only
+    server (crawl4ai), so it must be SKIPPED — not merely
+    tried-then-fallen-back-from, because the hang prevents the
+    fallback from ever running.
+    """
+    from contextlib import AsyncExitStack
+
+    conn = McpServerConnection(config=MCPServerConfig(name="c", url="http://h:1/mcp/sse"))
+    calls: list[str] = []
+
+    async def fake_sse(stack, timeout, headers):
+        calls.append("sse")
+        return ("r", "w")
+
+    async def fake_streamable(stack, timeout, headers):
+        calls.append("streamable")
+        return ("r", "w")
+
+    conn._open_sse_transport = fake_sse  # type: ignore[method-assign]
+    conn._open_streamable_http_transport = fake_streamable  # type: ignore[method-assign]
+    async with AsyncExitStack() as stack:
+        await conn._open_http_transport(stack)
+
+    assert calls == ["sse"], "…/sse URL must skip Streamable HTTP entirely"
+
+
+@pytest.mark.asyncio()
+async def test_open_http_transport_uses_streamable_for_non_sse_url() -> None:
+    """
+    A plain HTTP MCP URL still tries Streamable HTTP first (with the
+    existing SSE fallback on failure) — the routing change must not
+    regress modern Streamable-HTTP servers.
+    """
+    from contextlib import AsyncExitStack
+
+    conn = McpServerConnection(config=MCPServerConfig(name="c", url="http://h:1/mcp"))
+    calls: list[str] = []
+
+    async def fake_sse(stack, timeout, headers):
+        calls.append("sse")
+        return ("r", "w")
+
+    async def fake_streamable(stack, timeout, headers):
+        calls.append("streamable")
+        return ("r", "w")
+
+    conn._open_sse_transport = fake_sse  # type: ignore[method-assign]
+    conn._open_streamable_http_transport = fake_streamable  # type: ignore[method-assign]
+    async with AsyncExitStack() as stack:
+        await conn._open_http_transport(stack)
+
+    assert calls == ["streamable"], "plain URL must try Streamable HTTP first"

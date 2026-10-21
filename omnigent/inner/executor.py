@@ -36,6 +36,8 @@ ToolArgs: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ToolResult: TypeAlias = Any  # type: ignore[explicit-any]
 ToolCallMetadata: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
 ExecutorExtra: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+ExecutorUsage: TypeAlias = dict[str, Any]  # type: ignore[explicit-any]
+CompactedMessages: TypeAlias = list[Message]
 
 # ``enqueue_session_message`` content — arbitrary user-supplied payload
 # (string text or a structured JSON value).
@@ -47,6 +49,22 @@ EnqueuedContent: TypeAlias = Any  # type: ignore[explicit-any]
 # provider-opaque via this TypeAlias — callers narrow with their own ``cast``
 # or per-event isinstance checks, matching the existing peer-file pattern.
 ProviderStreamItem: TypeAlias = Any  # type: ignore[explicit-any]
+
+
+def describe_exception(exc: BaseException) -> str:
+    """Return a non-empty, human-readable description of *exc*.
+
+    ``str(exc)`` is empty for several stdlib exceptions raised without a
+    message (a bare ``RuntimeError()``, ``TimeoutError()``, etc.). Executors
+    that report a failure by ``str(exc)`` then surface a blank error to the
+    operator (issue #4281: "inner executor error: " with no detail). Fall back
+    to ``repr(exc)`` — which always includes the class name — so a failure is
+    never reported without at least naming its type.
+
+    :param exc: The exception to describe.
+    :returns: ``str(exc)`` when non-empty, otherwise ``repr(exc)``.
+    """
+    return str(exc) or repr(exc)
 
 
 @runtime_checkable
@@ -114,8 +132,7 @@ class TextChunk(ExecutorEvent):
 class ReasoningChunk(ExecutorEvent):
     """Streaming reasoning / chain-of-thought output.
 
-    Mirrors :class:`omnigent.runtime.executors.base.ReasoningChunk` so the
-    workflow's ``_event_to_sse_dict`` can map either flavor onto the same
+    The workflow's ``_event_to_sse_dict`` maps this onto the
     ``response.reasoning_text.delta`` / ``response.reasoning.started`` SSE
     events.
 
@@ -173,7 +190,7 @@ class TurnComplete(ExecutorEvent):
     response: str | None = None
     modified_by_policy: bool = False
     continue_turn: bool = False
-    usage: dict[str, Any] | None = None
+    usage: ExecutorUsage | None = None
 
 
 class ToolCallStatus(str, enum.Enum):
@@ -209,6 +226,96 @@ class ToolCallComplete(ExecutorEvent):
     error: str | None = None
     duration_ms: float = 0.0
     metadata: ToolCallMetadata = field(default_factory=dict)
+
+
+@dataclass
+class CompactionStarted(ExecutorEvent):
+    """The harness detected that compaction is about to begin.
+
+    Emitted as soon as the compaction signal is received, before the
+    compacted state is available.  Allows clients to show a progress
+    indicator while compaction is in flight.
+    """
+
+
+@dataclass
+class CompactionComplete(ExecutorEvent):
+    """The harness compacted its internal context.
+
+    The runner persists this as a compaction item so resumed sessions
+    receive pre-compacted history.
+
+    :param summary: Text summary of the compacted conversation.
+    :param token_count: Estimated token count of the summary.
+    :param model: Model used for summarization, or None if truncation-based.
+    :param compacted_messages: The compacted message list that replaces
+        the pre-compaction history, stored by the runner so a resumed
+        session replays these instead of the full original history.
+        ``None`` when the harness cannot export its compacted state
+        (e.g. claude-sdk where compaction is internal to the CLI).
+    """
+
+    summary: str
+    token_count: int
+    model: str | None = None
+    compacted_messages: CompactedMessages | None = None
+
+
+@dataclass
+class SubAgentStarted(ExecutorEvent):
+    """A sub-agent the harness agent spawned has begun.
+
+    Surfaced so the runner can mint an Omnigent child session (the web
+    "Subagents" panel lists one row per child). ACP has no standardized
+    sub-agent signal, so a per-dialect ``AcpSubAgentSource`` normalizes an
+    agent's own reporting (e.g. Devin's ``cognition.ai/subagent_*`` ``_meta``)
+    into this event — see :mod:`omnigent.inner.acp_subagents`.
+
+    :param child_key: Stable, per-turn-unique id for the sub-agent, used both to
+        correlate the later :class:`SubAgentCompleted` and as the idempotency
+        key when the child session is minted.
+    :param title: Short human label for the row, e.g. ``"mathutils"``.
+    :param task: The instruction the sub-agent was given, shown on the row.
+    """
+
+    child_key: str
+    title: str
+    task: str = ""
+
+
+@dataclass
+class SubAgentCompleted(ExecutorEvent):
+    """A previously-started sub-agent finished. See :class:`SubAgentStarted`.
+
+    :param child_key: Matches the :attr:`SubAgentStarted.child_key`.
+    :param ok: Whether the sub-agent reported success.
+    :param summary: The sub-agent's closing summary, shown on the child row.
+    """
+
+    child_key: str
+    ok: bool = True
+    summary: str = ""
+
+
+@dataclass
+class SubAgentToolCall(ExecutorEvent):
+    """A tool call an ACP sub-agent ran, to append to its child transcript.
+
+    Distinct from :class:`ToolCallRequest`, which renders in the *parent* stream:
+    this is a call the sub-agent made inside its delegated work, routed to the
+    sub-agent's own child session by :attr:`child_key`. See
+    :mod:`omnigent.inner.acp_subagents`.
+
+    :param child_key: Matches the owning :attr:`SubAgentStarted.child_key`.
+    :param call_id: The tool call's id, used as the child item's ``call_id``.
+    :param name: Human tool label for the card, e.g. ``"Wrote mathutils.py"``.
+    :param args: The tool's arguments (its raw input).
+    """
+
+    child_key: str
+    call_id: str
+    name: str
+    args: ToolArgs = field(default_factory=dict)
 
 
 @dataclass

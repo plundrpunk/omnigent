@@ -40,8 +40,8 @@ import threading
 from collections.abc import MutableMapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.inner.credential_proxy import CredentialRewriteRule
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.proxy import EgressProxy
@@ -91,8 +91,8 @@ class EgressProxyHandle:
     socket_path: Path
     ca_bundle_path: Path
     auth_token: str | None
-    _proxy: Any = field(repr=False)
-    _loop: Any = field(repr=False)
+    _proxy: EgressProxy = field(repr=False)
+    _loop: asyncio.AbstractEventLoop = field(repr=False)
     _thread: threading.Thread = field(repr=False)
     _stopped: bool = field(default=False, repr=False)
 
@@ -158,7 +158,15 @@ def start_egress_proxy(
         support).
     :returns: A live :class:`EgressProxyHandle`. Caller must invoke
         :meth:`EgressProxyHandle.stop` on cleanup.
+    :raises OSError: On Windows, where the L7 egress proxy (a Unix-socket
+        MITM listener) is unavailable.
     """
+    if IS_WINDOWS:
+        raise OSError(
+            "L7 egress filtering (os_env.sandbox.egress_rules) is not supported "
+            "on Windows: the egress proxy relies on a Unix-domain socket. Remove "
+            "the egress rules to run this agent on Windows, or run it on Linux/macOS."
+        )
     parsed_rules = parse_rules(list(rules))
     ca_cert_path, ca_key_path = ensure_ca()
     bundle_path = ensure_ca_bundle(ca_cert_path)

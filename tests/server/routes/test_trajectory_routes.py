@@ -618,7 +618,7 @@ async def test_goal_rejects_inaccessible_session_before_dispatch(
     _, permissions = stores
     if session == "read_only":
         permissions.grant(ALICE, seeded["bob"], LEVEL_READ)
-    conversation_id = "conv_missing" if session == "missing" else seeded["bob"]
+    conversation_id = "0" * 32 if session == "missing" else seeded["bob"]
     before = registry.list()
     response = await client.post(
         "/v1/goal",

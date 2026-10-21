@@ -41,6 +41,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from omnigent.model_fallbacks import CODING_AGENT_STATIC_MODELS
 from omnigent.native_coding_agents import native_coding_agent_for_terminal_name
 
 logger = logging.getLogger(__name__)
@@ -121,6 +122,11 @@ def _model(model_id: str, label: str | None = None) -> ModelEntry:
     return ModelEntry(id=model_id, label=label or model_id, source="static")
 
 
+def _static_models(agent_key: str) -> tuple[ModelEntry, ...]:
+    """The owned static model menu for ``agent_key`` (see ``model_fallbacks``)."""
+    return tuple(_model(m) for m in CODING_AGENT_STATIC_MODELS[agent_key].model_ids)
+
+
 #: The registry. Adding an agent is one entry here; discovery, the model
 #: catalog and the ``/v1/coding-agents`` payload all follow from it.
 CODING_AGENT_SPECS: tuple[CodingAgentSpec, ...] = (
@@ -146,14 +152,7 @@ CODING_AGENT_SPECS: tuple[CodingAgentSpec, ...] = (
         binary="codex",
         vendor="OpenAI",
         model_flag="-m",
-        static_models=(
-            _model("gpt-5.3-codex"),
-            _model("gpt-5.2-codex"),
-            _model("gpt-5.1-codex"),
-            _model("gpt-5.1-codex-max"),
-            _model("gpt-5.1-codex-mini"),
-            _model("gpt-5-codex"),
-        ),
+        static_models=_static_models("codex"),
         login_command="codex login",
         acp="adapter",
         acp_note="via codex-acp",
@@ -164,12 +163,7 @@ CODING_AGENT_SPECS: tuple[CodingAgentSpec, ...] = (
         binary="gemini",
         vendor="Google",
         model_flag="-m",
-        static_models=(
-            _model("gemini-3.1-pro"),
-            _model("gemini-3.1-flash"),
-            _model("gemini-2.5-pro"),
-            _model("gemini-2.5-flash"),
-        ),
+        static_models=_static_models("gemini"),
         login_command="gemini auth login",
         acp="native",
         notes=(
@@ -210,13 +204,7 @@ CODING_AGENT_SPECS: tuple[CodingAgentSpec, ...] = (
         binary="copilot",
         vendor="GitHub",
         model_flag="--model",
-        static_models=(
-            _model("auto", "Auto (Copilot picks)"),
-            _model("gpt-5.4"),
-            _model("gpt-5.3-codex"),
-            _model("claude-opus-4-5"),
-            _model("claude-sonnet-4-5"),
-        ),
+        static_models=(_model("auto", "Auto (Copilot picks)"), *_static_models("copilot")),
         login_command="copilot login",
     ),
     CodingAgentSpec(

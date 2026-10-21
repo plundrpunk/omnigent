@@ -20,8 +20,9 @@ Configuration comes from the server environment:
 - ``HA_GOAL_CWD`` — working directory for the subprocess (the
   harness-automaton checkout). Unset ⇒ 503.
 - ``HA_GOAL_WORKDIR`` — ``--workdir`` passed to the CLI (default
-  ``runs-goal``); artifacts land in ``<workdir>/goal/<goal_id>.<run_id>/``
-  (run-scoped, so a reused caller-chosen goal id never reads another run's).
+  ``runs-goal``); artifacts land in
+  ``<workdir>/runs/<run_id>/goal/<goal_id>.<run_id>/`` (run-scoped, so a reused
+  caller-chosen goal id never reads another run's).
 - Fleet dispatch uses the existing AMS bridge configuration and
   ``AOS_FLEET_GOAL_PROJECT`` (default ``fleet-autonomy``). The daemon
   controls the workspace; fleet requests cannot supply an ``exec`` block.
@@ -104,8 +105,14 @@ _STDERR_TAIL_CHARS = 8 * 1024
 #: absent: a bridge-started run never gets an unsandboxed shell.
 _EXEC_SANDBOXES = ("subprocess", "docker")
 
+#: Set to 1/true/yes to let a request select ``exec.sandbox="subprocess"``.
+#: Off by default: SubprocessToolRuntime is a guardrail, not a sandbox -- any
+#: interpreter it permits can still read the wider filesystem and reach the
+#: network. Model-proposed commands belong in Docker.
+_ALLOW_SUBPROCESS_ENV = "OMNIGENT_GOAL_ALLOW_SUBPROCESS_SANDBOX"
+
 #: Default sandbox when an exec block omits one — the stricter of the two.
-_DEFAULT_EXEC_SANDBOX = "subprocess"
+_DEFAULT_EXEC_SANDBOX = "docker"
 
 #: ``--command`` is a completion endpoint (a CLI or shim). A bare name or
 #: an absolute path is allowed; no spaces, quotes, or shell metacharacters,
@@ -113,14 +120,35 @@ _DEFAULT_EXEC_SANDBOX = "subprocess"
 _EXEC_COMMAND_RE = re.compile(r"^/?[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 
 #: Endpoint knobs for openai-compatible / anthropic / ollama providers.
-#: ``api_key_env`` is the NAME of a server-side env var — a request can
-#: select which key the server uses but can never supply or read one.
 _ENDPOINT_FIELDS: dict[str, str] = {
     "base_url": "--base-url",
     "api_key_env": "--api-key-env",
 }
 
-_API_KEY_ENV_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
+#: Env var holding the comma-separated names a request may select via
+#: ``api_key_env``. Empty (the default) means requests may not choose a key
+#: at all.
+#:
+#: A caller must never be able to pair an arbitrary env var name with an
+#: arbitrary URL: the server holds many secrets, and "use ANTHROPIC_API_KEY,
+#: send it to https://attacker.example" is a complete exfiltration primitive.
+#: Existence in os.environ is not a safety property -- every secret exists in
+#: os.environ. Only an explicit server-side allowlist is.
+_API_KEY_ENV_ALLOWLIST_ENV = "OMNIGENT_GOAL_API_KEY_ENVS"
+
+#: Env var holding the comma-separated base URLs a request may select.
+#: Empty (the default) means requests may not choose an endpoint.
+_BASE_URL_ALLOWLIST_ENV = "OMNIGENT_GOAL_BASE_URLS"
+
+
+def _env_flag(env_name: str) -> bool:
+    return os.environ.get(env_name, "").strip().lower() in ("1", "true", "yes")
+
+
+def _allowlist(env_name: str) -> frozenset[str]:
+    raw = os.environ.get(env_name, "")
+    return frozenset(item.strip() for item in raw.split(",") if item.strip())
+
 
 #: The harness's own role set (harness_automaton.roles.DEFAULT_ROLES).
 #: There is no "orchestrator" — ``planner`` is the role that decomposes the
@@ -166,26 +194,51 @@ def _validate_role_models(spec: Any) -> list[str]:
 
 
 def _validate_endpoint(body: dict[str, Any]) -> dict[str, str]:
-    """Validate optional ``base_url`` / ``api_key_env`` overrides."""
+    """Validate optional ``base_url`` / ``api_key_env`` overrides.
+
+    Both are checked against a server-side allowlist, not merely validated for
+    shape. A caller that can name any env var and any URL can make the server
+    post any secret it holds to any host it likes.
+    """
     out: dict[str, str] = {}
+
     base_url = body.get("base_url")
     if base_url is not None:
-        if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
-            raise HTTPException(status_code=422, detail="base_url must be an http(s) URL")
-        out["base_url"] = base_url
-    api_key_env = body.get("api_key_env")
-    if api_key_env is not None:
-        if not isinstance(api_key_env, str) or not _API_KEY_ENV_RE.match(api_key_env):
+        allowed_urls = _allowlist(_BASE_URL_ALLOWLIST_ENV)
+        if not isinstance(base_url, str):
+            raise HTTPException(status_code=422, detail="base_url must be a string")
+        if base_url not in allowed_urls:
             raise HTTPException(
                 status_code=422,
-                detail="api_key_env must be an environment variable NAME, not a key",
+                detail=(
+                    "base_url is not allowlisted on this server; "
+                    f"set {_BASE_URL_ALLOWLIST_ENV} to permit it"
+                ),
+            )
+        out["base_url"] = base_url
+
+    api_key_env = body.get("api_key_env")
+    if api_key_env is not None:
+        allowed_keys = _allowlist(_API_KEY_ENV_ALLOWLIST_ENV)
+        if not isinstance(api_key_env, str):
+            raise HTTPException(status_code=422, detail="api_key_env must be a string")
+        if api_key_env not in allowed_keys:
+            # Deliberately does not say whether the variable exists: that alone
+            # would let a caller enumerate the server's secrets by name.
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "api_key_env is not allowlisted on this server; "
+                    f"set {_API_KEY_ENV_ALLOWLIST_ENV} to permit it"
+                ),
             )
         if api_key_env not in os.environ:
             raise HTTPException(
                 status_code=422,
-                detail=f"{api_key_env} is not set in the server environment",
+                detail=f"{api_key_env} is allowlisted but not set in the environment",
             )
         out["api_key_env"] = api_key_env
+
     return out
 
 
@@ -250,6 +303,20 @@ def _automaton_bin() -> str:
 
 def _goal_cwd() -> str:
     return os.environ.get("HA_GOAL_CWD") or ""
+
+
+def _run_workdir(run_id: str) -> Path:
+    """Per-run working directory.
+
+    The harness writes artifacts to ``<workdir>/goal/<goal_id>/``. Two runs of
+    the same goal_id therefore share a directory unless each run gets its own
+    workdir: the second run would read the first's blocker and outcome files,
+    and a concurrent pair would interleave evidence.
+    """
+    workdir = Path(_goal_workdir())
+    if not workdir.is_absolute():
+        workdir = Path(_goal_cwd()) / workdir
+    return workdir / "runs" / run_id
 
 
 def _goal_workdir() -> str:
@@ -327,6 +394,15 @@ def _validate_exec(spec: Any) -> dict[str, Any] | None:
         raise HTTPException(
             status_code=422,
             detail=f"exec.sandbox must be one of {', '.join(_EXEC_SANDBOXES)}",
+        )
+    if sandbox == "subprocess" and not _env_flag(_ALLOW_SUBPROCESS_ENV):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "exec.sandbox='subprocess' is disabled on this server; "
+                "model-proposed commands run in Docker. Set "
+                f"{_ALLOW_SUBPROCESS_ENV}=1 to permit it."
+            ),
         )
 
     allow_write = spec.get("allow_write", False)
@@ -440,11 +516,35 @@ class GoalRunRegistry:
     def get(self, run_id: str) -> dict[str, Any] | None:
         return self._runs.get(run_id)
 
-    def list(self, conversation_id: str | None = None) -> list[dict[str, Any]]:
+    def list(
+        self,
+        conversation_id: str | None = None,
+        *,
+        owner: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Runs, newest first; ``owner`` keeps only that owner's runs.
+
+        ``owner=None`` is unrestricted. Routes apply the full read rule
+        (including ownerless legacy runs) via ``_can_read``.
+        """
         runs = list(self._runs.values())
         if conversation_id is not None:
             runs = [r for r in runs if r.get("conversation_id") == conversation_id]
+        if owner is not None:
+            runs = [r for r in runs if r.get("owner") == owner]
         return sorted(runs, key=lambda r: r["started_at"], reverse=True)
+
+    def get_for(self, run_id: str, owner: str | None) -> dict[str, Any] | None:
+        """One run, or None when it is missing *or* owned by someone else.
+
+        Both cases return None so a caller cannot confirm another user's run.
+        """
+        run = self._runs.get(run_id)
+        if run is None:
+            return None
+        if owner is not None and run.get("owner") != owner:
+            return None
+        return run
 
     def running_count(self) -> int:
         return sum(
@@ -633,11 +733,11 @@ async def _refresh_fleet_goal(run: dict[str, Any]) -> None:
 async def _execute_goal_run(run: dict[str, Any]) -> None:
     """Run the CLI to completion and fold exit code + artifacts into ``run``."""
     contract = run["contract"]
-    # The harness names its artifact dir ``<workdir>/goal/<goal_id>/`` and
-    # never clears it. ``goal_id`` is caller-chosen, so a reused id would
-    # read back an earlier run's (or another owner's) outcome, blocker and
-    # checkpoint. Hand the harness a run-scoped id; the record keeps the
-    # caller's goal_id.
+    run_workdir = _run_workdir(str(run["run_id"]))
+    run_workdir.mkdir(parents=True, exist_ok=True)
+    # The harness names its artifact dir ``<workdir>/goal/<goal_id>/`` and never
+    # clears it. ``goal_id`` is caller-chosen, so besides the per-run workdir the
+    # harness also gets a run-scoped id; the record keeps the caller's goal_id.
     harness_goal_id = f"{contract['goal_id']}.{run['run_id']}"
     with tempfile.NamedTemporaryFile(
         "w", suffix=".json", delete=False, encoding="utf-8"
@@ -650,7 +750,7 @@ async def _execute_goal_run(run: dict[str, Any]) -> None:
         "--contract",
         contract_path,
         "--workdir",
-        _goal_workdir(),
+        str(run_workdir),
         "--json",
     ]
     provider = run.get("provider")
@@ -707,10 +807,7 @@ async def _execute_goal_run(run: dict[str, Any]) -> None:
         with suppress(OSError):
             os.unlink(contract_path)
 
-    workdir = Path(_goal_workdir())
-    if not workdir.is_absolute():
-        workdir = Path(_goal_cwd()) / workdir
-    artifact_dir = workdir / "goal" / harness_goal_id
+    artifact_dir = run_workdir / "goal" / harness_goal_id
     outcome = _parse_trailing_json(stdout)
     outcome_file = _read_artifact(artifact_dir / "goal-outcome.json")
     if outcome_file is not None:
@@ -745,7 +842,9 @@ def create_goal_router(
         user. ``None`` in single-user mode (endpoint is open).
     :param conversation_store: Sessions used by the shared access check.
     :param permission_store: Session grants and explicit admin flags;
-        ``None`` disables session checks, but not goal owner checks.
+        ``None`` disables session checks, but not goal owner checks. In
+        multi-user mode exec-capable runs need its admin flag; without the
+        store they are refused.
     :returns: A configured :class:`APIRouter`.
 
     Reads require an exact owner match, even for shared sessions and admins.
@@ -785,6 +884,32 @@ def create_goal_router(
                     "Goal bridge not configured — set HA_AUTOMATON_BIN and "
                     "HA_GOAL_CWD in the server environment."
                 ),
+            )
+
+    async def _require_exec_admin(owner: str | None, exec_spec: dict[str, Any] | None) -> None:
+        """Exec-capable runs are shared command execution, so they are admin-only.
+
+        Multi-user callers can otherwise bypass any UI affordance and ask the
+        server to start a writable harness run directly. Single-user local mode
+        remains allowed via the reserved ``local`` identity.
+        """
+        if exec_spec is None or auth_provider is None or owner == RESERVED_USER_LOCAL:
+            return
+        if permission_store is None:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Goal exec requests require an admin check, and no permission "
+                    "store is configured on this server."
+                ),
+            )
+        if owner is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        is_admin = await asyncio.to_thread(permission_store.is_admin, owner)
+        if not is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail="Goal exec requests are restricted to admin users.",
             )
 
     @router.get("/goal/config")
@@ -845,6 +970,7 @@ def create_goal_router(
         limits = _validate_limits(body.get("limits"))
         endpoint = _validate_endpoint(body)
         role_models = _validate_role_models(body.get("role_models"))
+        await _require_exec_admin(user_id, exec_spec)
         if registry.running_count() >= _MAX_CONCURRENT_RUNS:
             raise HTTPException(
                 status_code=429,
@@ -918,7 +1044,7 @@ def create_goal_router(
             await _refresh_fleet_goal(run)
             return {"run_id": run_id, "status": run["status"], "events": [], "total": 0}
         _require_configured()
-        artifact = _artifact_for(run, allow_fallback=auth_provider is None)
+        artifact = _artifact_for(run)
         if artifact is None:
             return {"run_id": run_id, "status": run.get("status"), "events": [], "total": 0}
         try:
@@ -951,13 +1077,11 @@ _EVENT_TEXT_CAP = 400
 _MAX_EVENTS = 400
 
 
-def _artifact_for(run: dict[str, Any], *, allow_fallback: bool = True) -> Path | None:
+def _artifact_for(run: dict[str, Any]) -> Path | None:
     """Locate a run's artifact, during the run as well as after it.
 
-    A finished run names its artifact in the CLI outcome. The legacy
-    auth-disabled fallback selects the newest file in the shared directory.
-    Authenticated reads disable that shared-directory fallback: it cannot
-    establish which run (or owner) produced a file.
+    A finished run names its artifact in the CLI outcome. A running one does
+    not yet, so fall back to the newest artifact in this run's own workdir.
     """
     outcome = run.get("outcome") or {}
     if isinstance(outcome, dict):
@@ -966,9 +1090,13 @@ def _artifact_for(run: dict[str, Any], *, allow_fallback: bool = True) -> Path |
             candidate = Path(str(raw))
             if candidate.is_file():
                 return candidate
-    if not allow_fallback:
+    # Scoped to this run's own workdir. The previous global "newest artifact
+    # touched since the run began" fallback could serve another run's events
+    # entirely -- including another user's -- whenever two ran concurrently.
+    run_id = run.get("run_id")
+    if not run_id:
         return None
-    art_dir = Path(_goal_workdir()) / "artifacts"
+    art_dir = _run_workdir(str(run_id)) / "artifacts"
     if not art_dir.is_dir():
         return None
     files = [f for f in art_dir.glob("*.json") if f.is_file()]

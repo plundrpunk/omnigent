@@ -6,7 +6,7 @@
   "branch": "aos-simplify",
   "defaults": {
     "provider": "subprocess",
-    "model": "gpt-5.6-sol:medium",
+    "model": "${AOS_CHAIN_MODEL}",
     "exec": {
       "workspace": "/Users/drfoundryos/Documents/DevFolder/Omnigent",
       "sandbox": "subprocess",
@@ -21,14 +21,14 @@
       "timeout": 3600
     },
     "role_models": {
-      "planner": "subprocess:gpt-5.6-sol:high",
-      "critic": "subprocess:gpt-5.6-sol:high",
-      "verifier": "subprocess:gpt-5.6-sol:high",
-      "executor": "subprocess:gpt-5.6-sol:medium",
-      "revisor": "subprocess:gpt-5.6-sol:medium",
-      "optimizer": "subprocess:gpt-5.6-sol:medium",
-      "synthesizer": "subprocess:gpt-5.6-sol:medium",
-      "quarantine_parser": "subprocess:gpt-5.6-sol:medium"
+      "planner": "subprocess:${AOS_CHAIN_MODEL_HIGH}",
+      "critic": "subprocess:${AOS_CHAIN_MODEL_HIGH}",
+      "verifier": "subprocess:${AOS_CHAIN_MODEL_HIGH}",
+      "executor": "subprocess:${AOS_CHAIN_MODEL}",
+      "revisor": "subprocess:${AOS_CHAIN_MODEL}",
+      "optimizer": "subprocess:${AOS_CHAIN_MODEL}",
+      "synthesizer": "subprocess:${AOS_CHAIN_MODEL}",
+      "quarantine_parser": "subprocess:${AOS_CHAIN_MODEL}"
     }
   },
   "phases": [

@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
 
@@ -15,13 +19,14 @@ from omnigent.spec.types import (
     LLMConfig,
     LocalToolInfo,
     MCPServerConfig,
+    SharePolicy,
     SkillSpec,
     ToolRuntime,
     ToolsConfig,
 )
 from omnigent.tools import ToolManager
 from omnigent.tools.base import ToolContext
-from omnigent.tools.client_specified import ClientSideToolSpec
+from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.mcp import clear_discovery_cache
 
 _TEST_CTX = ToolContext(task_id="task_test", agent_id="agent_test")
@@ -53,11 +58,12 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # Read-only session discovery tools are registered for every
         # agent (a user-added agent that declares no sub-agents still
         # needs to list/peek/get-info on its session-mates); the
-        # spawn-lifecycle writes (sys_session_send/close/create) are
+        # mutating tools (sys_session_send/close/create/share) are
         # opt-in via tools.agents or the top-level ``spawn: true``.
         "sys_session_get_history",
         "sys_session_list",
         "sys_session_get_info",
+        "sys_session_rename",
         # Read-only agent discovery tools are likewise always available
         # (global, permission-bounded reads of any accessible session's
         # agent / bundle).
@@ -68,6 +74,22 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # browse the registry and add policies at runtime.
         "sys_add_policy",
         "sys_policy_registry",
+        # Scheduled-task management tools are always auto-registered
+        # so agents can create, list, update, and delete recurring
+        # runs without spec opt-in. They are runner-dispatched via
+        # the Omnigent server's REST API.
+        "sys_scheduled_task_create",
+        "sys_scheduled_task_list",
+        "sys_scheduled_task_update",
+        "sys_scheduled_task_delete",
+        # Embedded-browser tools are always auto-registered (framework-
+        # owned) so any agent can drive the desktop app's browser without
+        # the spec opting in. Schema-only; runner-dispatched.
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_screenshot",
     }
 )
 
@@ -96,6 +118,12 @@ def _non_lifecycle_schemas(
             and fn.get("name") in _ALWAYS_PRESENT_TOOLS
         )
     ]
+
+
+def test_session_rename_is_registered_for_every_agent() -> None:
+    names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
+
+    assert "sys_session_rename" in names
 
 
 @pytest.fixture()
@@ -164,6 +192,10 @@ def _make_spec(
         skills=skills or [],
         mcp_servers=mcp_servers or [],
         local_tools=local_tools or [],
+        # Without this, ``LoadSkillTool`` merges in host-scope skills from
+        # ~/.claude/skills and every .claude/skills above cwd, and these tests
+        # assert on whatever the developer happens to have installed.
+        skills_filter="none",
     )
 
 
@@ -271,11 +303,18 @@ def test_schemas_include_read_skill_file_with_resources(
 
 def test_schemas_exclude_read_skill_file_without_resources(
     skill_no_resources: SkillSpec,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     get_tool_schemas does NOT include read_skill_file when
     no skill has bundled resources.
     """
+    # Host-scope skill discovery falls back to cwd; run from an empty
+    # directory so this repo's own .claude/skills/ doesn't contribute
+    # resources to the check.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     mgr = ToolManager(
         _make_spec([skill_no_resources]),
     )
@@ -284,14 +323,94 @@ def test_schemas_exclude_read_skill_file_without_resources(
     assert "read_skill_file" not in names
 
 
-def test_schemas_empty_when_no_skills() -> None:
+def test_schemas_empty_when_no_skills(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     get_tool_schemas returns empty when agent has no skills,
     excluding the always-registered lifecycle tool
     (``sys_cancel_task``).
     """
+    # Host-scope skill discovery falls back to cwd; run from an empty
+    # directory so this repo's own .claude/skills/ doesn't contribute
+    # skills/resources to the check.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     mgr = ToolManager(_make_spec([]))
     assert _non_lifecycle_schemas(mgr) == []
+
+
+def test_schemas_isolate_a_failing_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A tool whose ``get_schema`` raises is skipped, not allowed to drop
+    the entire toolset: every other tool's schema is still returned and
+    a warning names the offending tool.
+
+    Regression test for the silent total-toolset drop in #378. A single
+    unimportable ``type: function`` tool (dotted ``callable`` path that
+    fails to import) used to abort the whole list comprehension, leaving
+    the model with zero declared tools and only a swallowed WARNING.
+    """
+
+    class _BoomTool:
+        def get_schema(self) -> dict[str, Any]:
+            raise ImportError("No module named 'boom'")
+
+    mgr = ToolManager(_make_spec([]))
+    healthy = {s["function"]["name"] for s in mgr.get_tool_schemas()}
+    assert healthy  # sanity: always-present lifecycle tools exist
+
+    mgr._tools["boom"] = _BoomTool()  # type: ignore[assignment]
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        schemas = mgr.get_tool_schemas()
+
+    names = {s["function"]["name"] for s in schemas}
+    assert "boom" not in names
+    assert names == healthy  # every healthy tool survived the bad one
+    assert any("boom" in record.getMessage() for record in caplog.records)
+
+
+def test_client_schemas_isolate_a_failing_tool(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A client-side tool whose ``get_schema`` raises is skipped, not
+    allowed to drop the entire client toolset: every other client tool's
+    schema is still returned and a warning names the offending tool.
+
+    Mirrors ``test_schemas_isolate_a_failing_tool`` for the
+    ``get_client_tool_schemas`` path that ``SpawnTool`` uses to propagate
+    client tools to sub-agents (#378).
+    """
+
+    class _BoomClientTool(ClientSideTool):
+        def get_schema(self) -> dict[str, Any]:
+            raise ImportError("No module named 'boom'")
+
+    mgr = ToolManager(_make_spec([]))
+    healthy_tool = ClientSideTool(
+        ClientSideToolSpec(
+            name="weather",
+            schema={"type": "function", "function": {"name": "weather"}},
+        )
+    )
+    mgr._tools["weather"] = healthy_tool
+    healthy = {s["function"]["name"] for s in mgr.get_client_tool_schemas()}
+    assert healthy == {"weather"}  # sanity: the good client tool is advertised
+
+    mgr._tools["boom"] = _BoomClientTool(ClientSideToolSpec(name="boom", schema={}))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.tools.manager"):
+        schemas = mgr.get_client_tool_schemas()
+
+    names = {s["function"]["name"] for s in schemas}
+    assert "boom" not in names
+    assert names == healthy  # the healthy client tool survived the bad one
+    assert any("boom" in record.getMessage() for record in caplog.records)
 
 
 def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
@@ -300,11 +419,13 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     ``sys_session_list`` / ``sys_session_get_info``) is registered for
     **every** agent, even one that declares no sub-agents — so a
     user-added agent can read its session-mates for context. The
-    spawn-lifecycle writes (``sys_session_send`` /
-    ``sys_session_close`` / ``sys_session_create``) are NOT registered
-    without an opt-in (``tools.agents`` or top-level ``spawn: true``).
-    A regression that registered the writes by default would expose
-    the child-session spawn surface to every custom agent.
+    opt-in session-spawn tools (``sys_session_send`` /
+    ``sys_session_close`` / ``sys_session_create`` /
+    ``sys_session_share``) are NOT registered without an opt-in
+    (``tools.agents`` or top-level ``spawn: true``). A regression that
+    registered the writes by default would expose the child-session
+    spawn surface — and, for share, the ability to expose the session
+    to a third party or ``__public__`` — to every custom agent.
     """
     mgr = ToolManager(_make_spec([]))
     names = {s["function"]["name"] for s in mgr.get_tool_schemas()}
@@ -318,6 +439,11 @@ def test_session_reads_registered_but_writes_gated_without_opt_in() -> None:
     assert "sys_session_send" not in names
     assert "sys_session_close" not in names
     assert "sys_session_create" not in names
+    # Sharing has its OWN dedicated `share:` flag (default `none`), so it
+    # is absent here even though this spec also lacks spawn/agents. A
+    # regression registering it by default would let any prompt-injected
+    # agent expose its session (incl. via __public__).
+    assert "sys_session_share" not in names
     # Model awareness pairs with the dispatch grant — without send there
     # is no args.model to pick, so the listing tool must stay gated too.
     assert "sys_list_models" not in names
@@ -342,6 +468,13 @@ def test_spawn_flag_registers_write_tools_without_sub_agents() -> None:
     assert "sys_session_create" in names
     # The dispatch grant brings model awareness along with it.
     assert "sys_list_models" in names
+    # Intelligent routing advisor stays hidden when routing is disabled.
+    assert "sys_advise_models" not in names
+    # Sharing is DECOUPLED from spawn — its own `share:` flag governs it,
+    # so `spawn: true` alone (share defaulting to `none`) does NOT
+    # register it. A regression coupling them would re-expose sharing to
+    # every spawn-capable agent.
+    assert "sys_session_share" not in names
 
 
 def test_session_send_schema_drops_named_mode_without_sub_agents() -> None:
@@ -399,6 +532,97 @@ def test_declared_agents_grant_send_close_but_not_create() -> None:
     assert "sys_session_create" not in names
     # Model awareness rides the same grant as send.
     assert "sys_list_models" in names
+    # Advisor is capability-gated — absent without a routing client.
+    assert "sys_advise_models" not in names
+    # Declaring sub-agents does NOT enable sharing — that is the separate
+    # `share:` flag's job, decoupled from the spawn/agents grant.
+    assert "sys_session_share" not in names
+
+
+@dataclass
+class _FakeRoutingCaps:
+    routing_client: object | None = None
+
+
+def _spawn_spec() -> AgentSpec:
+    return AgentSpec(spec_version=1, spawn=True)
+
+
+def test_advise_models_hidden_when_routing_disabled() -> None:
+    """sys_advise_models must not appear when no router is configured."""
+    caps = _FakeRoutingCaps(routing_client=None)
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+    assert "sys_list_models" in names
+    assert "sys_advise_models" not in names
+
+
+def test_advise_models_exposed_from_a_backends_only_deployment() -> None:
+    """The gate is "some source can answer", not "a legacy client is set".
+
+    A deployment that configures only ``routing_backends`` routes, so hiding the
+    tool there would advertise routing-off while the server routes anyway.
+    """
+    from omnigent.server.routing_backend import RoutingBackends
+
+    caps = SimpleNamespace(
+        routing_client=None,
+        routing_backends=RoutingBackends(local=cast("Any", object())),
+    )
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+    assert "sys_advise_models" in names
+
+
+def test_advise_models_exposed_when_routing_enabled() -> None:
+    """sys_advise_models is advertised alongside send when routing is configured."""
+    caps = _FakeRoutingCaps(routing_client=object())
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        names = {s["function"]["name"] for s in ToolManager(_spawn_spec()).get_tool_schemas()}
+    assert "sys_list_models" in names
+    assert "sys_advise_models" in names
+
+
+def test_share_non_public_registers_share_tool_without_public() -> None:
+    """
+    ``agent_session_sharing: non-public`` alone (no spawn / declared
+    agents) registers ``sys_session_share`` — proving the flag is
+    independently sufficient AND does not drag in the spawn-lifecycle
+    tools. The advertised ``user_id`` schema must NOT mention
+    ``__public__``, so the model is not offered a grantee the runner
+    would reject. If the gating regressed to the spawn opt-in, share
+    would be absent here.
+    """
+    mgr = ToolManager(AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.NON_PUBLIC))
+    schemas = {s["function"]["name"]: s for s in mgr.get_tool_schemas()}
+    assert "sys_session_share" in schemas
+    # Sharing is decoupled from spawn — none of the spawn writes ride along.
+    assert "sys_session_send" not in schemas
+    assert "sys_session_close" not in schemas
+    assert "sys_session_create" not in schemas
+    # non-public must not advertise the public sentinel.
+    user_id_desc = schemas["sys_session_share"]["function"]["parameters"]["properties"]["user_id"][
+        "description"
+    ]
+    assert "__public__" not in user_id_desc
+
+
+def test_share_public_registers_share_tool_advertising_public() -> None:
+    """
+    ``agent_session_sharing: public`` registers ``sys_session_share``
+    and the advertised ``user_id`` schema DOES mention ``__public__`` —
+    the only tier where anonymous-read grants are permitted. If
+    ``allow_public`` weren't threaded from the flag into the tool, the
+    public option would be hidden (or, worse, advertised under
+    non-public).
+    """
+    mgr = ToolManager(AgentSpec(spec_version=1, agent_session_sharing=SharePolicy.PUBLIC))
+    schemas = {s["function"]["name"]: s for s in mgr.get_tool_schemas()}
+    assert "sys_session_share" in schemas
+    user_id_desc = schemas["sys_session_share"]["function"]["parameters"]["properties"]["user_id"][
+        "description"
+    ]
+    assert "__public__" in user_id_desc
 
 
 def test_both_grants_compose() -> None:
@@ -456,14 +680,14 @@ def test_agent_read_tools_registered_for_every_agent() -> None:
     assert "sys_agent_download" in names
     assert "sys_agent_list" in names
     # get/download require a session_id (an agent is only inspectable
-    # while running in some session); list takes no parameters.
+    # while running in some session); list exposes optional pagination.
     for tool_name in ("sys_agent_get", "sys_agent_download"):
         schema = next(s for s in mgr.get_tool_schemas() if s["function"]["name"] == tool_name)
         assert "session_id" in schema["function"]["parameters"]["required"]
     list_schema = next(
         s for s in mgr.get_tool_schemas() if s["function"]["name"] == "sys_agent_list"
     )
-    assert list_schema["function"]["parameters"]["properties"] == {}
+    assert set(list_schema["function"]["parameters"]["properties"]) == {"limit", "cursor"}
 
 
 # ── MCP integration ──────────────────────────────────────
@@ -476,6 +700,83 @@ def test_shutdown_safe_without_start() -> None:
     spec = _make_spec()
     mgr = ToolManager(spec)
     mgr.shutdown()
+
+
+def test_shutdown_idempotent() -> None:
+    """Calling ``shutdown()`` twice does not raise."""
+    spec = _make_spec()
+    mgr = ToolManager(spec)
+    mgr.start()
+    mgr.shutdown()
+    mgr.shutdown()
+
+
+def test_shutdown_closes_os_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``shutdown()`` closes ``_os_env`` when it was self-created."""
+    spec = _make_spec()
+    mgr = ToolManager(spec)
+    mgr.start()
+
+    class _FakeOSEnv:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    fake_env = _FakeOSEnv()
+    mgr._os_env = fake_env  # type: ignore[assignment]
+    mgr._pre_resolved_os_env = None
+
+    mgr.shutdown()
+    assert fake_env.closed
+    assert mgr._os_env is None
+
+
+def test_shutdown_skips_pre_resolved_os_env() -> None:
+    """``shutdown()`` does NOT close a pre-resolved (shared) OS env."""
+    spec = _make_spec()
+
+    class _FakeOSEnv:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    shared_env = _FakeOSEnv()
+    mgr = ToolManager(spec, os_env=shared_env)  # type: ignore[arg-type]
+    mgr.start()
+    mgr.shutdown()
+    assert not shared_env.closed
+
+
+def test_shutdown_calls_tool_shutdown() -> None:
+    """``shutdown()`` calls ``shutdown()`` on every registered tool."""
+    from omnigent.tools.base import Tool
+
+    class _TrackingTool(Tool):
+        shut_down = False
+
+        @classmethod
+        def name(cls) -> str:
+            return "_tracking"
+
+        @classmethod
+        def description(cls) -> str:
+            return "test"
+
+        def get_schema(self) -> dict[str, Any]:
+            return {"type": "function", "function": {"name": "_tracking"}}
+
+        def shutdown(self) -> None:
+            self.shut_down = True
+
+    spec = _make_spec()
+    mgr = ToolManager(spec)
+    tracker = _TrackingTool()
+    mgr._tools["_tracking"] = tracker
+    mgr.start()
+    mgr.shutdown()
+    assert tracker.shut_down
 
 
 # ── Client-specified tools ────────────────────────────────
@@ -497,7 +798,10 @@ def _make_client_side_spec(name: str) -> ClientSideToolSpec:
     )
 
 
-def test_client_tools_registered_in_schemas() -> None:
+def test_client_tools_registered_in_schemas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     Client-specified tools appear in get_tool_schemas() alongside
     built-in tools without calling start().
@@ -505,6 +809,11 @@ def test_client_tools_registered_in_schemas() -> None:
     A failure here means the LLM never sees client tools — the
     client_tool_specs constructor arg is not being wired up.
     """
+    # Host-scope skill discovery falls back to cwd; run from an empty
+    # directory so this repo's own .claude/skills/ doesn't contribute
+    # extra tool schemas to the count below.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     spec = _make_spec()
     mgr = ToolManager(
         spec,
@@ -598,11 +907,19 @@ def test_client_tool_shadows_skill_tool(
     )
 
 
-def test_client_tools_none_equivalent_to_empty() -> None:
+def test_client_tools_none_equivalent_to_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     Passing client_tool_specs=None and client_tool_specs=[] produce
     the same result: no client tools registered.
     """
+    # Host-scope skill discovery falls back to cwd; run from an empty
+    # directory so this repo's own .claude/skills/ doesn't contribute
+    # extra tool schemas to the empty-list check.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     spec = _make_spec()
     mgr_none = ToolManager(spec, client_tool_specs=None)
     mgr_empty = ToolManager(spec, client_tool_specs=[])
@@ -906,11 +1223,19 @@ def test_local_tools_registered_and_callable(
     )
 
 
-def test_local_tools_skipped_without_workdir() -> None:
+def test_local_tools_skipped_without_workdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
     ToolManager with workdir=None skips local tool registration
     without error, even if spec has local_tools.
     """
+    # Host-scope skill discovery falls back to cwd (independent of
+    # workdir); run from an empty directory so this repo's own
+    # .claude/skills/ doesn't contribute extra tool schemas.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     info = LocalToolInfo(
         name="some_tool",
         path="tools/python/some_tool.py",
@@ -957,3 +1282,21 @@ def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> N
         f"databricks-gpt-5-4 — Databricks does not support this tool type "
         f"and rejects the request with HTTP 400. Got schema: {schema!r}"
     )
+
+
+def test_read_skill_file_registered_for_root_level_resources(tmp_path: Path) -> None:
+    """A skill whose only extra files sit beside SKILL.md still gets the tool."""
+    from omnigent.tools.builtins import any_skill_has_resources
+
+    skill_dir = tmp_path / "codebase-design"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text("body")
+    (skill_dir / "DEEPENING.md").write_text("deepening")
+    skill = SkillSpec(
+        name="codebase-design",
+        description="Designs codebases.",
+        content="body",
+        skill_dir=skill_dir,
+    )
+
+    assert any_skill_has_resources([skill]) is True

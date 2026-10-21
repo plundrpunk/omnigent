@@ -45,7 +45,10 @@ async def test_http_errors_use_standard_envelope(app: FastAPI, status: int, code
         response = await client.get("/v1/test-error")
     assert response.status_code == status
     assert response.headers["retry-after"] == "10"
-    assert response.json() == {"error": {"code": code, "message": "Request rejected"}}
+    assert response.json() == {
+        "error": {"code": code, "message": "Request rejected"},
+        "detail": "Request rejected",
+    }
 
 
 @pytest.mark.asyncio
@@ -72,7 +75,7 @@ async def test_structured_http_error_details(app: FastAPI, detail: dict, expecte
     ) as client:
         response = await client.get("/v1/test-error")
     assert response.status_code == 502
-    assert response.json() == {"error": expected}
+    assert response.json() == {"error": expected, "detail": detail}
 
 
 @pytest.mark.asyncio
@@ -149,8 +152,9 @@ async def test_validation_errors_use_standard_envelope(app: FastAPI, body: objec
             response = await client.post("/v1/test-validation", json=body)
     assert response.status_code == 422
     error = response.json()["error"]
-    assert set(response.json()) == {"error"}
+    assert set(response.json()) == {"error", "detail"}
     assert set(error) == {"code", "message"}
+    assert all(set(item) == {"loc", "msg", "type"} for item in response.json()["detail"])
     assert error["code"] == "invalid_input"
     assert "body" in error["message"]
     assert "private-input" not in response.text
@@ -165,7 +169,10 @@ async def test_router_errors_use_standard_envelope(app: FastAPI) -> None:
         missing = await client.get("/v1/does-not-exist")
         wrong_method = await client.post("/health")
     assert missing.status_code == 404
-    assert missing.json() == {"error": {"code": "not_found", "message": "Not Found"}}
+    assert missing.json() == {
+        "error": {"code": "not_found", "message": "Not Found"},
+        "detail": "Not Found",
+    }
     assert wrong_method.status_code == 405
     assert wrong_method.json()["error"]["code"] == "method_not_allowed"
     assert "GET" in wrong_method.headers["allow"]
