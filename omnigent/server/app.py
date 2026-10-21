@@ -58,6 +58,7 @@ from omnigent.server.routes.sessions import (
     set_server_runner_router,
 )
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.routes.trajectory import create_trajectory_router
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
 from omnigent.stores import (
     AgentStore,
@@ -1517,10 +1518,27 @@ def create_app(
         tags=["ams"],
     )
     # GUI → Harness Automaton goal bridge (R9 V2; see routes/goal.py).
+    goal_router = create_goal_router(
+        auth_provider=auth_provider,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+    )
     app.include_router(
-        create_goal_router(auth_provider=auth_provider),
+        goal_router,
         prefix="/v1",
         tags=["goal"],
+    )
+    # Unified trajectory timeline: session items + goal runs/artifact
+    # events + AMS work receipts, read-side only (see routes/trajectory.py).
+    app.include_router(
+        create_trajectory_router(
+            conversation_store,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+            goal_registry=getattr(goal_router, "state", None),
+        ),
+        prefix="/v1",
+        tags=["trajectory"],
     )
 
     # ── Tunnel lifecycle callbacks (Step 8.5 crash recovery) ───

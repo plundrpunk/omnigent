@@ -64,9 +64,11 @@ from urllib.parse import quote
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 
-from omnigent.server.auth import AuthProvider
+from omnigent.server.auth import LEVEL_EDIT, AuthProvider
 from omnigent.server.routes import ams
-from omnigent.server.routes._auth_helpers import require_user
+from omnigent.server.routes._auth_helpers import require_access, require_user
+from omnigent.stores import ConversationStore
+from omnigent.stores.permission_store import PermissionStore
 
 #: CLI exit code → run status. Anything else is an ``error`` (never a
 #: success): unknown codes must not be able to read as completion.
@@ -675,13 +677,22 @@ async def _execute_goal_run(run: dict[str, Any]) -> None:
     )
 
 
-def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
+def create_goal_router(
+    auth_provider: AuthProvider | None = None,
+    *,
+    conversation_store: ConversationStore | None = None,
+    permission_store: PermissionStore | None = None,
+) -> APIRouter:
     """Build the goal-run router.
 
     :param auth_provider: Auth provider used to identify the requesting
         user. ``None`` in single-user mode (endpoint is open).
+    :param conversation_store: Sessions used by the shared access check.
+    :param permission_store: Session grants; ``None`` disables enforcement.
     :returns: A configured :class:`APIRouter`.
     """
+    if permission_store is not None and conversation_store is None:
+        raise ValueError("conversation_store is required with permission_store")
     router = APIRouter()
     registry = GoalRunRegistry()
     # Exposed for tests: the registry is per-router, not module-global.
@@ -711,7 +722,7 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
     @router.post("/goal", status_code=202)
     async def start_goal(request: Request) -> dict[str, Any]:
         """Validate the contract and start a background goal run."""
-        require_user(request, auth_provider)
+        user_id = require_user(request, auth_provider)
         try:
             body = await request.json()
         except (json.JSONDecodeError, UnicodeDecodeError):
@@ -727,6 +738,10 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
         conversation_id = body.get("conversation_id")
         if conversation_id is not None and not isinstance(conversation_id, str):
             raise HTTPException(status_code=422, detail="conversation_id must be a string")
+        if conversation_id is not None and conversation_store is not None:
+            await require_access(
+                user_id, conversation_id, LEVEL_EDIT, permission_store, conversation_store
+            )
         if dispatch == "fleet":
             if "exec" in body:
                 raise HTTPException(
@@ -734,6 +749,7 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
                     detail="exec is not allowed for fleet dispatch; the daemon sets the workspace",
                 )
             run = await _enqueue_fleet_goal(contract, conversation_id)
+            run["owner"] = user_id
             registry.create(run)
             return _public(run)
         provider = body.get("provider")
@@ -759,6 +775,7 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
             "run_id": str(uuid.uuid4()),
             "goal_id": contract["goal_id"],
             "conversation_id": conversation_id,
+            "owner": user_id,
             "provider": provider,
             "model": model,
             "limits": limits or None,
