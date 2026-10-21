@@ -20,8 +20,10 @@ import { Link } from "@/lib/routing";
 import type { SessionStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { GoalRunEvents } from "@/shell/GoalRunEvents";
+import { TrajectoryTimeline } from "@/shell/TrajectoryTimeline";
 import { useGoalEvents } from "@/hooks/useGoalEvents";
 import { useGoalRuns } from "@/hooks/useGoalRuns";
+import { useTrajectory } from "@/hooks/useTrajectory";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { useChatStore } from "@/store/chatStore";
 
@@ -519,6 +521,41 @@ function GoalRunCard({ run }: { run: GoalRun }) {
   );
 }
 
+/**
+ * The unified trajectory: session work, goal runs and receipts on one
+ * clock. Collapsed by default so a closed panel never polls.
+ */
+export function TrajectorySection({ conversationId }: { conversationId: string }) {
+  const [open, setOpen] = useState(false);
+  const page = useTrajectory(conversationId, open);
+  return (
+    <section
+      data-testid="trajectory-section"
+      className="rounded-lg border border-border bg-card p-3"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-2 text-xs font-medium text-foreground">
+          <WaypointsIcon className="size-3.5 text-muted-foreground" />
+          Trajectory
+        </span>
+        <button
+          type="button"
+          data-testid="trajectory-toggle"
+          onClick={() => setOpen((value) => !value)}
+          className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground hover:text-foreground"
+        >
+          {open ? "Hide" : "Show"}
+        </button>
+      </div>
+      {open && (
+        <div className="mt-2">
+          <TrajectoryTimeline page={page} />
+        </div>
+      )}
+    </section>
+  );
+}
+
 function StageIcon({ state }: { state: LoopStageState }) {
   if (state === "complete") return <CheckCircle2Icon className="size-4" />;
   if (state === "active") return <LoaderCircleIcon className="size-4 animate-spin" />;
@@ -680,6 +717,8 @@ export function WorkLoopPanel({
         </section>
 
         {goalRuns !== null && <GoalRunsSection runs={goalRuns} />}
+
+        <TrajectorySection conversationId={conversationId} />
 
         <section className="rounded-lg border border-border bg-card p-3">
           <div className="mb-3 flex items-center gap-2 text-xs font-medium text-foreground">
