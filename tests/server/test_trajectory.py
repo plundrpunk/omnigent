@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from omnigent.server.trajectory import (
     SCHEMA_VERSION,
     TrajectoryScope,
@@ -375,6 +377,19 @@ def test_scope_drops_receipts_owned_by_another_user() -> None:
     )
     merged = merge_trajectory([mine, theirs], _scope(owners=frozenset({"drew"})))
     assert [e.owner for e in merged] == ["drew"]
+
+
+@pytest.mark.parametrize(
+    "user_fields", [{}, {"user_id": None}, {"user_id": ""}, {"user_id": "  "}]
+)
+@pytest.mark.parametrize("owners", [None, frozenset(), frozenset({"drew"})])
+def test_ownerless_ams_receipts_require_single_user_mode(user_fields, owners) -> None:
+    receipt = _receipt()
+    receipt.pop("user_id")
+    receipt.update(user_fields)
+    entry = normalize_work_receipt(receipt, conversation_id=CONV, source="ams")
+    assert entry is not None
+    assert merge_trajectory([entry], _scope(owners)) == ([entry] if owners is None else [])
 
 
 def test_scope_without_owner_constraint_keeps_unowned_and_owned() -> None:

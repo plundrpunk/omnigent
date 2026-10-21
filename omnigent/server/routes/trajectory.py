@@ -17,8 +17,9 @@ User isolation:
   ``GET /v1/sessions/{id}/items``); otherwise 404, and nothing —
   not even AMS — is queried.
 - Goal runs are included only when their ``conversation_id`` is this
-  session. A run's artifact is read only from the path the run itself
-  recorded (``outcome.artifact_path``) — never the "newest artifact"
+  session and, in multi-user mode, their recorded owner is the caller.
+  Legacy ownerless runs are excluded. A run's artifact is read only from
+  the path the run itself recorded (``outcome.artifact_path``) — never the "newest artifact"
   fallback, which could belong to someone else's run.
 - AMS receipts are fetched only for this session's own ids
   (``<conversation_id>`` and ``goal-queue:<goal_id>`` of its runs), and
@@ -266,6 +267,10 @@ def create_trajectory_router(
 
         # ── Harness: goal runs started from this session ──
         runs = goal_registry.list(conversation_id) if goal_registry is not None else []
+        if user_id is not None and user_id != RESERVED_USER_LOCAL:
+            # Authorize before reading artifacts, inline receipts, or deriving
+            # AMS lookup keys. AMS aliases apply only to receipt ownership.
+            runs = [run for run in runs if run.get("owner") == user_id]
         for run in runs:
             entries += normalize_goal_run(run)
             artifact = await asyncio.to_thread(_read_artifact, run)

@@ -1518,7 +1518,11 @@ def create_app(
         tags=["ams"],
     )
     # GUI → Harness Automaton goal bridge (R9 V2; see routes/goal.py).
-    goal_router = create_goal_router(auth_provider=auth_provider)
+    goal_router = create_goal_router(
+        auth_provider=auth_provider,
+        conversation_store=conversation_store,
+        permission_store=permission_store,
+    )
     app.include_router(
         goal_router,
         prefix="/v1",

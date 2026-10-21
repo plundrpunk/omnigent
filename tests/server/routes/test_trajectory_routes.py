@@ -8,15 +8,17 @@ server.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.requests import HTTPConnection
 
@@ -27,8 +29,8 @@ from omnigent.entities.conversation import (
     WorkReceiptData,
 )
 from omnigent.errors import OmnigentError
-from omnigent.server.auth import LEVEL_OWNER, AuthProvider
-from omnigent.server.routes.goal import GoalRunRegistry
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
+from omnigent.server.routes.goal import GoalRunRegistry, create_goal_router
 from omnigent.server.routes.trajectory import create_trajectory_router
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -87,8 +89,18 @@ def fake_ams() -> _FakeAms:
 
 
 @pytest.fixture()
-def registry() -> GoalRunRegistry:
-    return GoalRunRegistry()
+def goal_router(stores) -> APIRouter:
+    conv_store, perm_store = stores
+    return create_goal_router(
+        auth_provider=_HeaderAuth(),
+        conversation_store=conv_store,
+        permission_store=perm_store,
+    )
+
+
+@pytest.fixture()
+def registry(goal_router: APIRouter) -> GoalRunRegistry:
+    return goal_router.state
 
 
 @pytest.fixture()
@@ -182,15 +194,16 @@ def seeded(
             }
         )
     )
-    for run_id, conv, goal in (
-        ("run-alice", alice_conv.id, "g-1"),
-        ("run-bob", bob_conv.id, "g-bob"),
+    for run_id, conv, goal, owner in (
+        ("run-alice", alice_conv.id, "g-1", ALICE),
+        ("run-bob", bob_conv.id, "g-bob", BOB),
     ):
         registry.create(
             {
                 "run_id": run_id,
                 "goal_id": goal,
                 "conversation_id": conv,
+                "owner": owner,
                 "status": "completed",
                 "exit_code": 0,
                 "started_at": "2026-10-21T10:00:00+00:00",
@@ -209,10 +222,12 @@ async def client(
     registry: GoalRunRegistry,
     fake_ams: _FakeAms,
     monkeypatch: pytest.MonkeyPatch,
+    goal_router: APIRouter,
 ) -> AsyncIterator[httpx.AsyncClient]:
     monkeypatch.setenv("OMNIGENT_AMS_USER_MAP", f"{ALICE}=drew")
     conv_store, perm_store = stores
     app = FastAPI()
+    app.include_router(goal_router, prefix="/v1")
 
     @app.exception_handler(OmnigentError)
     async def _err(_request: Request, exc: OmnigentError) -> JSONResponse:
@@ -369,6 +384,7 @@ async def test_relative_artifact_path_resolves_against_goal_cwd(
     registry.create(
         {
             "run_id": "run-rel",
+            "owner": ALICE,
             "goal_id": "g-rel",
             "conversation_id": seeded["alice"],
             "status": "completed",
@@ -476,3 +492,185 @@ async def test_capped_sessions_show_the_newest_window(
     parent = [e for e in body["entries"] if e["conversation_id"] == seeded["alice"]]
     omni = [e for e in parent if e["source"] == "omnigent"]
     assert [e["action"] for e in omni][-1] == "user_message"
+
+
+@pytest.mark.parametrize("owner", [BOB, None, "", "  ", "drew"])
+async def test_foreign_or_legacy_runs_on_own_session_are_excluded(
+    client, seeded, registry, fake_ams, monkeypatch, owner
+) -> None:
+    from omnigent.server.routes import trajectory as trajectory_routes
+
+    foreign = {
+        **registry.get("run-alice"),
+        "run_id": "injected-run",
+        "goal_id": "injected-goal",
+        "work_receipt": _receipt(OTHER_RECEIPT_ID, "drew", seeded["alice"]),
+    }
+    if owner is None:
+        foreign.pop("owner")
+    else:
+        foreign["owner"] = owner
+    registry.create(foreign)
+    read_runs = []
+    read_artifact = trajectory_routes._read_artifact
+
+    def track_artifact(run):
+        read_runs.append(run["run_id"])
+        return read_artifact(run)
+
+    monkeypatch.setattr(trajectory_routes, "_read_artifact", track_artifact)
+    response = await client.get(
+        f"/v1/trajectory/{seeded['alice']}", headers={"X-Test-User": ALICE}
+    )
+    assert response.status_code == 200
+    assert "injected-run" not in response.text
+    assert "injected-goal" not in response.text
+    assert response.json()["sources"]["harness"]["count"] == 1
+    assert read_runs == ["run-alice"]
+    assert "goal-queue:injected-goal" not in fake_ams.calls
+    assert {e["run_id"] for e in response.json()["entries"] if e["run_id"]} == {"run-alice"}
+
+
+@pytest.mark.parametrize(
+    "user_fields", [{}, {"user_id": None}, {"user_id": ""}, {"user_id": "  "}]
+)
+async def test_ownerless_receipt_is_absent_from_timeline_and_detail(
+    client, seeded, fake_ams, user_fields
+) -> None:
+    receipt = _receipt(OTHER_RECEIPT_ID, "drew", "goal-queue:g-1")
+    receipt.pop("user_id")
+    receipt.update(user_fields)
+    fake_ams.receipts["goal-queue:g-1"] = receipt
+    url = f"/v1/trajectory/{seeded['alice']}"
+    response = await client.get(url, headers={"X-Test-User": ALICE})
+    assert response.status_code == 200
+    assert OTHER_RECEIPT_ID not in response.text
+    detail = await client.get(f"{url}/receipts/{OTHER_RECEIPT_ID}", headers={"X-Test-User": ALICE})
+    assert detail.status_code == 404
+
+
+@pytest.fixture()
+def dispatch_stubs(monkeypatch):
+    from omnigent.server.routes import goal
+
+    monkeypatch.setenv("HA_AUTOMATON_BIN", "/unused/automaton")
+    monkeypatch.setenv("HA_GOAL_CWD", "/unused/workspace")
+    execute = AsyncMock()
+    enqueue = AsyncMock(return_value={"continuation_id": "test-continuation"})
+    monkeypatch.setattr(goal, "_execute_goal_run", execute)
+    monkeypatch.setattr(goal, "_fleet_request", enqueue)
+    return execute, enqueue
+
+
+def _goal_body(dispatch, conversation_id):
+    return {
+        "contract": {
+            "goal_id": "new-goal",
+            "end_state": "tests pass",
+            "evidence_criteria": {"test_command": "pytest -q"},
+        },
+        "dispatch": dispatch,
+        "conversation_id": conversation_id,
+        "owner": BOB,  # A client cannot override authenticated attribution.
+    }
+
+
+@pytest.mark.parametrize("dispatch", ["local", "fleet"])
+@pytest.mark.parametrize("session", ["bob", "missing", "read_only"])
+async def test_goal_rejects_inaccessible_session_before_dispatch(
+    client, seeded, registry, stores, dispatch_stubs, dispatch, session
+) -> None:
+    _, permissions = stores
+    if session == "read_only":
+        permissions.grant(ALICE, seeded["bob"], LEVEL_READ)
+    conversation_id = "conv_missing" if session == "missing" else seeded["bob"]
+    before = registry.list()
+    response = await client.post(
+        "/v1/goal",
+        json=_goal_body(dispatch, conversation_id),
+        headers={"X-Test-User": ALICE},
+    )
+    assert response.status_code == (403 if session == "read_only" else 404)
+    assert registry.list() == before
+    for stub in dispatch_stubs:
+        stub.assert_not_called()
+
+
+@pytest.mark.parametrize("dispatch", ["local", "fleet"])
+@pytest.mark.parametrize("session", ["alice", "child", None])
+async def test_goal_records_authenticated_owner_and_own_run_appears(
+    client, seeded, registry, dispatch_stubs, dispatch, session
+) -> None:
+    conversation_id = seeded[session] if session else None
+    response = await client.post(
+        "/v1/goal",
+        json=_goal_body(dispatch, conversation_id),
+        headers={"X-Test-User": ALICE},
+    )
+    assert response.status_code == 202
+    run = registry.get(response.json()["run_id"])
+    assert run["owner"] == ALICE
+    assert run["conversation_id"] == conversation_id
+    if conversation_id is not None:
+        timeline = await client.get(
+            f"/v1/trajectory/{conversation_id}", headers={"X-Test-User": ALICE}
+        )
+        assert timeline.status_code == 200
+        assert any(e["run_id"] == run["run_id"] for e in timeline.json()["entries"])
+    if dispatch == "fleet":
+        dispatch_stubs[1].assert_awaited_once()
+        dispatch_stubs[0].assert_not_called()
+
+
+@pytest.mark.parametrize("dispatch", ["local", "fleet"])
+async def test_concurrent_callers_cannot_attach_to_same_private_session(
+    client, seeded, registry, dispatch_stubs, dispatch
+) -> None:
+    owner, intruder = await asyncio.gather(
+        *(
+            client.post(
+                "/v1/goal",
+                json=_goal_body(dispatch, seeded["alice"]),
+                headers={"X-Test-User": user},
+            )
+            for user in (ALICE, BOB)
+        )
+    )
+    assert owner.status_code == 202
+    assert intruder.status_code == 404
+    created = [r for r in registry.list() if r["goal_id"] == "new-goal"]
+    assert len(created) == 1
+    assert created[0]["owner"] == ALICE
+
+
+@pytest.mark.parametrize("auth_provider", [None, _HeaderAuth()])
+async def test_single_user_keeps_legacy_run_and_ownerless_receipt(
+    stores, seeded, registry, fake_ams, auth_provider
+) -> None:
+    registry.get("run-alice").pop("owner")
+    fake_ams.receipts["goal-queue:g-1"].pop("user_id")
+    app = FastAPI()
+    app.include_router(
+        create_trajectory_router(
+            stores[0],
+            auth_provider=auth_provider,
+            goal_registry=registry,
+            receipt_fetcher=fake_ams,
+        ),
+        prefix="/v1",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as local:
+        response = await local.get(
+            f"/v1/trajectory/{seeded['alice']}", headers={"X-Test-User": "local"}
+        )
+        assert response.status_code == 200
+        assert any(e["run_id"] == "run-alice" for e in response.json()["entries"])
+        assert OTHER_RECEIPT_ID in response.text
+        detail = await local.get(
+            f"/v1/trajectory/{seeded['alice']}/receipts/{OTHER_RECEIPT_ID}",
+            headers={"X-Test-User": "local"},
+        )
+        assert detail.status_code == 200
+        assert "user_id" not in detail.json()

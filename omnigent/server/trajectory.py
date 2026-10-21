@@ -187,8 +187,11 @@ class TrajectoryScope:
     def allows(self, entry: TrajectoryEntry) -> bool:
         if entry.conversation_id is None or entry.conversation_id not in self.conversation_ids:
             return False
-        if self.owners is not None and entry.owner is not None:
-            return entry.owner in self.owners
+        if self.owners is not None:
+            # AMS records lack the session store's permission boundary;
+            # missing ownership must fail closed in multi-user mode.
+            if entry.source == "ams" or entry.owner is not None:
+                return entry.owner in self.owners
         return True
 
 
