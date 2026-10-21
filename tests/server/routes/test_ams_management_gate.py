@@ -28,3 +28,15 @@ def test_management_denies_every_caller_without_outbound_requests(caller):
             ):
                 assert client.request(method, f"/v1/ams/management/{path}").status_code == 503
         outbound.assert_not_called()
+
+
+def test_management_openapi_has_stable_unique_operation_ids():
+    app = FastAPI()
+    app.include_router(create_ams_router(), prefix="/v1")
+    operations = app.openapi()["paths"]["/v1/ams/management/{path}"]
+
+    assert set(operations) == {"get", "post", "put", "patch", "delete"}
+    for method, operation in operations.items():
+        assert operation["operationId"] == (
+            f"management_unavailable_v1_ams_management__path__{method}"
+        )

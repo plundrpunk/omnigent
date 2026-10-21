@@ -177,9 +177,13 @@ def create_ams_router(auth_provider: AuthProvider | None = None) -> APIRouter:
             ),
         }
 
-    @router.api_route(
-        "/ams/management/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"]
-    )
+    # Separate routes keep OpenAPI operation IDs unique and independent of
+    # Python's hash-dependent method-set iteration order.
+    @router.get("/ams/management/{path:path}")
+    @router.post("/ams/management/{path:path}")
+    @router.put("/ams/management/{path:path}")
+    @router.patch("/ams/management/{path:path}")
+    @router.delete("/ams/management/{path:path}")
     async def management_unavailable(request: Request) -> Any:
         # Never reuse the shared AMS key for this surface without a trusted
         # caller-to-owner binding. No environment toggle bypasses this gate.
