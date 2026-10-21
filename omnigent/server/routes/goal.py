@@ -168,9 +168,7 @@ def _validate_endpoint(body: dict[str, Any]) -> dict[str, str]:
     base_url = body.get("base_url")
     if base_url is not None:
         if not isinstance(base_url, str) or not base_url.startswith(("http://", "https://")):
-            raise HTTPException(
-                status_code=422, detail="base_url must be an http(s) URL"
-            )
+            raise HTTPException(status_code=422, detail="base_url must be an http(s) URL")
         out["base_url"] = base_url
     api_key_env = body.get("api_key_env")
     if api_key_env is not None:
@@ -186,6 +184,7 @@ def _validate_endpoint(body: dict[str, Any]) -> dict[str, str]:
             )
         out["api_key_env"] = api_key_env
     return out
+
 
 #: Loop budgets forwarded to the CLI. The harness defaults ``max_revisions``
 #: to 1 — a single failed verification ends the run — which is far too tight
@@ -446,7 +445,8 @@ class GoalRunRegistry:
 
     def running_count(self) -> int:
         return sum(
-            1 for r in self._runs.values()
+            1
+            for r in self._runs.values()
             if r["status"] == "running" and r.get("dispatch") != "fleet"
         )
 
@@ -463,8 +463,10 @@ async def _fleet_request(method: str, path: str, **kwargs: Any) -> Any:
     try:
         async with httpx.AsyncClient(timeout=ams._TIMEOUT_SECONDS) as client:
             response = await client.request(
-                method, f"{base}/api/v1/{path}",
-                headers={"X-API-Key": key} if key else {}, **kwargs,
+                method,
+                f"{base}/api/v1/{path}",
+                headers={"X-API-Key": key} if key else {},
+                **kwargs,
             )
     except httpx.HTTPError:
         raise HTTPException(status_code=502, detail="AMS unreachable") from None
@@ -487,20 +489,25 @@ async def _enqueue_fleet_goal(
         metadata["omnigent_conversation_id"] = conversation_id
     contract = {**contract, "metadata": metadata}
     project = os.environ.get("AOS_FLEET_GOAL_PROJECT") or "fleet-autonomy"
-    continuation = await _fleet_request("POST", "continuations/", json={
-        "original_goal": contract["end_state"][:500],
-        "next_action": "goal-queue daemon: run the embedded goal contract with automaton goal",
-        "handoff_notes": (
-            "HA-GOALCONTRACT-JSON\n```json\n"
-            + json.dumps(contract, indent=2, sort_keys=True) + "\n```"
-        ),
-        "project": project,
-        "task_type": "goal",
-        "agent_id": "omnigent-aos",
-        "blockers": [],
-        "remaining_subtasks": [],
-        "priority_memories": [],
-    })
+    continuation = await _fleet_request(
+        "POST",
+        "continuations/",
+        json={
+            "original_goal": contract["end_state"][:500],
+            "next_action": "goal-queue daemon: run the embedded goal contract with automaton goal",
+            "handoff_notes": (
+                "HA-GOALCONTRACT-JSON\n```json\n"
+                + json.dumps(contract, indent=2, sort_keys=True)
+                + "\n```"
+            ),
+            "project": project,
+            "task_type": "goal",
+            "agent_id": "omnigent-aos",
+            "blockers": [],
+            "remaining_subtasks": [],
+            "priority_memories": [],
+        },
+    )
     continuation_id = (
         continuation.get("continuation_id") if isinstance(continuation, dict) else None
     )
@@ -528,8 +535,11 @@ async def _refresh_fleet_goal(run: dict[str, Any]) -> None:
         "GET", f"continuations/{quote(run['continuation_id'], safe='')}"
     )
     statuses = {
-        "pending": "queued", "claimed": "running", "in_progress": "running",
-        "completed": "completed", "failed": "blocked",
+        "pending": "queued",
+        "claimed": "running",
+        "in_progress": "running",
+        "completed": "completed",
+        "failed": "blocked",
     }
     state = continuation.get("status") if isinstance(continuation, dict) else None
     if not isinstance(state, str) or state not in statuses:
@@ -542,9 +552,14 @@ async def _refresh_fleet_goal(run: dict[str, Any]) -> None:
     )
     # Receipts are supporting evidence, never the authority for run status.
     try:
-        receipt = await _fleet_request("GET", "work-receipts/latest", params={
-            "session_id": f"goal-queue:{run['goal_id']}", "project": run["project"],
-        })
+        receipt = await _fleet_request(
+            "GET",
+            "work-receipts/latest",
+            params={
+                "session_id": f"goal-queue:{run['goal_id']}",
+                "project": run["project"],
+            },
+        )
     except HTTPException:
         receipt = None
     run["work_receipt"] = receipt or None
@@ -780,9 +795,7 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
         return _public(run)
 
     @router.get("/goal/{run_id}/events")
-    async def get_goal_events(
-        run_id: str, request: Request, since: int = 0
-    ) -> dict[str, Any]:
+    async def get_goal_events(run_id: str, request: Request, since: int = 0) -> dict[str, Any]:
         """Normalised run events, for live rendering in the work-loop panel.
 
         ``since`` is an event index, so the client can poll for the tail
@@ -799,14 +812,12 @@ def create_goal_router(auth_provider: AuthProvider | None = None) -> APIRouter:
 
         artifact = _artifact_for(run)
         if artifact is None:
-            return {"run_id": run_id, "status": run.get("status"),
-                    "events": [], "total": 0}
+            return {"run_id": run_id, "status": run.get("status"), "events": [], "total": 0}
         try:
             data = json.loads(artifact.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             # A run writes its artifact continuously; a torn read is normal.
-            return {"run_id": run_id, "status": run.get("status"),
-                    "events": [], "total": 0}
+            return {"run_id": run_id, "status": run.get("status"), "events": [], "total": 0}
 
         raw_events = data.get("events") or []
         start = max(0, int(since))

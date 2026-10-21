@@ -36,7 +36,7 @@ def ams_env(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
         def __init__(self, **kwargs: Any) -> None:
             self._kwargs = kwargs
 
-        async def __aenter__(self) -> "_FakeClient":
+        async def __aenter__(self) -> _FakeClient:
             return self
 
         async def __aexit__(self, *exc: Any) -> None:
@@ -195,7 +195,7 @@ async def test_ams_error_passes_through_verbatim(
     class _ErrClient:
         def __init__(self, **kwargs: Any) -> None: ...
 
-        async def __aenter__(self) -> "_ErrClient":
+        async def __aenter__(self) -> _ErrClient:
             return self
 
         async def __aexit__(self, *exc: Any) -> None:

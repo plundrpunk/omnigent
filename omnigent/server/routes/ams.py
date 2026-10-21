@@ -337,7 +337,7 @@ async def check_bridge_at_startup(
 
     if probe is None:
 
-        async def probe(base_url: str, api_key: str) -> int:  # noqa: A001 - shadowing the param on purpose
+        async def probe(base_url: str, api_key: str) -> int:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(
                     f"{base_url}/health",
@@ -347,7 +347,7 @@ async def check_bridge_at_startup(
 
     try:
         status_code = await probe(base, _api_key())
-    except Exception as exc:  # noqa: BLE001 - any failure is the same verdict at boot
+    except Exception as exc:
         detail = f"probe of {base}/health failed: {exc!r}"
         _shout(logging.ERROR, "UNREACHABLE", detail)
         if required:

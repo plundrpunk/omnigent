@@ -204,10 +204,9 @@ export interface FleetModelResult {
  * The hand re-registers on boot, refreshing warden metadata.
  */
 export async function putFleetModel(agentId: string, model: string): Promise<FleetModelResult> {
-  return amsPut<FleetModelResult>(
-    `api/warden/agents/${encodeURIComponent(agentId)}/model`,
-    { model },
-  );
+  return amsPut<FleetModelResult>(`api/warden/agents/${encodeURIComponent(agentId)}/model`, {
+    model,
+  });
 }
 
 /** Current default model from a warden agent's metadata, if reported. */
