@@ -42,7 +42,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +51,7 @@ TERMINAL = {"completed", "blocked", "paused", "setup_error", "error"}
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def log(msg: str) -> None:

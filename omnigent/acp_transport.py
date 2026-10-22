@@ -229,7 +229,7 @@ class ACPClient:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         try:
             await asyncio.wait_for(proc.wait(), timeout=_SHUTDOWN_GRACE_S)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             with contextlib.suppress(ProcessLookupError, OSError):
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             with contextlib.suppress(asyncio.TimeoutError):
@@ -396,7 +396,7 @@ class ACPClient:
 
         try:
             message = await asyncio.wait_for(future, timeout=timeout or self._request_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._pending.pop(msg_id, None)
             raise ACPError(
                 f"{method} timed out after {timeout or self._request_timeout}s"

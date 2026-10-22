@@ -287,7 +287,7 @@ async def _run(
 
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         with suppress(ProcessLookupError):
             proc.kill()
         return 124, "", f"timed out after {timeout}s"

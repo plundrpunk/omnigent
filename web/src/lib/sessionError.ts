@@ -73,11 +73,11 @@ export function latestActivityErrorWindow(
       case "routing_decision":
       case "elicitation":
         return { state: resolvedFailure(), boundaryResolved: true };
+      // A fleet work receipt is appended by the fleet refresh, not by the
+      // agent's turn, so like a retry it neither resolves nor masks a failure.
       case "retry":
       case "compaction_loading":
       case "compaction":
-      // A fleet work receipt is appended by the fleet refresh, not by the
-      // agent's turn, so it neither resolves nor masks a preceding failure.
       case "work_receipt":
         break;
       default: {
