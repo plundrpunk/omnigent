@@ -14,7 +14,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from omnigent.codex_native_bridge import CodexNativeBridgeState
+    from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState
 
 from fastapi.responses import JSONResponse, Response
 
@@ -141,7 +141,7 @@ class CodexGoalRunner:
         params: dict[str, object],
     ) -> dict[str, object] | JSONResponse:
         """Execute one Codex app-server goal JSON-RPC request."""
-        from omnigent.codex_native_app_server import client_for_transport
+        from omnigent.harnesses.codex_native.app_server import client_for_transport
 
         state = await self._bridge_state_for_session(conv_id, action=f"goal {action}")
         if state is None:
@@ -158,7 +158,7 @@ class CodexGoalRunner:
             )
         except ValueError as exc:
             return self._malformed_response(action, str(exc))
-        except Exception as exc:  # noqa: BLE001 - surface app-server goal failures to AP.
+        except Exception as exc:  # surface app-server goal failures to AP.
             self._logger.warning(
                 "Codex-native %s failed for session=%s",
                 method,

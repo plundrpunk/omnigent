@@ -14,7 +14,9 @@ with ``modelProvider: "gemini"`` in its settings.
        "expiry_date": …, "id_token": "eyJ…", "scope": "…", "token_type": "Bearer"}
 
 - Linux writes ``~/.gemini/antigravity-cli/antigravity-oauth-token`` — the OAuth
-  object **nested under** ``token`` (verified live against agy 1.0.10)::
+  object **nested under** ``token`` (verified live against agy 1.0.10):
+
+  .. code-block:: json
 
       {"auth_method": "oauth",
        "token": {"access_token": "ya29.…", "refresh_token": "1//0g…",
@@ -38,7 +40,7 @@ cost while weakening a signal that already works.
 The fallback asks the CLI rather than inspecting
 ``~/.gemini/antigravity-cli/settings.json`` because omnigent's own CLI launch
 path creates that file under the real home before agy ever starts
-(:func:`omnigent.antigravity_native_bridge.ensure_agy_feedback_survey_disabled`).
+(:func:`omnigent.harnesses.antigravity_native.bridge.ensure_agy_feedback_survey_disabled`).
 Its presence proves only that omnigent ran, not that anyone signed in, so
 keying on it would leave the credential gate permanently satisfied. Nothing
 omnigent writes can make ``agy models`` exit 0.
