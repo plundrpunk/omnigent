@@ -3047,8 +3047,9 @@ describe("Right workspace card visibility", () => {
 
   it("keeps the card mounted with Run and Agents for a minimal agent", () => {
     // A no-os_env agent (available: false) with no shells still has the
-    // unconditional Run and Agents tabs, so the card mounts, Run becomes the
-    // fallback, and Files/Shells are absent.
+    // unconditional Run and Agents tabs, so the card mounts, the pinned-page
+    // fallback lands on Agents, Run stays one click away, and Files/Shells
+    // are absent.
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
@@ -3060,8 +3061,8 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: /Files/i })).toBeNull();
     expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
-    expect(screen.getByRole("tab", { name: /^Run$/i })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("tab", { name: /Agents/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: /^Run$/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
   });
 

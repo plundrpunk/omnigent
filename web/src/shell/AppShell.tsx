@@ -952,16 +952,10 @@ function AppShellImpl() {
   // render an empty white card with no way to dismiss it.
   const hasRailContent = Object.values(railTabsAvailable).some(Boolean);
   const initialWorkspaceTab = readInitialWorkspaceTab();
-  // Fleet: Run is the primary session object and always available, so when the
-  // configured default is unavailable the fallback is a pinned Files/Changes
-  // page, else Run — the same order the pre-sync fallback used.
-  const pinnedWorkspaceTabs = readPinnedWorkspaceTabs();
-  const fallbackWorkspaceTab: RightRailTab | null =
+  const fallbackWorkspaceTab =
     initialWorkspaceTab !== null && railTabsAvailable[initialWorkspaceTab]
       ? initialWorkspaceTab
-      : (pinnedWorkspaceTabs.find(
-          (tab) => (tab === "files" || tab === "changes") && railTabsAvailable[tab],
-        ) ?? "run");
+      : (readPinnedWorkspaceTabs().find((tab) => railTabsAvailable[tab]) ?? null);
   // Mount the relay at the always-present shell level (not BrowserPane, which
   // only mounts while its tab is selected) so it's listening before the first
   // browser_navigate. No-op outside Electron / with no conversation.

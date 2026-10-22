@@ -6202,32 +6202,32 @@ export function NewChatLandingScreen() {
           gutters) keeps the composer from feeling cramped against the
           viewport edges on phones. */}
       <div className="flex min-h-0 w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-[max(20px,env(safe-area-inset-bottom))] md:pb-16 md:select-none">
-        {/* AUTOMATON OS banner: ANSI-shadow blocks, grayscale, decorative.
-            Shown on the plain landing only; a project landing keeps its icon. */}
-        {selectedProject ? null : (
-          <pre
-            aria-hidden="true"
-            data-testid="automaton-ascii-banner"
-            className="mb-6 select-none overflow-hidden text-center font-mono text-[6px] leading-[1.22] sm:text-[11px]"
-          >
-            {[
-              " █████╗  ██╗   ██╗ ████████╗  ██████╗  ███╗   ███╗  █████╗  ████████╗  ██████╗  ███╗   ██╗    ██████╗  ███████╗",
-              "██╔══██╗ ██║   ██║ ╚══██╔══╝ ██╔═══██╗ ████╗ ████║ ██╔══██╗ ╚══██╔══╝ ██╔═══██╗ ████╗  ██║   ██╔═══██╗ ██╔════╝",
-              "███████║ ██║   ██║    ██║    ██║   ██║ ██╔████╔██║ ███████║    ██║    ██║   ██║ ██╔██╗ ██║   ██║   ██║ ███████╗",
-              "██╔══██║ ██║   ██║    ██║    ██║   ██║ ██║╚██╔╝██║ ██╔══██║    ██║    ██║   ██║ ██║╚██╗██║   ██║   ██║ ╚════██║",
-              "██║  ██║ ╚██████╔╝    ██║    ╚██████╔╝ ██║ ╚═╝ ██║ ██║  ██║    ██║    ╚██████╔╝ ██║ ╚████║   ╚██████╔╝ ███████║",
-              "╚═╝  ╚═╝  ╚═════╝     ╚═╝     ╚═════╝  ╚═╝     ╚═╝ ╚═╝  ╚═╝    ╚═╝     ╚═════╝  ╚═╝  ╚═══╝    ╚═════╝  ╚══════╝",
-            ].map((line) => (
-              <div key={line}>
-                <span className="banner-a">{line.slice(0, 8)}</span>
-                <span className="banner-core">{line.slice(8, 51)}</span>
-                <span className="banner-a">{line.slice(51, 59)}</span>
-                <span className="banner-core">{line.slice(59)}</span>
-              </div>
-            ))}
-          </pre>
-        )}
         <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 md:flex-none">
+          {/* AUTOMATON OS banner: ANSI-shadow blocks, grayscale, decorative.
+              Shown on the plain landing only; a project landing keeps its icon. */}
+          {selectedProject ? null : (
+            <pre
+              aria-hidden="true"
+              data-testid="automaton-ascii-banner"
+              className="select-none overflow-hidden text-center font-mono text-[6px] leading-[1.22] sm:text-[11px]"
+            >
+              {[
+                " █████╗  ██╗   ██╗ ████████╗  ██████╗  ███╗   ███╗  █████╗  ████████╗  ██████╗  ███╗   ██╗    ██████╗  ███████╗",
+                "██╔══██╗ ██║   ██║ ╚══██╔══╝ ██╔═══██╗ ████╗ ████║ ██╔══██╗ ╚══██╔══╝ ██╔═══██╗ ████╗  ██║   ██╔═══██╗ ██╔════╝",
+                "███████║ ██║   ██║    ██║    ██║   ██║ ██╔████╔██║ ███████║    ██║    ██║   ██║ ██╔██╗ ██║   ██║   ██║ ███████╗",
+                "██╔══██║ ██║   ██║    ██║    ██║   ██║ ██║╚██╔╝██║ ██╔══██║    ██║    ██║   ██║ ██║╚██╗██║   ██║   ██║ ╚════██║",
+                "██║  ██║ ╚██████╔╝    ██║    ╚██████╔╝ ██║ ╚═╝ ██║ ██║  ██║    ██║    ╚██████╔╝ ██║ ╚████║   ╚██████╔╝ ███████║",
+                "╚═╝  ╚═╝  ╚═════╝     ╚═╝     ╚═════╝  ╚═╝     ╚═╝ ╚═╝  ╚═╝    ╚═╝     ╚═════╝  ╚═╝  ╚═══╝    ╚═════╝  ╚══════╝",
+              ].map((line) => (
+                <div key={line}>
+                  <span className="banner-a">{line.slice(0, 8)}</span>
+                  <span className="banner-core">{line.slice(8, 51)}</span>
+                  <span className="banner-a">{line.slice(51, 59)}</span>
+                  <span className="banner-core">{line.slice(59)}</span>
+                </div>
+              ))}
+            </pre>
+          )}
           {selectedProject ? (
             // Landing inside a project: swap Otto's eyes for the project's
             // icon — the default pink folder, or a chosen emoji — and name the

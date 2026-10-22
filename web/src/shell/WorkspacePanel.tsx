@@ -1122,12 +1122,13 @@ function WorkspacePanelImpl({
     return pending || showFilesPanel;
   });
   const pinnedTabs = readPinnedWorkspaceTabs();
-  // Run (the fleet Work Loop) leads the fixed tabs whenever the host passes
-  // Work Loop data; it is not a pinnable/default preference tab.
   const visiblePermanentTabs = [
-    ...(workLoop ? ["run" as const] : []),
     ...availablePanels.filter((tab) => pinnedTabs.includes(tab)),
     ...(showContentSearch && (pending || showFilesPanel) ? ["content-search" as const] : []),
+    // Run (the fleet Work Loop) is a fixed tab whenever the host passes Work
+    // Loop data. It is not a pin/default preference, and it trails the pinned
+    // pages so the 1-9 shortcuts keep upstream's mapping.
+    ...(workLoop ? ["run" as const] : []),
   ];
   const unpinnedTabs = availablePanels.filter((tab) => !pinnedTabs.includes(tab));
   const visibleOpenPanels = openPanels.filter((tab) => unpinnedTabs.includes(tab));
