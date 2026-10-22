@@ -587,7 +587,7 @@ def _run_migrations(engine: Engine, db_uri: str) -> None:
 
     current = _get_current_db_revision(engine)
     head = _get_head_db_revision(db_uri)
-    _verify_db_revision_is_supported(db_uri, current, head)
+    _verify_db_revision_is_supported(engine, db_uri, current, head)
 
     _logger.info("Running database migrations...")
     config = _build_alembic_config(db_uri)
@@ -743,6 +743,7 @@ def _get_head_db_revision(db_uri: str) -> str:
 
 
 def _verify_db_revision_is_supported(
+    engine: Engine,
     db_uri: str,
     current: str | None,
     head: str,
@@ -750,6 +751,15 @@ def _verify_db_revision_is_supported(
     """Reject a database revision that is unknown to this build."""
     if current is None or current == head:
         return
+
+    if current == "f7c1d2e3a4b5":
+        parent = "nf12ab34cd56" if inspect(engine).has_table("connections") else "e5d9bc8ac650"
+        raise RuntimeError(
+            f"Omnigent database has a retired work_receipt stamp (found revision {current!r}). "
+            "From the Omnigent repository root, set OMNIGENT_DB_URL to this database's URL "
+            f"and run `alembic -c omnigent/db/alembic.ini stamp --purge {parent}`, "
+            "then restart Omnigent."
+        )
 
     from alembic.script import ScriptDirectory
     from alembic.util import CommandError
@@ -795,7 +805,7 @@ def _initialize_or_verify_schema(engine: Engine, db_uri: str) -> None:
 
     head = _get_head_db_revision(db_uri)
     current = _get_current_db_revision(engine)
-    _verify_db_revision_is_supported(db_uri, current, head)
+    _verify_db_revision_is_supported(engine, db_uri, current, head)
 
     if current is None:
         _run_migrations(engine, db_uri)
