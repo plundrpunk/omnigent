@@ -12,7 +12,7 @@ The values are tiny string constants that need to match across at
 least four call sites. Centralizing them here lets us:
 
 * keep ``omnigent.repl._resume_picker`` decoupled from the
-  ``omnigent.claude_native`` import graph (which pulls in tmux /
+  ``omnigent.harnesses.claude_native.main`` import graph (which pulls in tmux /
   websocket code); the picker just imports this module instead;
 * fail fast in CI if a refactor diverges any of the call sites
   (see ``tests/test_wrapper_labels.py``);
@@ -26,6 +26,9 @@ from __future__ import annotations
 # for the ``omnigent.*`` namespace; never reused for guardrails /
 # policy labels.
 WRAPPER_LABEL_KEY = "omnigent.wrapper"
+
+# Identifies parent-owned children reported over ACP.
+ACP_SUBAGENT_ID_LABEL_KEY = "omnigent.acp.subagent_id"
 
 # Label key + value that put the Web UI in terminal-first mode (the inline
 # native-CLI terminal renders as the main view; the Web UI gates on
@@ -49,3 +52,41 @@ CODEX_NATIVE_WRAPPER_VALUE = "codex-native-ui"
 # Value the ``omnigent pi`` wrapper writes into
 # ``conversations.labels[WRAPPER_LABEL_KEY]``.
 PI_NATIVE_WRAPPER_VALUE = "pi-native-ui"
+
+# Value the ``omnigent opencode`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+OPENCODE_NATIVE_WRAPPER_VALUE = "opencode-native-ui"
+
+# Value the ``omnigent cursor`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+CURSOR_NATIVE_WRAPPER_VALUE = "cursor-native-ui"
+
+# Value the ``omnigent kiro`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+KIRO_NATIVE_WRAPPER_VALUE = "kiro-native-ui"
+
+# Value the ``omnigent goose`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+GOOSE_NATIVE_WRAPPER_VALUE = "goose-native-ui"
+
+# Value the ``omnigent antigravity`` native (agy TUI) wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+ANTIGRAVITY_NATIVE_WRAPPER_VALUE = "antigravity-native-ui"
+
+# Value stamped on mirrored Antigravity child sessions.
+ANTIGRAVITY_NATIVE_SUBAGENT_WRAPPER_VALUE = "antigravity-native-ui-subagent"
+
+# Value the ``omnigent qwen`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+QWEN_NATIVE_WRAPPER_VALUE = "qwen-native-ui"
+
+# Value the ``omnigent kimi`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+KIMI_NATIVE_WRAPPER_VALUE = "kimi-native-ui"
+
+# Value the ``omnigent devin`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+DEVIN_NATIVE_WRAPPER_VALUE = "devin-native-ui"
+# Value the ``omnigent hermes`` wrapper writes into
+# ``conversations.labels[WRAPPER_LABEL_KEY]``.
+HERMES_NATIVE_WRAPPER_VALUE = "hermes-native-ui"

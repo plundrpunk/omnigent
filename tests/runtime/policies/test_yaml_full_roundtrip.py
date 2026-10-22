@@ -93,9 +93,8 @@ async def test_yaml_full_schema_label(
     tmp_path: Path,
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """Full `{initial, values, monotonic}` declaration
-    parses + builds correctly. Monotonic enforces at apply
-    time."""
+    """Full `{initial, values}` declaration parses + builds
+    correctly. Values enum enforces at apply time."""
     engine = _write_and_build(
         tmp_path,
         conversation_store,
@@ -107,7 +106,6 @@ guardrails:
     sensitivity:
       initial: public
       values: [public, internal, confidential]
-      monotonic: increasing
   policies:
     promote:
       type: function
@@ -129,8 +127,8 @@ guardrails:
     assert r.action == PolicyAction.ALLOW
     assert engine.labels["sensitivity"] == "confidential"
 
-    # Demote attempt → blocked by monotonic increasing.
-    engine.apply_label_writes({"sensitivity": "public"})
+    # Out-of-enum write is dropped.
+    engine.apply_label_writes({"sensitivity": "rogue"})
     # Still confidential.
     assert engine.labels["sensitivity"] == "confidential"
 
@@ -345,9 +343,15 @@ guardrails:
           prompt: "check"
 """,
     )
-    # All three policies built, plus the auto-injected __ask_on_add_policy.
+    # All three policies build before the mandatory approval guards.
     names = [p.spec.name for p in engine.policies]
-    assert names == ["label_taint", "function_rate", "prompt_check", "__ask_on_add_policy"]
+    assert names == [
+        "label_taint",
+        "function_rate",
+        "prompt_check",
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
 
     from omnigent.spec.types import FunctionPolicySpec
 

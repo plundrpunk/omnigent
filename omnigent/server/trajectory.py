@@ -31,7 +31,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 SCHEMA_VERSION = "trajectory.v1"
@@ -214,7 +214,7 @@ def to_iso(value: Any) -> str | None:
     if isinstance(value, (int, float)):
         seconds = value / 1000.0 if value > 1e12 else float(value)
         try:
-            return datetime.fromtimestamp(seconds, tz=timezone.utc).isoformat()
+            return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
         except (OverflowError, OSError, ValueError):
             return None
     if isinstance(value, str) and value.strip():
@@ -226,8 +226,8 @@ def to_iso(value: Any) -> str | None:
         except ValueError:
             return None
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc).isoformat()
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC).isoformat()
     return None
 
 

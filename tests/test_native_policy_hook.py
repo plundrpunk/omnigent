@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import httpx
 import pytest
 
-from omnigent.native_policy_hook import (
+from omnigent.native import native_policy_hook
+from omnigent.native.native_policy_hook import (
+    _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
+    fail_ask_hook_output,
+    fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    post_evaluate_with_retry,
 )
 
 
@@ -310,3 +316,776 @@ def test_user_prompt_submit_non_blocking_actions_return_none(action: str) -> Non
     """
     output = evaluation_response_to_hook_output("UserPromptSubmit", {"result": action})
     assert output is None
+
+
+def test_fail_closed_pre_tool_use_denies() -> None:
+    """
+    An unobtainable verdict on PreToolUse fails CLOSED with ``deny``.
+
+    PreToolUse is the authoritative pre-execution gate for native tools —
+    the sole enforcement point for connector-native ``mcp__*`` tools and
+    native Bash/Write/Edit — so a verdict that cannot be fetched must deny
+    rather than silently let the call through (issue #536).
+    """
+    output = fail_closed_hook_output("PreToolUse")
+    assert output is not None
+    hook_specific = output["hookSpecificOutput"]
+    assert hook_specific["hookEventName"] == "PreToolUse"
+    assert hook_specific["permissionDecision"] == "deny"
+    # A deny is inert without a reason on the consuming harnesses, so one
+    # must always be present.
+    assert hook_specific["permissionDecisionReason"]
+
+
+def test_fail_closed_user_prompt_submit_fails_closed() -> None:
+    """
+    ``UserPromptSubmit`` (``PHASE_REQUEST``) fails CLOSED on an unobtainable verdict.
+
+    The request gate is the sole pre-turn enforcement point for native
+    sessions — a server hiccup must not let an over-budget or otherwise-
+    blocked request proceed. The output must be a top-level
+    ``decision: "block"`` with a non-empty reason (both Claude Code and
+    Codex drop a block with an empty reason).
+    """
+    output = fail_closed_hook_output("UserPromptSubmit")
+    assert output is not None
+    assert output["decision"] == "block"
+    assert output["reason"]
+
+
+def test_fail_closed_post_tool_use_fails_open() -> None:
+    """
+    ``PostToolUse`` (``PHASE_TOOL_RESULT``) fails OPEN (``None``).
+
+    The tool has already executed by this point, so denying would only
+    block an already-incurred side effect. Mirrors the runner-side
+    ``FAIL_CLOSED_PHASES``.
+    """
+    assert fail_closed_hook_output("PostToolUse") is None
+
+
+def test_fail_closed_unknown_event_fails_open() -> None:
+    """
+    An unrecognized hook event fails OPEN (``None``), not closed.
+
+    Only the exact ``PreToolUse`` event denies; any novel event name added
+    by a future harness must fall through to "no opinion" rather than
+    accidentally blocking — the conservative default for an unknown gate.
+    """
+    assert fail_closed_hook_output("SomeNewEvent") is None
+
+
+def test_fail_ask_pre_tool_use_returns_ask() -> None:
+    """
+    ``fail_ask_hook_output`` returns ``permissionDecision: "ask"`` for ``PreToolUse``.
+
+    Using ``"ask"`` explicitly prompts the user regardless of permission mode
+    (unlike ``None``, which fails open in ``bypassPermissions``/``acceptEdits``).
+    """
+    output = fail_ask_hook_output("PreToolUse")
+    assert output is not None
+    hook = output["hookSpecificOutput"]
+    assert hook["hookEventName"] == "PreToolUse"
+    assert hook["permissionDecision"] == "ask"
+    assert hook["permissionDecisionReason"]
+
+
+def test_fail_ask_pre_tool_use_with_detail_includes_detail() -> None:
+    """Detail string is appended to the ask reason."""
+    output = fail_ask_hook_output("PreToolUse", "server connection refused")
+    assert output is not None
+    assert "server connection refused" in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_fail_ask_user_prompt_submit_still_fails_closed() -> None:
+    """
+    ``fail_ask_hook_output`` still blocks ``UserPromptSubmit``.
+
+    The request gate is the sole pre-turn enforcement point; a server
+    hiccup must not silently allow an over-budget or blocked request.
+    """
+    output = fail_ask_hook_output("UserPromptSubmit")
+    assert output is not None
+    assert output["decision"] == "block"
+    assert output["reason"]
+
+
+def test_fail_ask_post_tool_use_fails_open() -> None:
+    """``PostToolUse`` fails open under fail-ask, same as fail-closed."""
+    assert fail_ask_hook_output("PostToolUse") is None
+
+
+def test_fail_ask_unknown_event_fails_open() -> None:
+    """Unknown events fail open under fail-ask."""
+    assert fail_ask_hook_output("SomeNewEvent") is None
+
+
+def _resp(status: int, location: str | None = None) -> httpx.Response:
+    """Build a fake response for re-auth classification tests."""
+    headers = {"Location": location} if location else {}
+    return httpx.Response(status, headers=headers, request=httpx.Request("POST", "https://ap/x"))
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (_resp(401), True),
+        # Databricks Apps returns 403 "Invalid Token" for an expired bearer.
+        (_resp(403), True),
+        (_resp(302, "https://w.example.com/oidc/oauth2/v2.0/authorize"), True),
+        (_resp(302, "https://omnigents.example.databricksapps.com/.auth/callback"), True),
+        # Unrelated redirect / success must NOT trigger a wasted token round-trip.
+        (_resp(302, "https://w.example.com/some/other/page"), False),
+        (_resp(302, None), False),
+        (_resp(200), False),
+        (_resp(503), False),
+    ],
+)
+def test_is_login_redirect_or_unauthorized_classifies_reauth_signals(
+    response: httpx.Response, expected: bool
+) -> None:
+    """
+    401 and an Apps OAuth-login 302 are re-auth signals; nothing else is.
+
+    The Databricks Apps front door bounces an *expired* bearer with a
+    ``302 → /oidc/`` (or ``/.auth/``), NOT a ``401`` — so a hook that only
+    checked ``401`` silently failed closed once the one-shot token lapsed.
+    This is the classifier that lets the hook re-mint instead.
+    """
+    assert _is_login_redirect_or_unauthorized(response) is expected
+
+
+def _make_redirect_then_ok_client(
+    seen_headers: list[dict[str, str]],
+    *,
+    redirect: httpx.Response,
+    ok: httpx.Response,
+) -> type:
+    """Build an httpx.Client stub: redirect on attempt 1, ``ok`` thereafter."""
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del url, json
+            seen_headers.append(dict(self._headers))
+            return redirect if len(seen_headers) == 1 else ok
+
+    return _Client
+
+
+def _make_sequence_client(
+    responses: list[httpx.Response],
+    request_bodies: list[dict[str, object]],
+) -> type:
+    """Build an httpx.Client stub that returns responses in order."""
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del url
+            request_bodies.append(dict(json))
+            index = min(len(request_bodies) - 1, len(responses) - 1)
+            return responses[index]
+
+    return _Client
+
+
+def test_post_evaluate_with_retry_recovers_from_429_with_stable_elicitation_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient 429 retries the same logical policy evaluation."""
+    request = httpx.Request("POST", "https://ap/x")
+    responses = [
+        httpx.Response(429, text="rate limited", request=request),
+        httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"}, request=request),
+    ]
+    request_bodies: list[dict[str, object]] = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_sequence_client(responses, request_bodies),
+    )
+    monkeypatch.setattr(native_policy_hook.time, "sleep", sleeps.append)
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {"type": "PHASE_REQUEST"}}, 5.0, "policy hook"
+    )
+
+    assert resp is responses[1]
+    assert error is None
+    assert sleeps == [1.0]
+    assert len(request_bodies) == 2
+    elicitation_id = request_bodies[0]["_omnigent_elicitation_id"]
+    assert isinstance(elicitation_id, str)
+    assert elicitation_id.startswith("elicit_evaluate_")
+    assert all(body["_omnigent_elicitation_id"] == elicitation_id for body in request_bodies)
+
+
+def test_post_evaluate_with_retry_bounds_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 429 honors ``Retry-After`` without exceeding the delay cap."""
+    request = httpx.Request("POST", "https://ap/x")
+    responses = [
+        httpx.Response(429, headers={"Retry-After": "30"}, request=request),
+        httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"}, request=request),
+    ]
+    request_bodies: list[dict[str, object]] = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_sequence_client(responses, request_bodies),
+    )
+    monkeypatch.setattr(native_policy_hook.time, "sleep", sleeps.append)
+
+    resp, error = post_evaluate_with_retry("https://ap/x", {}, {"event": {}}, 5.0, "hook")
+
+    assert resp is responses[1]
+    assert error is None
+    assert sleeps == [10.0]
+
+
+def test_post_evaluate_with_retry_fails_closed_after_repeated_429(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated 429s stop at the existing retry budget and fail closed."""
+    request = httpx.Request("POST", "https://ap/x")
+    responses = [httpx.Response(429, text="rate limited", request=request)]
+    request_bodies: list[dict[str, object]] = []
+    now = 0.0
+    sleeps: list[float] = []
+
+    def _sleep(delay: float) -> None:
+        nonlocal now
+        sleeps.append(delay)
+        now += delay
+
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_sequence_client(responses, request_bodies),
+    )
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: now)
+    monkeypatch.setattr(native_policy_hook.time, "sleep", _sleep)
+
+    resp, error = post_evaluate_with_retry("https://ap/x", {}, {"event": {}}, 5.0, "hook")
+
+    assert resp is None
+    assert error is not None
+    assert "retry budget exhausted" in error
+    assert "server returned 429" in error
+    assert sleeps == [1.0, 2.0, 4.0, 8.0, 10.0]
+    assert len(request_bodies) == 6
+    assert len({body["_omnigent_elicitation_id"] for body in request_bodies}) == 1
+
+
+def test_post_evaluate_with_retry_keeps_non_429_4xx_single_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-rate-limit 4xx remains final without sleeping or retrying."""
+    request = httpx.Request("POST", "https://ap/x")
+    responses = [httpx.Response(422, text="invalid request", request=request)]
+    request_bodies: list[dict[str, object]] = []
+    sleeps: list[float] = []
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_sequence_client(responses, request_bodies),
+    )
+    monkeypatch.setattr(native_policy_hook.time, "sleep", sleeps.append)
+
+    resp, error = post_evaluate_with_retry("https://ap/x", {}, {"event": {}}, 5.0, "hook")
+
+    assert resp is None
+    assert error == "server returned 422: invalid request"
+    assert sleeps == []
+    assert len(request_bodies) == 1
+
+
+def test_post_evaluate_with_retry_reauths_on_login_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 302→/oidc/ re-mints the bearer and retries, returning the real verdict.
+
+    Regression guard for the production bug where an "old" native session
+    (token past the ~1h Databricks OAuth lifetime) failed CLOSED on every tool
+    call. The first attempt carries the lapsed token (302), the retry carries
+    the fresh token and gets the ALLOW verdict — exactly as the runner's
+    refresh-capable ``_RunnerDatabricksAuth`` does for its own callbacks.
+    """
+    seen_headers: list[dict[str, str]] = []
+    redirect = httpx.Response(
+        302,
+        headers={"Location": "https://w.example.com/oidc/oauth2/v2.0/authorize"},
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    ok = httpx.Response(
+        200,
+        text='{"result":"POLICY_ACTION_ALLOW"}',
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_redirect_then_ok_client(seen_headers, redirect=redirect, ok=ok),
+    )
+    reauth_calls: list[int] = []
+
+    def _reauth() -> dict[str, str]:
+        reauth_calls.append(1)
+        return {"Authorization": "Bearer fresh", "X-Databricks-Org-Id": "o1"}
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x",
+        {"Authorization": "Bearer stale"},
+        {"event": {}},
+        5.0,
+        "evaluate-policy hook",
+        reauth=_reauth,
+    )
+
+    assert resp is ok
+    assert error is None
+    assert reauth_calls == [1]  # re-minted exactly once
+    assert seen_headers[0]["Authorization"] == "Bearer stale"  # first attempt: lapsed token
+    assert seen_headers[1]["Authorization"] == "Bearer fresh"  # retry: fresh token
+
+
+@pytest.mark.parametrize("sever", ["504", "torn"])
+def test_post_evaluate_with_retry_reparks_a_held_ask_poll_the_gateway_severed(
+    monkeypatch: pytest.MonkeyPatch,
+    sever: str,
+) -> None:
+    """
+    A held ASK poll the gateway severs re-POSTs the same id and spends no budget.
+
+    The Databricks front door caps any request at 300s and answers 504 (or
+    tears the connection down). The transient budget is 30s from the first
+    attempt, so counting that 504 as a fault exhausted it at once and an
+    unattended ASK gate failed closed after five minutes.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+    sleeps: list[float] = []
+    monkeypatch.setattr(native_policy_hook.time, "sleep", sleeps.append)
+    held = native_policy_hook._EVALUATE_POLICY_HELD_POLL_FLOOR_S + 290.0
+    bodies: list[dict[str, object]] = []
+    ok = httpx.Response(
+        200,
+        text='{"result":"POLICY_ACTION_ALLOW"}',
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            bodies.append(json)
+            if len(bodies) > 2:
+                return ok
+            clock["t"] += held  # the gateway held the poll for its full budget
+            req = httpx.Request("POST", url)
+            if sever == "504":
+                return httpx.Response(504, request=req)
+            raise httpx.RemoteProtocolError("gateway severed the poll", request=req)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, 86400.0, "evaluate-policy hook"
+    )
+
+    assert resp is ok
+    assert error is None
+    assert len(bodies) == 3
+    assert len({body["_omnigent_elicitation_id"] for body in bodies}) == 1, (
+        "every re-POST must re-park the same elicitation"
+    )
+    initial = native_policy_hook._EVALUATE_POLICY_RETRY_INITIAL_BACKOFF_S
+    assert sleeps == [initial, initial], "a severed held poll re-POSTs inside the re-park grace"
+
+
+def test_post_evaluate_with_retry_slow_429_spends_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A 429 after a held poll is a rate limit, not a gateway sever."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+    sleeps: list[float] = []
+    monkeypatch.setattr(native_policy_hook.time, "sleep", sleeps.append)
+    held = native_policy_hook._EVALUATE_POLICY_HELD_POLL_FLOOR_S + 290.0
+    bodies: list[dict[str, object]] = []
+    ok = httpx.Response(
+        200,
+        text='{"result":"POLICY_ACTION_ALLOW"}',
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            bodies.append(json)
+            if len(bodies) > 2:
+                return ok
+            clock["t"] += held
+            return httpx.Response(429, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, 86400.0, "evaluate-policy hook"
+    )
+
+    assert resp is None
+    assert error is not None
+    assert "retry budget exhausted" in error
+    assert "server returned 429" in error
+    assert len(bodies) == 1
+    assert sleeps == []
+    assert "re-parking" not in capsys.readouterr().err
+
+
+def test_post_evaluate_with_retry_fast_5xx_still_exhausts_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A server answering 5xx at once is a fault bounded by the transient budget.
+
+    Only a poll held past the floor is a gateway sever; a sick server that
+    refuses quickly must still fail closed once the budget is spent.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(native_policy_hook.time, "monotonic", lambda: clock["t"])
+
+    def _sleep(seconds: float) -> None:
+        """
+        Advance the fake clock instead of waiting.
+
+        :param seconds: Backoff the loop asked for.
+        :returns: None.
+        """
+        clock["t"] += seconds
+
+    monkeypatch.setattr(native_policy_hook.time, "sleep", _sleep)
+    posts: list[str] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            posts.append(url)
+            return httpx.Response(503, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, 86400.0, "evaluate-policy hook"
+    )
+
+    assert resp is None
+    assert error is not None and "retry budget exhausted" in error
+    assert 2 <= len(posts) <= 8, "retried within the budget, then gave up"
+
+
+def test_post_evaluate_with_retry_reauths_on_403_invalid_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A 403 "Invalid Token" re-mints the bearer and retries, returning the verdict.
+
+    Databricks Apps returns 403 (not 401) for an expired bearer. Guards the fix
+    that added 403 to the re-auth signal set alongside 401 and 302→/oidc/.
+    """
+    seen_headers: list[dict[str, str]] = []
+    forbidden = httpx.Response(
+        403,
+        text="Invalid Token",
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    ok = httpx.Response(
+        200,
+        text='{"result":"POLICY_ACTION_ALLOW"}',
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_redirect_then_ok_client(seen_headers, redirect=forbidden, ok=ok),
+    )
+    reauth_calls: list[int] = []
+
+    def _reauth() -> dict[str, str]:
+        reauth_calls.append(1)
+        return {"Authorization": "Bearer fresh"}
+
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x",
+        {"Authorization": "Bearer stale"},
+        {"event": {}},
+        5.0,
+        "evaluate-policy hook",
+        reauth=_reauth,
+    )
+
+    assert resp is ok
+    assert error is None
+    assert reauth_calls == [1]
+    assert seen_headers[0]["Authorization"] == "Bearer stale"
+    assert seen_headers[1]["Authorization"] == "Bearer fresh"
+
+
+def test_post_evaluate_with_retry_no_reauth_fails_on_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With no ``reauth`` callable, a login-redirect fails closed with a clear reason.
+
+    Callers without a token source (e.g. codex/kimi today) still fail closed on
+    a 302→/oidc bounce, but the helper rejects the redirect explicitly (rather
+    than leaning on ``raise_for_status``'s version-dependent 3xx handling and a
+    cryptic downstream "empty/malformed response"): it returns ``None`` with an
+    error that names the login redirect, and does not retry.
+    """
+    seen_headers: list[dict[str, str]] = []
+    redirect = httpx.Response(
+        302,
+        headers={"Location": "https://w.example.com/oidc/x"},
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_redirect_then_ok_client(seen_headers, redirect=redirect, ok=redirect),
+    )
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x", {}, {"event": {}}, 5.0, "evaluate-policy hook"
+    )
+    assert resp is None
+    assert error is not None
+    assert "login redirect" in error and "302" in error
+    assert len(seen_headers) == 1  # one attempt; a 302 is not retried without reauth
+
+
+def test_post_evaluate_with_retry_reauth_unavailable_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    When re-mint yields no token, the helper returns ``None`` (caller fails closed).
+
+    Re-auth is best-effort: a ``reauth`` that returns ``None`` (no creds /
+    transient mint failure) must not loop — the redirect is rejected explicitly
+    (returning ``None`` with a login-redirect error) so the caller keeps the
+    fail-closed safety net.
+    """
+    seen_headers: list[dict[str, str]] = []
+    redirect = httpx.Response(
+        302,
+        headers={"Location": "https://w.example.com/oidc/x"},
+        request=httpx.Request("POST", "https://ap/x"),
+    )
+    monkeypatch.setattr(
+        native_policy_hook.httpx,
+        "Client",
+        _make_redirect_then_ok_client(seen_headers, redirect=redirect, ok=redirect),
+    )
+    resp, error = post_evaluate_with_retry(
+        "https://ap/x",
+        {"Authorization": "Bearer stale"},
+        {"event": {}},
+        5.0,
+        "evaluate-policy hook",
+        reauth=lambda: None,
+    )
+    assert resp is None
+    assert error is not None
+    assert "login redirect" in error and "302" in error
+    assert len(seen_headers) == 1  # one attempt only; no retry loop
+
+
+# ── shared policy-hook header plumbing (writer + reader) ─────────────
+
+
+def test_policy_hook_request_headers_merges_baked_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reader merges the executor-baked auth + routing headers.
+
+    The import-free hook subprocess can't resolve credentials in-process, so
+    the executor bakes them into ``_OMNIGENT_AUTH_HEADERS``; the reader must
+    fold them onto ``Content-Type`` for the policy POST.
+    """
+    monkeypatch.setenv(
+        "_OMNIGENT_AUTH_HEADERS",
+        '{"Authorization": "Bearer tok", "X-Databricks-Org-Id": "org123"}',
+    )
+    assert native_policy_hook.policy_hook_request_headers() == {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer tok",
+        "X-Databricks-Org-Id": "org123",
+    }
+
+
+@pytest.mark.parametrize("raw", ["", "not json", "[1,2]"])
+def test_policy_hook_request_headers_tolerates_missing_or_bad_env(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    """Absent / malformed env → just ``Content-Type`` (local-unauth path).
+
+    A bad value must not crash the hook nor inject garbage headers — the
+    server simply decides without auth (a local unauthenticated server needs
+    none).
+    """
+    if raw:
+        monkeypatch.setenv("_OMNIGENT_AUTH_HEADERS", raw)
+    else:
+        monkeypatch.delenv("_OMNIGENT_AUTH_HEADERS", raising=False)
+    assert native_policy_hook.policy_hook_request_headers() == {"Content-Type": "application/json"}
+
+
+def test_policy_hook_wrapper_script_bakes_auth_and_routing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The writer bakes bearer + routing into the wrapper via the one builder.
+
+    A new harness wiring up its hook through this helper gets auth AND
+    workspace routing for free — the gap that left the cursor/hermes hooks
+    posting unauthenticated and unrouted.
+    """
+    import omnigent.cli_auth as cli_auth
+    import omnigent.runner._entry as entry
+
+    monkeypatch.setattr(
+        entry, "_make_auth_token_factory", lambda *, server_url=None: lambda: "tok"
+    )
+    monkeypatch.setattr(cli_auth, "load_databricks_org_id", lambda _url: "org123")
+
+    script = native_policy_hook.policy_hook_wrapper_script(
+        "https://acme.databricks.com/api/2.0/omnigent", "conv_x", "/path/hook.py"
+    )
+
+    assert script.startswith("#!/bin/sh\n")
+    assert "_OMNIGENT_SERVER_URL=https://acme.databricks.com/api/2.0/omnigent" in script
+    assert "_OMNIGENT_SESSION_ID=conv_x" in script
+    # The baked headers carry BOTH the bearer and the routing header.
+    line = next(
+        ln for ln in script.splitlines() if ln.startswith("export _OMNIGENT_AUTH_HEADERS=")
+    )
+    assert "Bearer tok" in line
+    assert "X-Databricks-Org-Id" in line and "org123" in line
+
+
+def test_policy_hook_wrapper_script_omits_auth_when_unauthenticated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No token + no recorded selector → empty auth dict (local-unauth runs).
+
+    The wrapper still exports the (empty) header dict, so the reader yields
+    just ``Content-Type`` — non-workspace callers are unaffected.
+    """
+    import omnigent.cli_auth as cli_auth
+    import omnigent.runner._entry as entry
+
+    monkeypatch.setattr(entry, "_make_auth_token_factory", lambda *, server_url=None: None)
+    monkeypatch.setattr(cli_auth, "load_databricks_org_id", lambda _url: None)
+
+    script = native_policy_hook.policy_hook_wrapper_script(
+        "http://127.0.0.1:6767", "conv_local", "/path/hook.py"
+    )
+    line = next(
+        ln for ln in script.splitlines() if ln.startswith("export _OMNIGENT_AUTH_HEADERS=")
+    )
+    assert "Bearer" not in line
+    assert "X-Databricks-Org-Id" not in line
+
+
+def test_policy_hook_reauth_remints_and_preserves_routing_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared reauth re-mints the bearer and keeps the routing header.
+
+    When a baked one-shot token lapses, the four hooks (codex/kimi/cursor/
+    hermes) that wire this builder must mint a fresh bearer through the same
+    factory the refresh-capable runtime auth uses — without dropping the
+    workspace-routing header that travels alongside it.
+    """
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda _server_url: lambda: "fresh-token",
+    )
+    reauth = native_policy_hook.policy_hook_reauth(
+        "https://acme.databricks.com/api/2.0/omnigent",
+        {"Authorization": "Bearer stale", "X-Databricks-Org-Id": "o9"},
+    )
+    assert reauth() == {"Authorization": "Bearer fresh-token", "X-Databricks-Org-Id": "o9"}
+
+
+def test_policy_hook_reauth_returns_none_without_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No refresh mechanism (local/unauth) → ``None`` so the caller fails closed."""
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda _server_url: None,
+    )
+    reauth = native_policy_hook.policy_hook_reauth(
+        "http://127.0.0.1:6767", {"Content-Type": "application/json"}
+    )
+    assert reauth() is None
+
+
+def test_documented_tool_response_takes_precedence() -> None:
+    result = hook_payload_to_evaluation_request(
+        "PostToolUse",
+        {
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "tool_response": "actual result",
+            "tool_output": "legacy",
+        },
+    )
+    assert result is not None
+    assert result["event"]["data"]["result"] == "actual result"

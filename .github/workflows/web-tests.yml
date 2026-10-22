@@ -1,0 +1,219 @@
+name: web Tests
+
+# Runs `npm test` (Vitest) + format check for the web React/TypeScript
+# frontend on every non-draft PR that touches web/** and on push to main.
+# Draft PRs are skipped; `ready_for_review` refires when the draft is converted.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "web/**"
+      - "editors/vscode/**"
+      - "sdks/web-extension/**"
+      - "examples/extensions/hello-page/web/**"
+      - ".github/ci-deps/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "patches/**"
+      - ".npmrc"
+      - ".github/actions/setup-pnpm/**"
+      - ".github/workflows/web-tests.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "web/**"
+      - "editors/vscode/**"
+      - "sdks/web-extension/**"
+      - "examples/extensions/hello-page/web/**"
+      - ".github/ci-deps/**"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
+      - "patches/**"
+      - ".npmrc"
+      - ".github/actions/setup-pnpm/**"
+      - ".github/workflows/web-tests.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  # PRs key by number (old runs cancel); push keys by SHA (each merge runs).
+  group: web-tests-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  # Security precondition gate: pnpm install/test runs the PR's own install hooks and
+  # test code, so untrusted PRs are held until the scan passes (security-gate.yml).
+  # Trusted authors and non-PR events pass through.
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
+  scope:
+    name: Web coverage scope
+    needs: gate
+    runs-on: ubuntu-latest
+    outputs:
+      web: ${{ steps.scope.outputs.web }}
+      ios: ${{ steps.scope.outputs.ios }}
+      dependency: ${{ steps.scope.outputs.dependency }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
+
+  web-test:
+    name: web test
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.web == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Set up uv for dependency peer validation
+        if: github.event_name == 'pull_request' && needs.scope.outputs.dependency == 'true'
+        uses: ./.github/actions/setup-uv
+
+      - name: Validate changed dependency peers
+        if: github.event_name == 'pull_request' && needs.scope.outputs.dependency == 'true'
+        run: uv run --no-project --with pyyaml==6.0.3 python .github/scripts/ci/check_npm_peers.py --base HEAD^1
+
+      - name: Run Electron storage-isolation unit test
+        run: node --test web/electron/test/browserViewRegistry_storage_isolation.test.js
+
+      - name: Install dependencies
+        # Pin the npm registry to the npmjs default; limit to the web package
+        # so the Electron package's large native devDependencies are not fetched.
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: pnpm install --frozen-lockfile --filter web
+
+      - name: Run Electron DOM and IPC regressions
+        # DOM suites use web's jsdom; IPC and preload suites stub Electron.
+        run: >-
+          node --test
+          web/electron/test/designModeScript.test.js
+          web/electron/test/browserActionScript.test.js
+          web/electron/test/browserIpc.test.js
+          web/electron/test/preload_update.test.js
+
+      - name: Install other workspace dependencies
+        if: needs.scope.outputs.dependency == 'true'
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: pnpm install --frozen-lockfile --filter ./editors/vscode --filter ./sdks/web-extension --filter ./examples/extensions/hello-page/web --filter ./web/electron
+
+      - name: Test and build workspace consumers
+        if: needs.scope.outputs.dependency == 'true'
+        run: |
+          pnpm --dir editors/vscode run type-check
+          pnpm --dir editors/vscode test
+          pnpm --dir editors/vscode run build
+          pnpm --dir sdks/web-extension run type-check
+          pnpm --dir examples/extensions/hello-page/web run build
+          node --test web/electron/test/*.test.js
+
+      - name: Check formatting
+        run: pnpm --filter web run format:check
+
+      - name: Run tests with coverage
+        run: pnpm --filter web run test:coverage
+
+      # Distill the v8 json-summary into a single total.txt, mirroring the
+      # backend's coverage-report job. ui-code-coverage.yml (privileged
+      # workflow_run) consumes this artifact and posts the report-only status.
+      - name: Summarize coverage
+        if: always()
+        run: |
+          cd web
+          mkdir -p ui-coverage-summary
+          if [[ ! -f coverage/coverage-summary.json ]]; then
+            echo "::warning::No coverage-summary.json; skipping UI coverage report."
+            exit 0
+          fi
+          node -e "process.stdout.write(String(require('./coverage/coverage-summary.json').total.lines.pct))" \
+            > ui-coverage-summary/total.txt
+          echo "Total UI coverage: $(cat ui-coverage-summary/total.txt)%"
+          # Render a markdown table; tee it to both the job log (visible inline)
+          # and the run's Summary tab (parity with the backend coverage-report
+          # job's GITHUB_STEP_SUMMARY table).
+          node -e '
+            const t = require("./coverage/coverage-summary.json").total;
+            const row = (k) => `| ${k[0].toUpperCase()}${k.slice(1)} | ${t[k].pct}% | ${t[k].covered}/${t[k].total} |`;
+            process.stdout.write(
+              "## UI Coverage\n\n" +
+              "| Metric | % | Covered/Total |\n|---|---|---|\n" +
+              ["lines","statements","functions","branches"].map(row).join("\n") + "\n");
+          ' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload UI coverage summary
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: ui-coverage-summary-${{ github.run_id }}
+          path: web/ui-coverage-summary/
+          retention-days: 14
+
+  ios:
+    name: iOS dependency tools
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.ios == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      BUNDLE_FROZEN: 'true'
+      FASTLANE_SKIP_UPDATE_CHECK: '1'
+      FASTLANE_HIDE_CHANGELOG: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1
+        with:
+          ruby-version: '3.3'
+          working-directory: web/ios
+          bundler-cache: true
+      - name: Check the locked Fastlane environment
+        working-directory: web/ios
+        run: |
+          bundle check
+          bundle exec fastlane --version
+
+  result:
+    name: Web result
+    if: always()
+    needs: [scope, web-test, ios]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful test selection
+        env:
+          SELECTION_RESULT: ${{ needs.scope.result }}
+        run: test "$SELECTION_RESULT" = success
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          sparse-checkout: .github/scripts/ci
+          persist-credentials: false
+      - name: Require selected consumer results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: python3 .github/scripts/ci/require_results.py web

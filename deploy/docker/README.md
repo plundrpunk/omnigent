@@ -39,44 +39,127 @@ Reset everything (drops the DB and the artifact store):
 docker compose down -v
 ```
 
+## Release features
+
+Override release-feature defaults with comma-separated names in
+`OMNIGENT_FEATURES` in `.env`: a name enables a feature, and `-name` disables
+it. Empty or unset uses the defaults. Then recreate the server container:
+
+```dotenv
+OMNIGENT_FEATURES=usage_page
+```
+
+```bash
+docker compose up -d
+curl -s http://localhost:8000/v1/info | jq '.features'
+```
+
+Known keys and their lifecycle are documented in
+[`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md). Unknown keys fail
+server startup so a typo cannot silently produce the wrong rollout. To roll
+back, add `-feature_name`, run `docker compose up -d` again, and reload the
+web app. Runner overrides such as `-claude_osc_status` must also be set on
+separately running hosts; restart their host/runners and launch fresh terminals.
+
+## Extra built-in agents
+
+`OMNIGENT_BUILTIN_AGENT_DIRS` seeds extra agents that are always available
+to every user. They are registered after the server's packaged native agents,
+configured or locally available ACP agents, Debby, and Polly. It's a
+colon-separated (`os.pathsep`) list of paths; each entry is either a
+single-file agent spec (`some-agent.yaml`) or a bundle directory, and the
+resulting agent's name is that path's file stem or directory name.
+
+The path is resolved INSIDE the container, so bind-mount the host
+directory that holds your spec(s) and point the env var at the mounted
+path, not the host path. Neither the mount nor the env var is wired into
+`docker-compose.yaml` by default — add both yourself:
+
+```yaml
+# In docker-compose.yaml, on the omnigent service:
+    environment:
+      OMNIGENT_BUILTIN_AGENT_DIRS: "${OMNIGENT_BUILTIN_AGENT_DIRS:-}"
+    volumes:
+      - artifact-data:/data
+      - ./agents:/agents:ro    # host directory holding your agent spec(s)
+```
+
+```dotenv
+# In .env:
+OMNIGENT_BUILTIN_AGENT_DIRS=/agents/my-agent.yaml
+```
+
+```bash
+docker compose up -d
+docker compose logs omnigent | grep "built-in agent"
+```
+
+A bad or missing path is logged and skipped rather than failing startup —
+the packaged built-ins still seed. Registration runs once, at startup only
+(there's no live reload). After editing a spec in an existing bind mount,
+restart the service so startup seeding runs again:
+
+```bash
+docker compose restart omnigent
+```
+
+After adding or changing the mount, environment variable, or other Compose
+configuration, recreate the service instead:
+
+```bash
+docker compose up -d --force-recreate omnigent
+```
+
+Built-ins are keyed by name. If an extra's file stem or directory name matches
+an existing built-in, startup refreshes that stable row with the extra bundle;
+it does not create a second agent. Use a distinct name unless that override is
+intentional.
+
 ## Multi-user mode (accounts — default)
 
 Built-in accounts auth: no IdP to register, no proxy to host.
 This is the default — `docker compose up -d` brings it up with no
-extra env wiring. First boot creates an admin user (named after the
-operator's OS user, falling back to `admin` in headless containers)
-with a random password that lands in the container logs and on the
-persistent volume at `/data/admin-credentials`.
+extra env wiring. No credentials are auto-generated. On first boot,
+when no admin exists yet and none was pre-seeded, the server creates
+nothing and prints:
+
+```
+→ No admin yet. Open <base_url> to create the first admin account (choose a username + password).
+```
+
+You then open the web UI's **Create admin** form (it appears while no
+admin exists) and pick your own username + password.
 
 For any deploy reachable through a public domain, also set the
-external URL so invite links resolve correctly:
+external URL so the printed link and invite links resolve correctly:
 
 ```bash
 # Add to .env (bootstrap.sh already minted the cookie secret for you):
 OMNIGENT_ACCOUNTS_BASE_URL=https://omnigent.example.com
 
 docker compose up -d
-docker compose logs omnigent | grep -A4 "Created initial admin"
+docker compose logs omnigent      # shows the "No admin yet" line with your base URL
 ```
 
-Copy the random `password` from the log line into the web UI's
-login form, then:
+Once you've created the admin and signed in:
 
 - Click your username in the top-right → **Members** → **Invite member**.
 - Share the single-use URL with the teammate; they pick their own
   username and password when they redeem it.
 - Sign-out lives in the same account menu.
 
-Headless deploy (CI, Cloud Run, etc.) where you can't read the
-logs? Pre-seed the password:
+Headless deploy (CI, Cloud Run, etc.) where you can't reach the
+Create-admin form? Pre-seed the admin password so first boot creates
+the admin directly:
 
 ```bash
 OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD=<your-strong-password>
 ```
 
-The persistent password file is at `/data/admin-credentials` on
-the `artifact-data` volume — survives `docker compose restart`,
-deleted by `docker compose down -v`.
+`OMNIGENT_ADMIN_CREDENTIALS_PATH` (set to `/data/admin-credentials`
+in `docker-compose.yaml`) anchors the persistent state directory on
+the `artifact-data` volume — it survives `docker compose restart` and
+is deleted by `docker compose down -v`.
 
 ## Multi-user mode (OIDC)
 
@@ -138,9 +221,8 @@ OMNIGENT_OIDC_ALLOWED_DOMAINS=example.com,subsidiary.example.com
 
 ### Generic OIDC (Okta, Auth0, Keycloak, Entra ID)
 
-Any IdP that publishes `/.well-known/openid-configuration` works.
-Set `OMNIGENT_OIDC_ISSUER` to the base URL; the server fetches
-discovery at startup.
+For standard discovery, set `OMNIGENT_OIDC_ISSUER` to your provider's issuer;
+the server fetches `/.well-known/openid-configuration` at startup.
 
 ```bash
 OMNIGENT_AUTH_PROVIDER=oidc
@@ -150,6 +232,62 @@ OMNIGENT_OIDC_CLIENT_SECRET=…
 OMNIGENT_OIDC_REDIRECT_URI=https://omnigent.example.com/auth/callback
 OMNIGENT_OIDC_COOKIE_SECRET=<64-hex-chars>
 ```
+
+#### Public PKCE clients and explicit endpoints
+
+For an IdP application registered as a **public client**, set
+`OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none` and **unset**
+`OMNIGENT_OIDC_CLIENT_SECRET`. Omnigent still sends its client ID, redirect URI,
+and PKCE verifier, but omits the client-secret field entirely. This is an
+explicit opt-in: the default `client_secret_post` continues to require a secret,
+including for GitHub login. PKCE S256 is used in both modes.
+
+If discovery is unavailable or advertises endpoints unsuitable for your
+deployment, configure **all three** endpoint overrides:
+
+```dotenv
+OMNIGENT_OIDC_ISSUER=https://identity.example.com
+OMNIGENT_OIDC_CLIENT_ID=omnigent
+OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none
+OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT=https://login.example.com/authorize
+OMNIGENT_OIDC_TOKEN_ENDPOINT=https://tokens.example.com/token
+OMNIGENT_OIDC_JWKS_URI=https://keys.example.com/jwks
+OMNIGENT_OIDC_REDIRECT_URI=https://omnigent.example.com/auth/callback
+OMNIGENT_OIDC_COOKIE_SECRET=<64-hex-chars>
+```
+
+With all three overrides, discovery is skipped. Partial overrides fail at
+startup rather than mixing endpoint sources. Leave all three unset to retain
+discovery. Overrides also work with confidential clients; public-client mode
+also works with discovery. Overrides do not apply to GitHub's special OAuth
+login flow.
+
+Authorization URL query parameters (for example, `?p=policy`) are preserved.
+Omnigent-generated OAuth parameters take precedence on name collisions.
+
+Only trusted operators should configure these addresses: the token endpoint
+receives authorization codes and, for confidential clients, the client secret;
+the JWKS endpoint determines which signing keys are trusted. Overrides must
+use HTTPS without embedded credentials or fragments. HTTP is allowed only for
+`localhost`, `127.0.0.1`, or `[::1]` for local testing. Endpoint hosts may differ
+from the issuer, but the token's issuer must still match
+`OMNIGENT_OIDC_ISSUER` exactly, and its audience must match the client ID.
+
+PS256-signed identity tokens are supported alongside the existing RSA and EC
+algorithms. These options do not disable signature, expiration, email
+verification, admission, or reauthentication checks. They configure **Omnigent
+login**, not upstream MCP credentials or shared-session credential ownership.
+
+When migrating from a custom integration that inferred public-client mode from
+an absent secret, explicitly add `OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none`.
+If your trusted enterprise directory omits `email_verified`, the existing
+`OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION=1` remains a separate operator choice;
+these compatibility options never enable it automatically.
+
+To verify a deployment, restart with the settings above, sign in from a private
+browser window, then run `omnigent login <server-url>` and finish the browser
+flow. Confirm both identify the expected account. The identity provider must
+enforce PKCE and one-time authorization codes; Omnigent supplies the verifier.
 
 ### HTTPS for the callback URL
 
@@ -179,21 +317,77 @@ accept over HTTPS. Three options:
    from the host). Examples: AWS ALB with ACM cert, Cloudflare in
    "Full" SSL mode, Fly.io / Cloud Run / Render platform certs.
 
+## Serving under a subpath (`OMNIGENT_WEB_BASE_PATH`)
+
+By default the Web UI is served from the origin root (`/`). To serve it
+under a path prefix instead — e.g. behind code-server's port proxy at
+`https://<host>/proxy/6767/`, or an nginx/Traefik `location /omnigent/`
+block — set the base path:
+
+```bash
+OMNIGENT_WEB_BASE_PATH=/proxy/6767 omnigent server
+# or, equivalently:
+omnigent server --base-path /proxy/6767
+```
+
+The Web UI then prefixes its API, SSE, WebSocket, and asset URLs with that
+path, and the server accepts requests **whether or not** the proxy forwards
+the prefix. That covers both code-server modes from one value:
+
+- **`/proxy/<port>/`** strips the prefix before forwarding — the server sees
+  `/v1/...` and serves it.
+- **`/absproxy/<port>/`** (and plain non-rewriting proxies) forward the full
+  `/proxy/6767/v1/...` — the server strips the configured prefix before
+  routing.
+
+Notes:
+
+- Leading slash, no trailing slash (`/proxy/6767`). Empty/unset = root
+  deployment (unchanged).
+- The root deployment (`http://localhost:6767/`) is unaffected.
+- For accounts login behind a subpath, also set `OMNIGENT_ACCOUNTS_BASE_URL`
+  to the full public URL including the prefix (e.g.
+  `https://<host>/proxy/6767`) so login/invite redirects and cookies resolve
+  correctly. For OIDC login, set `OMNIGENT_OIDC_REDIRECT_URI` to the full
+  public callback URL including the prefix (e.g.
+  `https://<host>/proxy/6767/auth/callback`).
+
 ## Header-proxy mode (for deploys behind an existing SSO proxy)
 
 If you already have oauth2-proxy, Databricks Apps, AWS ALB OIDC,
-Tailscale Funnel, or any other proxy that injects
-`X-Forwarded-Email`, set `OMNIGENT_AUTH_PROVIDER=header`. The
+Cloudflare Access, Tailscale Funnel, or any other proxy that injects
+an identity header, set `OMNIGENT_AUTH_PROVIDER=header`. The
 server will reject requests without the header.
 
 ```bash
 OMNIGENT_AUTH_PROVIDER=header
 ```
 
+The header read is `X-Forwarded-Email` by default. Proxies that use
+a different header name set `OMNIGENT_AUTH_HEADER` to point the
+server at it — for example, Cloudflare Access supplies the
+authenticated email in `Cf-Access-Authenticated-User-Email`:
+
+```bash
+OMNIGENT_AUTH_PROVIDER=header
+OMNIGENT_AUTH_HEADER=Cf-Access-Authenticated-User-Email
+```
+
+Some proxies namespace the value they inject. Google IAP forwards the
+email in `X-Goog-Authenticated-User-Email` prefixed with
+`accounts.google.com:`; set `OMNIGENT_AUTH_HEADER_STRIP_PREFIX` to drop
+it and recover the bare email:
+
+```bash
+OMNIGENT_AUTH_PROVIDER=header
+OMNIGENT_AUTH_HEADER=X-Goog-Authenticated-User-Email
+OMNIGENT_AUTH_HEADER_STRIP_PREFIX=accounts.google.com:
+```
+
 **Security note:** in this mode the proxy is responsible for
-stripping any inbound `X-Forwarded-Email` from the client request —
-otherwise any visitor can spoof an identity. The server trusts
-whatever value reaches it.
+stripping any inbound copy of the identity header from the client
+request — otherwise any visitor can spoof an identity. The server
+trusts whatever value reaches it.
 
 ## Environment variables
 
@@ -204,7 +398,10 @@ whatever value reaches it.
 | `OMNIGENT_PORT` | `8000` | Host port the server is published on. |
 | `OMNIGENT_AUTH_ENABLED` | `1` (in compose) | Master auth switch. `1` → accounts (or oidc if `OMNIGENT_OIDC_ISSUER` is set); `0` → single-user local mode (every request is the shared `local` user — local dev only, never shared deploys). |
 | `OMNIGENT_AUTH_PROVIDER` | unset | Escape hatch to pin a mode explicitly: `header` / `accounts` / `oidc`. Overrides the `AUTH_ENABLED` auto-selection. |
+| `OMNIGENT_AUTH_HEADER` | `X-Forwarded-Email` | Header-mode only: name of the trusted identity header. Set for proxies that use another name, e.g. `Cf-Access-Authenticated-User-Email` (Cloudflare Access). |
+| `OMNIGENT_AUTH_HEADER_STRIP_PREFIX` | unset (strip nothing) | Header-mode only: prefix removed from the identity header value. Set to `accounts.google.com:` for Google IAP's `X-Goog-Authenticated-User-Email`. |
 | `OMNIGENT_OIDC_*` | unset | OIDC config — required in oidc mode (issuer set, or `AUTH_PROVIDER=oidc`). See `.env.example`. |
+| `OMNIGENT_BUILTIN_AGENT_DIRS` | unset | Colon-separated paths (in-container) to extra always-available built-in agents, seeded once at startup. See [Extra built-in agents](#extra-built-in-agents). |
 | `PYPI_INDEX_URL` | `https://pypi.org/simple` | Build-time PyPI index — override only behind a corporate proxy. |
 
 `DATABASE_URL` and `ARTIFACT_DIR` are computed by compose and
@@ -218,8 +415,8 @@ seconds instead of paying an in-sandbox dependency install. It bakes
 the full omnigent install (all three packages + deps, `python` and
 `pip` on PATH), `git` (workspaces / worktrees), `tmux` (terminal
 sessions spawned by native harnesses), and the coding-harness CLIs —
-`claude`, `codex`, and `pi`, with the Node runtime they need — so
-claude-sdk / claude-native / codex / pi agents run in sandboxes
+`claude`, `codex`, `pi`, and `kiro-cli`, with the runtime they need — so
+claude-sdk / claude-native / codex / pi / kiro-native agents run in sandboxes
 without an in-sandbox install. None of the server-only bits are
 included (no SPA bundle, no psycopg, no uvicorn entrypoint).
 
@@ -237,6 +434,34 @@ Build it locally from the repo root:
 docker build -t omnigent-host:latest --target host \
              -f deploy/docker/Dockerfile .
 ```
+
+### Baking in extra harness CLIs
+
+A harness whose CLI isn't in the image fails closed with
+`harness_not_configured` when a managed-sandbox session tries to launch
+it. To bake in additional harness CLIs without forking the Dockerfile,
+pass `EXTRA_HARNESS_CLIS` at build time — space-separated harness names
+with an optional `@version` pin, whether the CLI ships on npm or via a
+vendor installer:
+
+```bash
+docker build -t omnigent-host:latest --target host \
+             -f deploy/docker/Dockerfile \
+             --build-arg EXTRA_HARNESS_CLIS="goose jcode opencode" .
+```
+
+Supported names (`opencode`, `qwen`, `goose`, `agy`, `jcode`, `cursor`,
+`kimi`), the install method behind each, and the `npm:<pkg-spec>` escape
+hatch live in [`install-harness-cli.sh`](./install-harness-cli.sh). Empty by
+default — the shipped CLI set is unchanged.
+
+Supply-chain note: the `agy` row is pinned to an immutable per-arch release
+asset with a sha256 check (the same control kiro-cli gets in the default
+image); the other vendor-installer rows run the harness's own `curl | bash`
+off mutable refs and are verified only with a `--version` check (cursor's
+installer cannot be pinned at all). `npm:<pkg-spec>` entries get no binary
+smoke check — confirm the binary yourself. UBI has no baked `agy`; use
+`EXTRA_HARNESS_CLIS=agy` there.
 
 ### Using it with the Modal sandbox provider
 

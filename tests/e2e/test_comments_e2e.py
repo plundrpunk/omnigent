@@ -23,15 +23,14 @@ Usage::
 
 from __future__ import annotations
 
-import io
 import json
-import tarfile
 from typing import Any
 
 import httpx
 import yaml
 
 from omnigent.server.auth import LEVEL_READ
+from tests._helpers.session import bundle_files
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -81,12 +80,7 @@ def _build_minimal_agent_bundle() -> bytes:
             },
         }
     ).encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(config)
-        tf.addfile(info, io.BytesIO(config))
-    return buf.getvalue()
+    return bundle_files({"config.yaml": config})
 
 
 def _ensure_agent(client: httpx.Client) -> str:
@@ -116,7 +110,7 @@ def _ensure_agent(client: httpx.Client) -> str:
         # Agent already exists — look up its id via sessions list.
         list_resp = client.get(
             "/v1/sessions",
-            params={"agent_name": _AGENT_NAME, "limit": 1},
+            params={"visibility": "all", "agent_name": _AGENT_NAME, "limit": 1},
         )
         list_resp.raise_for_status()
         sessions = list_resp.json()["data"]
@@ -391,18 +385,18 @@ def test_comments_update_body_and_status(http_client: httpx.Client) -> None:
         f"Status changed unexpectedly: expected 'draft', got {updated['status']!r}"
     )
 
-    # Update status to resolved.
+    # Update status to addressed.
     resolve_resp = http_client.patch(
         f"/v1/sessions/{session_id}/comments/{comment_id}",
-        json={"status": "resolved"},
+        json={"status": "addressed"},
         headers={"X-Forwarded-Email": _OWNER_EMAIL},
     )
     resolve_resp.raise_for_status()
     resolved = resolve_resp.json()
 
     # The status must reflect the PATCH; body must be unchanged.
-    assert resolved["status"] == "resolved", (
-        f"Status not updated to 'resolved': got {resolved['status']!r}"
+    assert resolved["status"] == "addressed", (
+        f"Status not updated to 'addressed': got {resolved['status']!r}"
     )
     assert resolved["body"] == "Revised text", (
         "Body regressed after status update — PATCH should only touch "

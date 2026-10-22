@@ -23,17 +23,107 @@ defines the full public interface.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import fnmatch
 import logging
+import os
 import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no flock.
+    fcntl = None  # type: ignore[assignment]
+
 _logger = logging.getLogger(__name__)
+
+# Wall-clock cap for git subprocesses backing the changed-files view. Large
+# repos (many untracked files, slow disk) can make `git status` slow, so this
+# is generous by default and overridable via OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS
+# for repos that need more (or less) headroom. It still bounds a genuinely hung
+# git so the panel surfaces a failure rather than blocking forever.
+_DEFAULT_GIT_TIMEOUT_SECONDS = 30.0
+
+
+# GIT_* variables that would redirect repository discovery or inject config
+# into a git subprocess. Dropped from anchored invocations so an inherited
+# environment cannot point them at another repository.
+_GIT_DISCOVERY_ENV = frozenset(
+    {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_PARAMETERS",
+    }
+)
+
+
+def _anchored_git_env() -> dict[str, str]:
+    """Return this process's environment minus repository-redirecting ``GIT_*``.
+
+    :returns: A copy of ``os.environ`` without :data:`_GIT_DISCOVERY_ENV`
+        and without ``GIT_CONFIG_COUNT`` / ``GIT_CONFIG_KEY_n`` /
+        ``GIT_CONFIG_VALUE_n``.
+    """
+    return {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _GIT_DISCOVERY_ENV and not k.startswith("GIT_CONFIG_")
+    }
+
+
+def _git_timeout_seconds() -> float:
+    """Return the git-subprocess timeout, honoring the env override.
+
+    Reads ``OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS`` on each call so operators can
+    tune it without a restart. Falls back to the default on unset/invalid/
+    non-positive values.
+    """
+    raw = os.environ.get("OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS")
+    if raw is not None:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    return _DEFAULT_GIT_TIMEOUT_SECONDS
+
+
+# Git roots whose ``core.untrackedCache`` we've already enabled this process, so
+# the one-shot config write doesn't repeat.  The host fallback path builds a
+# fresh registry per fs request (unlike the runner, which caches per session),
+# so without this guard every request would re-spawn the ``git config``.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by git-root filesystem path
+_untracked_cache_enabled: set[str] = set()
+_untracked_cache_lock = threading.Lock()
+
+
+class GitStatusUnavailable(RuntimeError):
+    """A ``git`` invocation backing the changed-files view could not complete.
+
+    Raised on timeout, non-zero exit, or spawn error.  This deliberately
+    distinguishes "could not read the working-tree state" from "there are no
+    changes": the former must surface as an error so the UI shows a failure
+    state, instead of being swallowed to an empty list that looks identical to
+    a clean tree.  When raised, the failure is also logged at WARNING with the
+    git argv, the directory it ran in, the exit code, stderr, and the
+    wall-clock duration so the next occurrence diagnoses itself.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
 
 # Filename patterns for ephemeral process artifacts that should never appear in
 # the Files panel regardless of .gitignore rules.  These are write-temp files
@@ -123,24 +213,144 @@ def _net_operation(first: str, last: str) -> str | None:
 
 
 def _find_git_root(path: Path) -> Path | None:
-    """Walk up the directory tree to find the nearest ``.git`` entry.
+    """Walk up the directory tree to find the nearest valid git repository.
 
     Handles both normal clones (``.git/`` directory) and git worktrees
-    (``.git`` file, a gitlink pointing at the real git dir).
+    (``.git`` file, a gitlink pointing at the real git dir). Directories
+    named ``.git`` that are not repositories (a stray leftover holding
+    unrelated files) are skipped, mirroring git's own discovery; a broken
+    gitlink file stops the search, as it does for git.
 
     :param path: Starting directory (will be resolved to an absolute path).
-    :returns: The directory that contains ``.git``, or ``None`` if *path*
-        is not inside a git repository.
+    :returns: The directory that contains a valid ``.git``, or ``None`` if
+        *path* is not inside a git repository.
     """
     current = path.resolve()
     while True:
         git_entry = current / ".git"
-        if git_entry.is_dir() or git_entry.is_file():
-            return current
+        if git_entry.is_dir():
+            if _is_git_repo(current):
+                return current
+        elif git_entry.is_file():
+            # A broken gitlink is fatal to git, not skipped — stop here.
+            return current if _is_git_repo(current) else None
         parent = current.parent
         if parent == current:
             return None
         current = parent
+
+
+def _git_common_dir(git_root: Path) -> Path:
+    """Return the Git directory shared by a repository and its worktrees."""
+    git_entry = git_root / ".git"
+    if git_entry.is_dir():
+        return git_entry.resolve()
+    try:
+        marker = git_entry.read_text(encoding="utf-8").strip()
+    except OSError:
+        return git_entry
+    if not marker.startswith("gitdir:"):
+        return git_entry
+    git_dir = Path(marker.removeprefix("gitdir:").strip())
+    if not git_dir.is_absolute():
+        git_dir = git_root / git_dir
+    git_dir = git_dir.resolve()
+    try:
+        common_marker = (git_dir / "commondir").read_text(encoding="utf-8").strip()
+    except OSError:
+        return git_dir
+    common_dir = Path(common_marker)
+    if not common_dir.is_absolute():
+        common_dir = git_dir / common_dir
+    return common_dir.resolve()
+
+
+def _resolve_gitfile(git_entry: Path) -> Path | None:
+    """Resolve a ``.git`` gitlink file to the git directory it points at.
+
+    :returns: The resolved git directory, or ``None`` when the file is not
+        a readable ``gitdir:`` link or its target is not a directory.
+    """
+    try:
+        marker = git_entry.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not marker.startswith("gitdir:"):
+        return None
+    git_dir = Path(marker.removeprefix("gitdir:").strip())
+    if not git_dir.is_absolute():
+        git_dir = git_entry.parent / git_dir
+    git_dir = git_dir.resolve()
+    return git_dir if git_dir.is_dir() else None
+
+
+def detect_git_root(path: Path) -> Path | None:
+    """Return the root of the repository containing *path*, if any.
+
+    Callers that cache a registry compare this against the registry's
+    ``git_root`` to notice a repository created or removed since.
+
+    :param path: Directory to start discovery from.
+    :returns: The repository root, or ``None`` when there is none or its
+        metadata cannot be read.
+    """
+    try:
+        return _find_git_root(path)
+    except OSError:
+        return None
+
+
+def _is_git_repo(git_root: Path) -> bool:
+    """Return True when *git_root*'s ``.git`` entry forms a working repository.
+
+    A directory named ``.git`` alone is not proof of a repository — it may
+    be a stray leftover holding unrelated files — so require what git's own
+    discovery checks: a HEAD plus object and ref stores. Linked worktrees
+    keep objects and refs in the common dir, so those are looked up there.
+
+    :param git_root: Directory containing the ``.git`` entry to validate.
+    """
+    git_entry = git_root / ".git"
+    if git_entry.is_dir():
+        git_dir = git_entry
+    elif git_entry.is_file():
+        resolved = _resolve_gitfile(git_entry)
+        if resolved is None:
+            return False
+        git_dir = resolved
+    else:
+        return False
+    if not (git_dir / "HEAD").exists():
+        return False
+    common_dir = _git_common_dir(git_root)
+    return (common_dir / "objects").is_dir() and (common_dir / "refs").is_dir()
+
+
+@contextlib.contextmanager
+def _untracked_cache_repo_lock(git_root: Path) -> Iterator[None]:
+    """Serialize the optional untracked-cache setup across runner processes."""
+    if fcntl is None:
+        yield
+        return
+    fd: int | None = None
+    lock_path = _git_common_dir(git_root) / "omnigent-untracked-cache.lock"
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        _logger.debug("could not lock untracked-cache setup for %s", git_root, exc_info=True)
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            fd = None
+    try:
+        yield
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            with contextlib.suppress(OSError):
+                os.close(fd)
 
 
 def _normalize_path(path: str, cwd: Path) -> str | None:
@@ -322,6 +532,11 @@ class FilesystemRegistry(ABC):
         """The workspace root directory being watched."""
         return self._cwd
 
+    @property
+    def git_root(self) -> Path | None:
+        """Root of the repository this registry reads, or ``None`` without one."""
+        return None
+
     # ── Concrete: record_change (no-op default) ────────────────────
 
     def record_change(
@@ -381,6 +596,30 @@ class FilesystemRegistry(ABC):
     def stop(self) -> None:
         """Stop any background observers.  Idempotent."""
         return
+
+    # ── Concrete: index-backed enumeration (no-op default) ─────────
+
+    def list_tracked_files(self, subdir: str = "") -> list[str] | None:
+        """Return every path the workspace's index knows about under *subdir*.
+
+        ``None`` means there is no index to consult, so callers must walk the
+        filesystem instead. Only :class:`GitFilesystemRegistry` has one.
+
+        :param subdir: Directory relative to the workspace root, e.g.
+            ``"src/app"``; ``""`` for the whole workspace.
+        :returns: Paths relative to *subdir*, or ``None``.
+        """
+        return None
+
+    def last_changed_files(self) -> list[str] | None:
+        """Return the on-disk paths the latest :meth:`list_changed_files` found.
+
+        Every created or modified path git reported, regardless of the
+        ``limit`` applied to the page that call returned. ``None`` until that
+        method has run in this process. Lets search reuse an answer the
+        Changed tab already paid for.
+        """
+        return None
 
     # ── Abstract: must be implemented by subclasses ───────────────
 
@@ -647,13 +886,10 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
 class GitFilesystemRegistry(FilesystemRegistry):
     """Filesystem registry backed by ``git status`` and ``git show``.
 
-    Used when the workspace is inside a git repository.  No background thread
-    is started.  :meth:`list_changed_files` and :meth:`get_changed_file`
-    always reflect the current working-tree state (staged + unstaged changes
-    and untracked files relative to HEAD).  Because git tracks changes from
-    HEAD rather than from a point in time, results are not scoped to a
-    conversation start time and include changes made by any process (agent
-    tool calls, shell commands, external editors, etc.).
+    Used when the workspace is inside a git repository. :meth:`start` launches
+    optional untracked-cache setup in a daemon thread; change queries remain
+    correct before it completes. :meth:`list_changed_files` and
+    :meth:`get_changed_file` always reflect the current working-tree state.
 
     :param watch_path: The workspace directory, e.g.
         ``Path("/home/user/project")``.
@@ -669,6 +905,189 @@ class GitFilesystemRegistry(FilesystemRegistry):
         """
         super().__init__(watch_path)
         self._git_root = git_root
+        self._optimization_start_lock = threading.Lock()
+        self._optimization_started = False
+        self._last_changes: list[str] | None = None
+
+    @property
+    def git_root(self) -> Path:
+        return self._git_root
+
+    def start(self) -> None:
+        """Start optional Git performance setup without blocking the caller."""
+        with self._optimization_start_lock:
+            if self._optimization_started:
+                return
+            self._optimization_started = True
+        threading.Thread(
+            target=self._enable_untracked_cache,
+            name="omnigent-git-untracked-cache",
+            daemon=True,
+        ).start()
+
+    def _enable_untracked_cache(self) -> None:
+        """Best-effort ``core.untrackedCache=true`` on this repo.
+
+        The untracked cache (upstream git ≥ 2.8) records untracked file/dir
+        mtimes in the index so ``git status --untracked-files=all`` skips
+        re-stat'ing every untracked path — the dominant cost on large repos.
+        Runs at most once per git-root per process (guarded by
+        :data:`_untracked_cache_enabled`) so the host fallback path — which
+        builds a fresh registry per fs request — doesn't re-spawn the config
+        write each time.
+
+        Gated on ``git update-index --test-untracked-cache`` (git's own
+        recommended probe): on filesystems with unreliable directory mtimes the
+        cache can return stale results — a newly-untracked file could then be
+        missing from the changed-files panel.  We only enable when the probe
+        passes.  Failures anywhere (old git, read-only .git, unsupported
+        filesystem) are ignored since the setting is a pure speedup with no
+        behavioral effect.
+        """
+        root_key = str(self._git_root.resolve())
+        with _untracked_cache_lock:
+            if root_key in _untracked_cache_enabled:
+                return
+            _untracked_cache_enabled.add(root_key)
+        with _untracked_cache_repo_lock(self._git_root):
+            if self._untracked_cache_is_enabled():
+                return
+            self._probe_and_enable_untracked_cache()
+
+    def _untracked_cache_is_enabled(self) -> bool:
+        """Return whether the shared repository config already enables the cache."""
+        started_at = time.perf_counter()
+        try:
+            result = subprocess.run(
+                ["git", "config", "--bool", "--get", "core.untrackedCache"],
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            _logger.info(
+                "git untracked-cache config check failed: git_root=%s elapsed_ms=%.1f",
+                self._git_root,
+                (time.perf_counter() - started_at) * 1000,
+            )
+            return False
+        enabled = result.returncode == 0 and result.stdout.strip().lower() == b"true"
+        _logger.info(
+            "git untracked-cache config checked: git_root=%s elapsed_ms=%.1f enabled=%s",
+            self._git_root,
+            (time.perf_counter() - started_at) * 1000,
+            enabled,
+        )
+        return enabled
+
+    def _probe_and_enable_untracked_cache(self) -> None:
+        """Probe filesystem support and enable the optional Git index extension."""
+        probe_started_at = time.perf_counter()
+        try:
+            probe = subprocess.run(
+                # A hook-based fsmonitor would run here with this process's
+                # privileges; the probe does not need it.
+                ["git", "-c", "core.fsmonitor=false", "update-index", "--test-untracked-cache"],
+                cwd=str(self._git_root),
+                env=_anchored_git_env(),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            _logger.info(
+                "git untracked-cache probe failed: git_root=%s elapsed_ms=%.1f",
+                self._git_root,
+                (time.perf_counter() - probe_started_at) * 1000,
+            )
+            return
+        _logger.info(
+            "git untracked-cache probe completed: git_root=%s elapsed_ms=%.1f returncode=%d",
+            self._git_root,
+            (time.perf_counter() - probe_started_at) * 1000,
+            probe.returncode,
+        )
+        if probe.returncode != 0:
+            return
+
+        config_started_at = time.perf_counter()
+        try:
+            config = subprocess.run(
+                ["git", "config", "core.untrackedCache", "true"],
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            _logger.info(
+                "git untracked-cache config failed: git_root=%s elapsed_ms=%.1f",
+                self._git_root,
+                (time.perf_counter() - config_started_at) * 1000,
+            )
+            return
+        _logger.info(
+            "git untracked-cache config completed: git_root=%s elapsed_ms=%.1f returncode=%d",
+            self._git_root,
+            (time.perf_counter() - config_started_at) * 1000,
+            config.returncode,
+        )
+
+    def list_tracked_files(self, subdir: str = "") -> list[str] | None:
+        """Return every path in git's index under *subdir*, relative to it.
+
+        One index read covers a repo of any size, where a filesystem walk has
+        to be budgeted. Failures return ``None`` so callers fall back to the
+        walk.
+
+        Git runs anchored at this registry's repository root, with the scope
+        passed as a pathspec rather than as the working directory: a
+        repository nested under the workspace (``sub/.git``, which a sandboxed
+        agent can create) is then never discovered, so its config cannot name
+        commands for this unsandboxed process to run. The fsmonitor hook is
+        disabled and repository-redirecting ``GIT_*`` variables are dropped
+        for the same reason.
+
+        :param subdir: Directory relative to the workspace root, e.g.
+            ``"src/app"``; ``""`` for the whole workspace.
+        :returns: Paths relative to *subdir*, or ``None`` when git could not
+            answer.
+        """
+        scope = self._cwd / subdir if subdir else self._cwd
+        try:
+            pathspec = scope.resolve().relative_to(self._git_root).as_posix()
+        except (ValueError, OSError, RuntimeError):
+            # Outside the repository, or unresolvable (a symlink loop raises
+            # RuntimeError on Python 3.12 and OSError on later versions).
+            return None
+        argv = ["git", "-C", str(self._git_root), "-c", "core.fsmonitor=false", "ls-files", "-z"]
+        if pathspec != ".":
+            argv += ["--", f":(literal){pathspec}"]
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+                env=_anchored_git_env(),
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            _logger.warning("GitFilesystemRegistry.list_tracked_files: %r failed: %s", argv, exc)
+            return None
+        if result.returncode != 0:
+            _logger.warning(
+                "GitFilesystemRegistry.list_tracked_files: %r exited %d: %s",
+                argv,
+                result.returncode,
+                result.stderr.decode("utf-8", errors="replace").strip(),
+            )
+            return None
+        prefix = "" if pathspec == "." else pathspec + "/"
+        return [
+            p[len(prefix) :]
+            for p in result.stdout.decode("utf-8", errors="replace").split("\0")
+            if len(p) > len(prefix) and p.startswith(prefix)
+        ]
+
+    def last_changed_files(self) -> list[str] | None:
+        return self._last_changes
 
     def list_changed_files(self, conversation_id: str, *, limit: int) -> list[dict[str, Any]]:
         """Return all uncommitted changes in the working tree, newest first.
@@ -681,27 +1100,63 @@ class GitFilesystemRegistry(FilesystemRegistry):
         :param limit: Maximum number of records to return.
         :returns: List of file-record dicts, newest first.
         """
+        # ``--untracked-files=all`` forces git to expand entirely-untracked
+        # directories into their individual files.  Without it, a new file
+        # inside a brand-new directory tree collapses to a single ``?? dir/``
+        # line, so the UI would show the directory (stat'd as ~96 B) instead
+        # of the added file.
+        #
+        # The ``:(exclude)`` pathspecs stop git from walking large untracked
+        # build/cache trees (node_modules/, .venv/ …) that we would discard
+        # below anyway.  With ``-uall`` git otherwise stat's every file in them,
+        # which dominates the runtime on big repos.  These mirror the
+        # ``_SKIP_DIRS`` root-level prune (kept below as a safety net).
+        argv = ["git", "status", "--porcelain", "--untracked-files=all"]
+        argv.extend(self._skip_dir_pathspecs())
+        started = time.monotonic()
         try:
-            # ``--untracked-files=all`` forces git to expand entirely-untracked
-            # directories into their individual files.  Without it, a new file
-            # inside a brand-new directory tree collapses to a single ``?? dir/``
-            # line, so the UI would show the directory (stat'd as ~96 B) instead
-            # of the added file.
             result = subprocess.run(
-                ["git", "status", "--porcelain", "--untracked-files=all"],
+                argv,
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_git_timeout_seconds(),
             )
-        except Exception:
-            _logger.debug(
-                "GitFilesystemRegistry.list_changed_files: git status failed", exc_info=True
+        except subprocess.TimeoutExpired as exc:
+            elapsed = time.monotonic() - started
+            _logger.warning(
+                "GitFilesystemRegistry.list_changed_files: %r in %s timed out after %.2fs",
+                argv,
+                self._git_root,
+                elapsed,
             )
-            return []
+            raise GitStatusUnavailable(f"git status timed out after {elapsed:.1f}s") from exc
+        except OSError as exc:
+            elapsed = time.monotonic() - started
+            _logger.warning(
+                "GitFilesystemRegistry.list_changed_files: %r in %s could not run after %.2fs: %s",
+                argv,
+                self._git_root,
+                elapsed,
+                exc,
+            )
+            raise GitStatusUnavailable(f"git status could not run: {exc}") from exc
 
+        elapsed = time.monotonic() - started
         if result.returncode != 0:
-            return []
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            _logger.warning(
+                "GitFilesystemRegistry.list_changed_files: %r in %s exited %d after %.2fs: %s",
+                argv,
+                self._git_root,
+                result.returncode,
+                elapsed,
+                stderr,
+            )
+            raise GitStatusUnavailable(
+                f"git status exited {result.returncode}" + (f": {stderr}" if stderr else "")
+            )
 
+        numstat = self._run_git_numstat()
         records: list[dict[str, Any]] = []
         for line in result.stdout.decode("utf-8", errors="replace").splitlines():
             parsed = _parse_git_porcelain_line(line)
@@ -711,13 +1166,21 @@ class GitFilesystemRegistry(FilesystemRegistry):
             rel_path = self._git_to_rel(git_path)
             if rel_path is None:
                 continue
+            if _is_ephemeral(rel_path):
+                continue
             # Skip runner-internal and build directories (e.g. terminals/,
             # node_modules/).  These are never agent-edited source files.
             first_component = Path(rel_path).parts[0] if Path(rel_path).parts else ""
             if first_component in _SKIP_DIRS:
                 continue
-            records.append(self._make_record(rel_path, operation))
+            # Counts come only from `git diff HEAD` (via numstat). Files git
+            # doesn't diff — untracked new files, binaries — get no counter.
+            counts = numstat.get(rel_path, (None, None))
+            records.append(self._make_record(rel_path, operation, counts))
 
+        # Search reuses this answer for untracked files instead of paying for
+        # its own ``git status``, which can take tens of seconds on a big repo.
+        self._last_changes = [r["path"] for r in records if r["status"] != "deleted"]
         records.sort(key=lambda r: (r["modified_at"] or 0, r["path"]), reverse=True)
         return records[:limit]
 
@@ -735,27 +1198,61 @@ class GitFilesystemRegistry(FilesystemRegistry):
         norm = _normalize_path(path, self._cwd)
         if norm is None:
             return None
+        if _is_ephemeral(norm):
+            return None
         try:
             cwd_prefix = self._cwd.relative_to(self._git_root)
             git_path = (cwd_prefix / norm).as_posix()
         except ValueError:
             return None
 
+        # Mirror list_changed_files: a read that *could not run* (timeout /
+        # spawn error / non-zero exit) raises so the diff endpoint surfaces it,
+        # instead of being swallowed to ``None`` — which the endpoint turns
+        # into a 404 indistinguishable from "this path has no changes".
+        argv = ["git", "status", "--porcelain", "--", git_path]
+        started = time.monotonic()
         try:
             result = subprocess.run(
-                ["git", "status", "--porcelain", "--", git_path],
+                argv,
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_git_timeout_seconds(),
             )
-        except Exception:
-            _logger.debug(
-                "GitFilesystemRegistry.get_changed_file: git status failed", exc_info=True
+        except subprocess.TimeoutExpired as exc:
+            elapsed = time.monotonic() - started
+            _logger.warning(
+                "GitFilesystemRegistry.get_changed_file: %r in %s timed out after %.2fs",
+                argv,
+                self._git_root,
+                elapsed,
             )
-            return None
+            raise GitStatusUnavailable(f"git status timed out after {elapsed:.1f}s") from exc
+        except OSError as exc:
+            elapsed = time.monotonic() - started
+            _logger.warning(
+                "GitFilesystemRegistry.get_changed_file: %r in %s could not run after %.2fs: %s",
+                argv,
+                self._git_root,
+                elapsed,
+                exc,
+            )
+            raise GitStatusUnavailable(f"git status could not run: {exc}") from exc
 
+        elapsed = time.monotonic() - started
         if result.returncode != 0:
-            return None
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            _logger.warning(
+                "GitFilesystemRegistry.get_changed_file: %r in %s exited %d after %.2fs: %s",
+                argv,
+                self._git_root,
+                result.returncode,
+                elapsed,
+                stderr,
+            )
+            raise GitStatusUnavailable(
+                f"git status exited {result.returncode}" + (f": {stderr}" if stderr else "")
+            )
 
         output = result.stdout.decode("utf-8", errors="replace")
         for line in output.splitlines():
@@ -788,7 +1285,7 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 ["git", "show", f"HEAD:{git_path}"],
                 cwd=str(self._git_root),
                 capture_output=True,
-                timeout=5,
+                timeout=_git_timeout_seconds(),
             )
             if result.returncode == 0:
                 return result.stdout.decode("utf-8", errors="replace")
@@ -801,6 +1298,25 @@ class GitFilesystemRegistry(FilesystemRegistry):
         return None
 
     # ── Internals ─────────────────────────────────────────────────
+
+    def _skip_dir_pathspecs(self) -> list[str]:
+        """Return ``:(exclude)`` pathspecs pruning :data:`_SKIP_DIRS` from status.
+
+        The post-filter in :meth:`list_changed_files` only prunes skip dirs at
+        the *workspace root* (first path component), so the pathspecs are
+        anchored to the workspace's location within the git root to match —
+        e.g. a workspace at ``repo/sub`` yields ``:(exclude)sub/node_modules``,
+        which leaves a ``node_modules/`` elsewhere in the repo untouched.
+        Returns an empty list when the workspace escapes the git root (in which
+        case the post-filter alone still applies).
+        """
+        try:
+            prefix = self._cwd.relative_to(self._git_root)
+        except ValueError:
+            return []
+        prefix_posix = prefix.as_posix()
+        base = "" if prefix_posix == "." else f"{prefix_posix}/"
+        return [f":(exclude){base}{name}" for name in sorted(_SKIP_DIRS)]
 
     def _git_to_rel(self, git_path: str) -> str | None:
         """Convert a git-root-relative path to a cwd-relative path.
@@ -815,13 +1331,22 @@ class GitFilesystemRegistry(FilesystemRegistry):
         except ValueError:
             return None
 
-    def _make_record(self, rel_path: str, operation: str) -> dict[str, Any]:
+    def _make_record(
+        self,
+        rel_path: str,
+        operation: str,
+        line_counts: tuple[int | None, int | None] = (None, None),
+    ) -> dict[str, Any]:
         """Build a file-record dict for *rel_path*.
 
         :param rel_path: Path relative to ``self._cwd``.
         :param operation: One of ``"created"``, ``"modified"``, ``"deleted"``.
-        :returns: File-record dict with ``path``, ``status``, ``bytes``, and
-            ``modified_at`` fields.
+        :param line_counts: ``(lines_added, lines_removed)`` for this file, each
+            ``None`` when unknown (binary file, path missing from numstat, or
+            numstat unavailable). Defaults to ``(None, None)`` so callers that
+            don't need counts (e.g. the diff endpoint) can omit them.
+        :returns: File-record dict with ``path``, ``status``, ``bytes``,
+            ``modified_at``, ``lines_added``, and ``lines_removed`` fields.
         """
         bytes_: int | None = None
         modified_at: int | None = None
@@ -832,7 +1357,66 @@ class GitFilesystemRegistry(FilesystemRegistry):
                 modified_at = int(st.st_mtime)
             except OSError:
                 pass
-        return {"path": rel_path, "status": operation, "bytes": bytes_, "modified_at": modified_at}
+        added, removed = line_counts
+        return {
+            "path": rel_path,
+            "status": operation,
+            "bytes": bytes_,
+            "modified_at": modified_at,
+            "lines_added": added,
+            "lines_removed": removed,
+        }
+
+    def _run_git_numstat(self) -> dict[str, tuple[int | None, int | None]]:
+        """Return per-file line counts from ``git diff --numstat HEAD``.
+
+        ``--no-renames`` splits a rename into two independent entries — a full
+        add on the destination path and a full delete on the old path — so the
+        paths line up with ``git status``'s destination-only entries rather than
+        an ``old -> new`` pair. (A pure rename therefore shows ``+N`` on the
+        moved file, not ``(None, None)``.) Binary files report ``-\\t-`` →
+        ``(None, None)``. Paths are keyed cwd-relative via :meth:`_git_to_rel`.
+
+        Never raises: a numstat failure (timeout, spawn error, non-zero exit)
+        returns ``{}`` so the changed-files list still renders with counts
+        degraded to ``None``. This is the sole guard for numstat failures.
+
+        :returns: Map of cwd-relative path → ``(lines_added, lines_removed)``.
+        """
+        argv = ["git", "diff", "--numstat", "--no-renames", "HEAD"]
+        try:
+            result = subprocess.run(
+                argv,
+                cwd=str(self._git_root),
+                capture_output=True,
+                timeout=_git_timeout_seconds(),
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            _logger.warning(
+                "GitFilesystemRegistry._run_git_numstat: %r in %s failed",
+                argv,
+                self._git_root,
+                exc_info=True,
+            )
+            return {}
+        if result.returncode != 0:
+            return {}
+        counts: dict[str, tuple[int | None, int | None]] = {}
+        for line in result.stdout.decode("utf-8", errors="replace").splitlines():
+            fields = line.split("\t")
+            if len(fields) != 3:
+                continue
+            added_s, removed_s, git_path = fields
+            rel_path = self._git_to_rel(_strip_git_quotes(git_path))
+            if rel_path is None:
+                continue
+            try:
+                added = None if added_s == "-" else int(added_s)
+                removed = None if removed_s == "-" else int(removed_s)
+            except ValueError:
+                continue
+            counts[rel_path] = (added, removed)
+        return counts
 
 
 # ── Factory ───────────────────────────────────────────────────────────────────
@@ -850,7 +1434,17 @@ def create_filesystem_registry(watch_path: Path) -> FilesystemRegistry:
     :param watch_path: The workspace root to track.
     :returns: A :class:`FilesystemRegistry` instance ready to be used.
     """
-    git_root = _find_git_root(watch_path.resolve())
+    try:
+        git_root = _find_git_root(watch_path.resolve())
+    except OSError as exc:
+        _logger.warning(
+            "Git metadata is unavailable; using ordinary file-change tracking",
+            extra={
+                "event_name": "filesystem_git_discovery_failed",
+                "attributes": {"exception_type": type(exc).__name__, "errno": exc.errno},
+            },
+        )
+        git_root = None
     if git_root is not None:
         return GitFilesystemRegistry(watch_path, git_root)
     return AgentEditFilesystemRegistry(watch_path)

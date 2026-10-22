@@ -8,6 +8,7 @@ known large size and reports exactly what comes back.
 """
 
 import json
+import os
 import subprocess
 import sys
 
@@ -23,7 +24,8 @@ prompt = (
 )
 
 payload = {
-    "model": "gpt-5.6-sol:medium",
+    # Set AOS_PROBE_MODEL to the shim model id under test.
+    "model": os.environ["AOS_PROBE_MODEL"],
     "messages": [{"role": "user", "content": prompt}],
 }
 

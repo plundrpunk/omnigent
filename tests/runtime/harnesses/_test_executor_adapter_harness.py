@@ -11,6 +11,7 @@ Four scripts:
 - ``"tool_call"``: a ToolCallRequest, then a ToolCallComplete
   with a result, then a TurnComplete (no further text).
 - ``"error"``: an ExecutorError event.
+- ``"cancelled"``: a TurnCancelled event.
 - ``"capture_messages"``: writes the received messages list as
   JSON to the path in ``MOCK_EXECUTOR_CAPTURE_PATH``, then
   emits a TurnComplete. Used to verify the full AP→harness→
@@ -39,8 +40,10 @@ from omnigent.inner.executor import (
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
 )
+from omnigent.inner.model_auth import ProviderAuthRequired
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _SCRIPT_ENV_VAR = "MOCK_EXECUTOR_SCRIPT"
@@ -78,6 +81,30 @@ class _CapturingExecutor(Executor):
 
     async def close_session(self, session_key: str) -> None:
         """No-op — no per-session resources to release."""
+        del session_key
+
+
+class _ProviderAuthFailureExecutor(Executor):
+    """Raise the trusted signer preflight failure at the executor boundary."""
+
+    async def run_turn(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        system_prompt: str,
+        config: ExecutorConfig | None = None,
+    ) -> AsyncIterator[ExecutorEvent]:
+        del messages, tools, system_prompt, config
+        if False:
+            yield TurnComplete(response=None)
+        raise ProviderAuthRequired.for_authority(
+            "https://workspace.cloud.databricks.com", "agent-profile"
+        )
+
+    async def close(self) -> None:
+        pass
+
+    async def close_session(self, session_key: str) -> None:
         del session_key
 
 
@@ -121,6 +148,11 @@ def _build_tool_call() -> Executor:
                 name="echo_tool",
                 status=ToolCallStatus.SUCCESS,
                 result="tool result",
+                # A handles_tools_internally executor (e.g. antigravity) stamps
+                # the request's real call_id on the completion too, so the
+                # observed function_call and its function_call_output pair
+                # downstream (an id-less completion cannot pair and is dropped).
+                metadata={"call_id": "call_test_1"},
             ),
             TurnComplete(response=None),
         ]
@@ -142,6 +174,49 @@ def _build_error() -> Executor:
     return executor
 
 
+def _build_error_with_usage() -> Executor:
+    """
+    MockExecutor scripted with an :class:`ExecutorError` carrying usage.
+
+    Mirrors a turn that failed after the model call started: the executor
+    observed the prompt size before dying, so the error carries it and the
+    scaffold's ``response.failed`` terminal event must surface it (else the
+    context-occupancy meter freezes at the previous turn's value).
+
+    :returns: A configured :class:`MockExecutor` instance.
+    """
+    executor = MockExecutor()
+    executor._turns.append(
+        [
+            ExecutorError(
+                message="mock error after usage observed",
+                usage={
+                    "input_tokens": 400,
+                    "output_tokens": 0,
+                    "total_tokens": 400,
+                    "context_tokens": 100_000,
+                    "model": "mock-model",
+                },
+            )
+        ]
+    )
+    return executor
+
+
+def _build_cancelled() -> Executor:
+    """
+    MockExecutor scripted with a provider-side :class:`TurnCancelled`.
+
+    The adapter should map this cleanly to ``response.cancelled`` rather than
+    falling through to ``response.completed``.
+
+    :returns: A configured :class:`MockExecutor` instance.
+    """
+    executor = MockExecutor()
+    executor._turns.append([TurnCancelled(reason="provider_cancelled")])
+    return executor
+
+
 def _build_capture_messages() -> Executor:
     """
     :class:`_CapturingExecutor` builder.
@@ -155,11 +230,38 @@ def _build_capture_messages() -> Executor:
     return _CapturingExecutor()
 
 
+def _build_pr_tracking() -> Executor:
+    executor = MockExecutor()
+    executor._turns.append(
+        [
+            ToolCallRequest(
+                name="Bash", args={"command": "gh pr create"}, metadata={"call_id": "pr1"}
+            ),
+            ToolCallComplete(
+                name="Bash",
+                status=ToolCallStatus.SUCCESS,
+                result="https://github.com/example/sdk/pull/42",
+                metadata={"call_id": "pr1"},
+            ),
+            TurnComplete(response="Created"),
+        ]
+    )
+    return executor
+
+
+def _build_provider_auth_failure() -> Executor:
+    return _ProviderAuthFailureExecutor()
+
+
 _SCRIPTS: dict[str, Callable[[], Executor]] = {
+    "pr_tracking": _build_pr_tracking,
     "text_only": _build_text_only,
     "tool_call": _build_tool_call,
     "error": _build_error,
+    "error_with_usage": _build_error_with_usage,
+    "cancelled": _build_cancelled,
     "capture_messages": _build_capture_messages,
+    "provider_auth_failure": _build_provider_auth_failure,
 }
 
 

@@ -18,6 +18,9 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.stores.conversation_store.sqlalchemy_store import (
+    SqlAlchemyConversationStore,
+)
 from tests.server.helpers import create_test_agent
 from tests.server.integration.test_sessions_endpoints import (
     _create_session,
@@ -54,6 +57,22 @@ async def _fork_session(
         f"/v1/sessions/{source_id}/fork",
         json=payload,
     )
+
+
+async def _list_builtin_agent_ids(client: httpx.AsyncClient) -> set[str]:
+    """
+    Return the ids of all built-in agents (``GET /v1/agents``).
+
+    The endpoint lists only ``session_id IS NULL`` rows, so this is the
+    set a leaked fork clone would wrongly join. ``limit=100`` covers the
+    handful of built-ins plus any (regression) leak.
+
+    :param client: The test HTTP client.
+    :returns: Set of built-in agent ids.
+    """
+    resp = await client.get("/v1/agents?limit=100")
+    assert resp.status_code == 200, f"GET /v1/agents failed: {resp.status_code} {resp.text}"
+    return {a["id"] for a in resp.json()["data"]}
 
 
 async def _get_session_items(
@@ -237,8 +256,43 @@ async def test_fork_coding_session_stamps_fork_source_label(
     )
 
 
+async def test_fork_recovers_runner_bound_native_session_without_workspace(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    Forking a runner-bound native session with lost workspace metadata still
+    sends the clone through directory rebinding.
+
+    Older ``/clear`` replacements could retain their live runner and native
+    presentation labels while dropping ``workspace``. Treating that source as
+    chat-only produces an unbound fork that silently cannot run. The native
+    wrapper label plus runner binding is the recovery signal.
+    """
+    agent = await create_test_agent(client)
+    source = await _create_session(
+        client,
+        agent["id"],
+        title="Legacy clear replacement",
+        labels={
+            "omnigent.ui": "terminal",
+            "omnigent.wrapper": "claude-code-native-ui",
+        },
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(source["id"], "runner_legacy_clear")
+
+    resp = await _fork_session(client, source["id"])
+    assert resp.status_code == 201
+    fork = resp.json()
+
+    assert fork["labels"].get("omnigent.fork.source_id") == source["id"]
+    assert fork.get("workspace") is None
+
+
 async def test_fork_chat_session_has_no_fork_source_label(
     client: httpx.AsyncClient,
+    db_uri: str,
 ) -> None:
     """
     Forking a chat-only session (no working directory) adds no
@@ -252,6 +306,8 @@ async def test_fork_chat_session_has_no_fork_source_label(
     """
     agent = await create_test_agent(client)
     source = await _create_session(client, agent["id"], title="Chat only")
+    store = SqlAlchemyConversationStore(db_uri)
+    assert store.set_runner_id(source["id"], "runner_chat_only")
 
     resp = await _fork_session(client, source["id"])
     assert resp.status_code == 201
@@ -306,12 +362,52 @@ async def test_fork_nonexistent_session_returns_404(
     )
 
 
+async def test_failed_fork_leaves_no_ghost_in_builtin_agents(
+    client: httpx.AsyncClient,
+) -> None:
+    """A fork that fails mid-flight adds nothing to ``GET /v1/agents``.
+
+    Regression for the duplicate-agent bug: the route pre-created the
+    cloned agent in its own committed transaction, so when
+    ``fork_conversation`` then raised — e.g. a stale ``up_to_response_id``
+    from "Fork from this response" — the clone was orphaned as a
+    ``session_id IS NULL`` row, which ``GET /v1/agents`` returns. Each
+    failed fork thus leaked a phantom "Claude Code"/"Codex" entry into the
+    picker. The clone is now created inside the fork transaction, so a
+    failed fork rolls it back and the built-in agent list is unchanged.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"], initial_message="hi")
+    await _wait_for_idle(client, session["id"])
+
+    # The test agent is session-scoped, so the built-in list starts empty;
+    # a leaked clone (session_id IS NULL) would be the only thing to appear.
+    before = await _list_builtin_agent_ids(client)
+
+    # "Fork from this response" with a response id that doesn't exist: the
+    # store raises ValueError → the route returns 400, AFTER the point where
+    # the buggy route had already committed the clone.
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/fork",
+        json={"up_to_response_id": "resp_does_not_exist"},
+    )
+    assert resp.status_code == 400, (
+        f"Stale up_to_response_id should 400, got {resp.status_code}: {resp.text}"
+    )
+
+    after = await _list_builtin_agent_ids(client)
+    assert after == before, (
+        f"A failed fork must not register any built-in agent; leaked: {sorted(after - before)}"
+    )
+
+
 async def test_fork_a_fork(
     client: httpx.AsyncClient,
 ) -> None:
     """
-    A fork can itself be forked (nested fork). All three sessions
-    are independent with distinct IDs, agent IDs, and copied items.
+    A fork can itself be forked (nested fork). All three sessions are
+    independent with distinct IDs and copied items, and share the one agent
+    row (forks of your own session reuse your agent).
     """
     agent = await create_test_agent(client)
     session = await _create_session(
@@ -331,11 +427,11 @@ async def test_fork_a_fork(
     assert resp2.status_code == 201
     fork2 = resp2.json()
 
-    # All three must have distinct IDs and agent IDs.
+    # Distinct sessions, one shared agent row.
     ids = {session["id"], fork1["id"], fork2["id"]}
     assert len(ids) == 3, f"All three sessions must have unique IDs, got {ids}."
     agent_ids = {session["agent_id"], fork1["agent_id"], fork2["agent_id"]}
-    assert len(agent_ids) == 3, f"All three sessions must have unique agent_ids, got {agent_ids}."
+    assert agent_ids == {session["agent_id"]}, f"Forks must share the agent, got {agent_ids}."
 
     # The second fork should have the same items as the first fork
     # (which has the same items as the source).

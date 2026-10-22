@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 from pathlib import Path
 
@@ -46,6 +47,8 @@ from omnigent.spec.types import (
     ToolsConfig,
 )
 from omnigent.spec.validator import ValidationResult, validate
+
+_logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_ASK_TIMEOUT",
@@ -159,6 +162,7 @@ def load(
     dest: Path | None = None,
     expand_env: bool = True,
     enforce_handler_allowlist: bool = False,
+    prune_invalid_sub_agents: bool = False,
 ) -> AgentSpec:
     """
     Load an agent spec from a directory, tarball path, or raw
@@ -195,6 +199,25 @@ def load(
         that parser does not resolve handlers). Defaults to ``False``
         so trusted spec loading (local ``omnigent run``, operator
         configs) keeps supporting custom handlers.
+    :param prune_invalid_sub_agents: When ``True``, a sub-agent that
+        fails validation is **dropped** from the spec (removed from
+        ``sub_agents`` and from any parent's ``tools.agents``
+        reference) and loading continues, instead of failing the whole
+        load. A WARNING is logged for each dropped sub-agent. The root
+        agent must still validate — a genuine root-level error always
+        raises. This is the backwards-compatibility guard for the
+        **execution** paths (runner spec resolution, server
+        :class:`~omnigent.runtime.agent_cache.AgentCache`): a bundle
+        reaching those paths was already validated by the server that
+        produced it, so a sub-agent that fails *here* means this client
+        is older than that server and can't run that sub-agent (e.g. it
+        names a harness this version doesn't know). Dropping the
+        sub-agent lets the parent agent launch with the capabilities
+        this client *does* support, rather than the whole agent failing
+        to start. Defaults to ``False`` so authoring/upload paths
+        (``omnigent run``,
+        :func:`omnigent.server.bundles.validate_agent_bundle`) stay
+        strict and surface real authoring mistakes to the author.
     :returns: A validated :class:`AgentSpec`.
     :raises OmnigentError: If the spec fails validation, if a policy
         names an unregistered handler under
@@ -220,7 +243,11 @@ def load(
         # omnigent.spec._omnigent_compat. Tech-debt aside;
         # remove this branch when omnigent compat ends.
         if is_omnigent_yaml(source):
-            return load_omnigent_yaml(source, enforce_handler_allowlist=enforce_handler_allowlist)
+            return load_omnigent_yaml(
+                source,
+                enforce_handler_allowlist=enforce_handler_allowlist,
+                prune_invalid_sub_agents=prune_invalid_sub_agents,
+            )
         if source.suffix.lower() in {".yaml", ".yml"}:
             # The path is a YAML file but failed the omnigent check
             # (missing required key, ``spec_version`` set, malformed,
@@ -257,9 +284,15 @@ def load(
     # *expand_env* and the flag does not apply.
     candidate = _find_omnigent_yaml_in_dir(root)
     if candidate is not None:
-        return load_omnigent_yaml(candidate, enforce_handler_allowlist=enforce_handler_allowlist)
+        return load_omnigent_yaml(
+            candidate,
+            enforce_handler_allowlist=enforce_handler_allowlist,
+            prune_invalid_sub_agents=prune_invalid_sub_agents,
+        )
 
     spec = parse(root, expand_env=expand_env)
+    if prune_invalid_sub_agents:
+        _prune_invalid_sub_agents(spec)
     result = validate(spec)
     if not result.valid:
         errors = "; ".join(f"{e.path}: {e.message}" for e in result.errors)
@@ -278,24 +311,67 @@ def load(
     return spec
 
 
-def _reject_unregistered_spec_policy_handlers(spec: AgentSpec) -> None:
-    """Reject function policies whose handler is not registered.
+def _prune_invalid_sub_agents(spec: AgentSpec) -> list[str]:
+    """Drop sub-agents that fail validation so the parent can still load.
 
-    Scans a parsed :class:`AgentSpec`'s guardrail policies for
-    :class:`~omnigent.spec.types.FunctionPolicySpec` entries whose
-    ``function.path`` is not in the policy registry. Recurses into
-    ``sub_agents`` — the ``config.yaml`` parser discovers child agents
-    from ``agents/`` subdirectories, each with its own ``guardrails``,
-    and those handlers are resolved + called at engine build just like
-    the root's, so a clean root with a malicious sub-agent would
-    otherwise bypass the upload allowlist. Used on the untrusted
-    agent-bundle upload path only (see :func:`load`).
+    Walks *spec*'s sub-agent tree depth-first and removes any
+    sub-agent whose own subtree fails :func:`validate`, mutating
+    *spec* in place: the failing sub-agent is removed from
+    ``sub_agents`` and its name (if any) is removed from the parent's
+    ``tools.agents`` reference list so the dangling reference does not
+    itself fail validation. A WARNING is logged for each drop.
 
-    :param spec: The parsed agent spec (or sub-agent) to scan.
-    :raises OmnigentError: If a function policy names an unregistered
-        handler, e.g. ``"subprocess.Popen"``.
+    Depth-first ordering matters: a child's invalid *grandchild* is
+    pruned before the child is judged, so a single bad leaf does not
+    take out an otherwise-valid sub-tree above it.
+
+    This is the mechanism behind ``load(..., prune_invalid_sub_agents=
+    True)`` — see :func:`load` for when and why it is enabled (the
+    execution paths only). It deliberately does **not** touch the root
+    spec: if the root itself is invalid, the caller's subsequent
+    :func:`validate` still fails loud.
+
+    :param spec: The spec to prune in place.
+    :returns: The names (or ``"<unnamed>"``) of every sub-agent dropped
+        anywhere in the tree, parent-most first within each level.
     """
-    from omnigent.policies.registry import is_registered_handler
+    dropped: list[str] = []
+    surviving: list[AgentSpec] = []
+    for sa in spec.sub_agents:
+        # Prune this child's own invalid descendants before deciding
+        # whether the child itself survives.
+        dropped.extend(_prune_invalid_sub_agents(sa))
+        sa_result = validate(sa)
+        if sa_result.valid:
+            surviving.append(sa)
+            continue
+        name = sa.name or "<unnamed>"
+        errors = "; ".join(f"{e.path}: {e.message}" for e in sa_result.errors)
+        _logger.warning(
+            "Dropping sub-agent %r from agent %r: it failed validation on this "
+            "client and will be unavailable. This usually means the spec was "
+            "produced by a newer Omnigent server with a feature this client does "
+            "not support (e.g. a harness it does not recognize) — upgrade this "
+            "client to use it. Validation errors: %s",
+            name,
+            spec.name or "<root>",
+            errors,
+        )
+        dropped.append(name)
+        # Remove the now-dangling reference so the parent still validates.
+        if sa.name is not None and sa.name in spec.tools.agents:
+            spec.tools.agents.remove(sa.name)
+    spec.sub_agents = surviving
+    return dropped
+
+
+def _reject_unregistered_spec_policy_handlers(spec: AgentSpec) -> None:
+    """Validate policy handlers throughout a parsed uploaded agent tree.
+
+    Both bundle formats use the same registry check, including legacy wrappers
+    and policies belonging to nested agents.
+    """
+    from omnigent.policies.registry import function_policy_handler_allowed
 
     guardrails = spec.guardrails
     if guardrails is not None:
@@ -303,7 +379,9 @@ def _reject_unregistered_spec_policy_handlers(spec: AgentSpec) -> None:
             if (
                 isinstance(policy, FunctionPolicySpec)
                 and policy.function is not None
-                and not is_registered_handler(policy.function.path)
+                and not function_policy_handler_allowed(
+                    policy.function.path, policy.function.arguments
+                )
             ):
                 raise OmnigentError(
                     f"Policy {policy.name!r}: handler {policy.function.path!r} is not a "

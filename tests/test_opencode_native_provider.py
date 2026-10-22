@@ -1,0 +1,862 @@
+"""Unit tests for opencode-native provider-config synthesis."""
+
+from __future__ import annotations
+
+import json
+import stat
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+from omnigent.harnesses.opencode_native.provider import (
+    OpenCodeGatewayResolution,
+    _gateway_endpoint_for_model,
+    _strip_jsonc_comments,
+    _strip_trailing_commas,
+    build_opencode_model_default_config,
+    build_opencode_omnigent_mcp_server,
+    build_opencode_provider_config,
+    managed_connect_opencode_config,
+    maybe_merge_user_provider_config,
+    resolve_databricks_gateway,
+    write_opencode_provider_config,
+)
+
+
+@pytest.fixture(autouse=True)
+def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.resolve_catalog_model",
+        lambda provider_name, *, family, **kwargs: types.SimpleNamespace(
+            model_id=f"catalog-{provider_name}-{family}-default"
+        ),
+    )
+
+
+def test_build_omnigent_mcp_server_points_serve_mcp_at_bridge_dir() -> None:
+    block = build_opencode_omnigent_mcp_server(Path("/tmp/bridge-xyz"))
+    assert set(block) == {"omnigent"}
+    entry = block["omnigent"]
+    assert entry["type"] == "local"
+    assert entry["enabled"] is True
+    # Milliseconds: must exceed the bridge's outer relay hop (330 s) so the
+    # relay's clean timeout error beats opencode's client-side kill.
+    assert entry["timeout"] == 360_000
+    cmd = entry["command"]
+    # Launches the SHARED serve-mcp relay, pointed at THIS bridge dir.
+    assert cmd[-3:] == ["serve-mcp", "--bridge-dir", "/tmp/bridge-xyz"]
+    assert "omnigent.harnesses.claude_native.bridge" in cmd
+    assert entry.get("environment", {}).get("PYTHONUNBUFFERED") == "1"
+
+
+def test_build_omnigent_mcp_server_honors_python_executable() -> None:
+    block = build_opencode_omnigent_mcp_server(Path("/tmp/b"), python_executable="/custom/python")
+    assert block["omnigent"]["command"][0] == "/custom/python"
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        {"command": "python", "args": [1], "env": {}},
+        {"command": "python", "args": [], "env": {"TOKEN": 1}},
+    ],
+)
+def test_build_omnigent_mcp_server_rejects_non_string_values(
+    monkeypatch: pytest.MonkeyPatch,
+    server: dict[str, object],
+) -> None:
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.build_mcp_config",
+        lambda bridge_dir, *, python_executable=None: {"mcpServers": {"omnigent": server}},
+    )
+
+    with pytest.raises(ValueError, match="Claude MCP server"):
+        build_opencode_omnigent_mcp_server(Path("/tmp/b"))
+
+
+def test_build_model_default_config_pins_model_without_provider_block() -> None:
+    cfg = build_opencode_model_default_config("anthropic/claude-sonnet-4-5")
+    assert cfg == {
+        "$schema": "https://opencode.ai/config.json",
+        "model": "anthropic/claude-sonnet-4-5",
+    }
+    # No provider block: opencode resolves the provider from the model prefix.
+    assert "provider" not in cfg
+
+
+def test_model_default_config_round_trips_through_writer(tmp_path: Path) -> None:
+    path = write_opencode_provider_config(
+        tmp_path, build_opencode_model_default_config("openai/gpt-5.5")
+    )
+    written = json.loads(path.read_text(encoding="utf-8"))
+    assert written["model"] == "openai/gpt-5.5"
+
+
+def test_qualified_model_joins_provider_and_endpoint() -> None:
+    res = OpenCodeGatewayResolution(
+        base_url="https://ws/serving-endpoints",
+        api_key="tok",
+        model_id="databricks-claude-sonnet-4-6",
+        provider_id="databricks-gateway",
+    )
+    assert res.qualified_model == "databricks-gateway/databricks-claude-sonnet-4-6"
+
+
+def test_build_provider_config_shape() -> None:
+    res = OpenCodeGatewayResolution(
+        base_url="https://ws/serving-endpoints",
+        api_key="sekret",
+        model_id="databricks-claude-sonnet-4-6",
+    )
+    cfg = build_opencode_provider_config(res)
+    block = cfg["provider"]["databricks-gateway"]
+    assert block["npm"] == "@ai-sdk/openai-compatible"
+    assert block["options"] == {"baseURL": "https://ws/serving-endpoints", "apiKey": "sekret"}
+    assert "databricks-claude-sonnet-4-6" in block["models"]
+    assert cfg["$schema"].endswith("config.json")
+
+
+def test_write_provider_config_is_0600_and_valid_json(tmp_path: Path) -> None:
+    res = OpenCodeGatewayResolution(
+        base_url="https://ws/serving-endpoints", api_key="tok", model_id="databricks-x"
+    )
+    path = write_opencode_provider_config(tmp_path, build_opencode_provider_config(res))
+    assert path == tmp_path / "opencode" / "opencode.json"
+    # Token-bearing config must not be world/group readable.
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    parsed = json.loads(path.read_text())
+    assert parsed["provider"]["databricks-gateway"]["options"]["apiKey"] == "tok"
+
+
+def test_write_provider_config_attributes_unity_gateway_models(tmp_path: Path) -> None:
+    """Each model of a Unity Gateway provider names OpenCode and Omnigent (+ ug)."""
+    config = {
+        "provider": {
+            "databricks": {
+                "options": {"baseURL": "https://dbc-1.cloud.databricks.com/ai-gateway/mlflow/v1"},
+                "models": {
+                    "system.ai.glm-5": {"headers": {"User-Agent": "ucode/0.1.0 opencode/1.2.0"}},
+                },
+            },
+            "serving": {
+                "options": {"baseURL": "https://dbc-1.cloud.databricks.com/serving-endpoints"},
+                "models": {"databricks-x": {"name": "databricks-x"}},
+            },
+        }
+    }
+
+    path = write_opencode_provider_config(tmp_path, config)
+
+    providers = json.loads(path.read_text())["provider"]
+    assert providers["databricks"]["models"]["system.ai.glm-5"]["headers"] == {
+        "User-Agent": "ucode/0.1.0 opencode/1.2.0",
+        "Databricks-Custom-Coding-Agent": "opencode",
+        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+    }
+    assert providers["serving"]["models"]["databricks-x"] == {"name": "databricks-x"}
+    # The caller's config is left as it was.
+    assert config["provider"]["databricks"]["models"]["system.ai.glm-5"]["headers"] == {
+        "User-Agent": "ucode/0.1.0 opencode/1.2.0"
+    }
+
+
+@pytest.mark.parametrize(
+    "model_id,expected",
+    [
+        ("databricks-claude-sonnet-4-6", "databricks-claude-sonnet-4-6"),
+        ("databricks/databricks-gpt-5-5", "databricks-gpt-5-5"),
+        ("claude-opus-4", None),  # not a gateway endpoint name
+        ("anthropic/claude-opus-4", None),
+        (None, None),
+    ],
+)
+def test_gateway_endpoint_normalization(model_id: str | None, expected: str | None) -> None:
+    assert _gateway_endpoint_for_model(model_id) == expected
+
+
+def test_resolve_gateway_none_without_profile() -> None:
+    assert resolve_databricks_gateway(None) is None
+    assert resolve_databricks_gateway("") is None
+
+
+def test_resolve_gateway_none_when_sdk_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Simulate databricks-sdk not installed: the import inside the function raises.
+    monkeypatch.setitem(sys.modules, "databricks.sdk.core", None)
+    assert resolve_databricks_gateway("oss") is None
+
+
+def _install_fake_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    host: str,
+    token: str | None,
+    endpoints: list[tuple[str, str]] | None = None,
+) -> None:
+    fake = types.ModuleType("databricks.sdk.core")
+
+    class _Config:
+        def __init__(self, *, profile: str) -> None:
+            self.profile = profile
+            self.host = host
+
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": f"Bearer {token}"} if token else {}
+
+    fake.Config = _Config  # type: ignore[attr-defined]
+    sdk = types.ModuleType("databricks.sdk")
+    # Only expose WorkspaceClient (used for serving-endpoint discovery) when the
+    # test supplies endpoints; otherwise the import fails and discovery no-ops.
+    if endpoints is not None:
+
+        class _WorkspaceClient:
+            def __init__(self, *, config: object) -> None:
+                self._config = config
+
+            @property
+            def serving_endpoints(self) -> object:
+                eps = [types.SimpleNamespace(name=n, task=t) for n, t in endpoints]
+                return types.SimpleNamespace(list=lambda: eps)
+
+        sdk.WorkspaceClient = _WorkspaceClient  # type: ignore[attr-defined]
+    # Ensure parent packages resolve for the dotted import.
+    monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
+    monkeypatch.setitem(sys.modules, "databricks.sdk", sdk)
+    monkeypatch.setitem(sys.modules, "databricks.sdk.core", fake)
+
+
+def test_resolve_gateway_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_sdk(monkeypatch, host="https://ws.cloud.databricks.com/", token="abc123")
+    res = resolve_databricks_gateway("oss", model_id="databricks-gpt-5-5")
+    assert res is not None
+    assert res.base_url == "https://ws.cloud.databricks.com/serving-endpoints"
+    assert res.api_key == "abc123"
+    assert res.model_id == "databricks-gpt-5-5"
+    assert res.qualified_model == "databricks-gateway/databricks-gpt-5-5"
+
+
+def test_resolve_gateway_defaults_non_gateway_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    res = resolve_databricks_gateway("oss", model_id="claude-opus-4")
+    assert res is not None
+    assert res.model_id == "catalog-databricks-claude-default"
+
+
+def test_resolve_gateway_none_when_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token=None)
+    assert resolve_databricks_gateway("oss") is None
+
+
+def test_resolve_gateway_lists_all_chat_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Discovery lists every chat serving-endpoint (pinned default first, embeddings
+    # dropped) so opencode's in-session picker offers them all.
+    _install_fake_sdk(
+        monkeypatch,
+        host="https://ws.databricks.com",
+        token="t",
+        endpoints=[
+            ("databricks-kimi-k3", "llm/v1/chat"),
+            ("databricks-claude-sonnet-4-6", "llm/v1/chat"),
+            ("databricks-gte-large-en", "llm/v1/embeddings"),
+            ("some-other-endpoint", "llm/v1/chat"),
+        ],
+    )
+    res = resolve_databricks_gateway("oss", model_id="databricks-claude-sonnet-4-6")
+    assert res is not None
+    # pinned default first, embeddings + non-databricks dropped, de-duped
+    assert res.model_ids == ("databricks-claude-sonnet-4-6", "databricks-kimi-k3")
+    cfg = build_opencode_provider_config(res)
+    models = cfg["provider"]["databricks-gateway"]["models"]  # type: ignore[index]
+    assert set(models) == {"databricks-claude-sonnet-4-6", "databricks-kimi-k3"}
+
+
+def test_resolve_gateway_single_model_when_discovery_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No WorkspaceClient (endpoints=None) -> discovery no-ops, just the pinned model.
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    res = resolve_databricks_gateway("oss", model_id="databricks-kimi-k3")
+    assert res is not None
+    assert res.model_ids == ("databricks-kimi-k3",)
+
+
+def test_resolve_gateway_env_default_applies(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No session model pinned -> the deployment env default steers the endpoint.
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "databricks-kimi-k3")
+    res = resolve_databricks_gateway("oss")
+    assert res is not None
+    assert res.model_id == "databricks-kimi-k3"
+
+
+def test_resolve_gateway_session_model_beats_env_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "databricks-kimi-k3")
+    res = resolve_databricks_gateway("oss", model_id="databricks-gpt-5-5")
+    assert res is not None
+    assert res.model_id == "databricks-gpt-5-5"
+
+
+def test_resolve_gateway_env_default_ignored_when_not_gateway_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A non ``databricks-*`` env value is not a routable endpoint -> catalog wins.
+    _install_fake_sdk(monkeypatch, host="https://ws.databricks.com", token="t")
+    monkeypatch.setenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", "kimi-k3")
+    res = resolve_databricks_gateway("oss")
+    assert res is not None
+    assert res.model_id == "catalog-databricks-claude-default"
+
+
+def test_build_mcp_block_stdio_and_http() -> None:
+    from types import SimpleNamespace as N
+
+    from omnigent.harnesses.opencode_native.provider import build_opencode_mcp_block
+
+    servers = [
+        N(
+            name="gh",
+            transport="stdio",
+            command="npx",
+            args=["-y", "server-github"],
+            env={"GITHUB_TOKEN": "x"},
+            url=None,
+            headers={},
+            databricks_profile=None,
+        ),
+        N(
+            name="remote",
+            transport="http",
+            url="https://mcp.example/sse",
+            headers={"X-Key": "k"},
+            databricks_profile=None,
+            command=None,
+            args=[],
+            env={},
+        ),
+        # Unrepresentable (stdio without a command) → skipped.
+        N(name="bad", transport="stdio", command=None, args=[], env={}, url=None, headers={}),
+    ]
+    block = build_opencode_mcp_block(servers)
+    assert set(block) == {"gh", "remote"}
+    assert block["gh"] == {
+        "type": "local",
+        "command": ["npx", "-y", "server-github"],
+        "enabled": True,
+        "environment": {"GITHUB_TOKEN": "x"},
+    }
+    assert block["remote"] == {
+        "type": "remote",
+        "url": "https://mcp.example/sse",
+        "enabled": True,
+        "headers": {"X-Key": "k"},
+    }
+
+
+def test_build_mcp_block_http_databricks_injects_bearer(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace as N
+
+    import omnigent.harnesses.opencode_native.provider as prov
+
+    monkeypatch.setattr(prov, "_databricks_bearer_token", lambda _p: "tok123")
+    servers = [
+        N(
+            name="dbx",
+            transport="http",
+            url="https://ws/mcp",
+            headers={},
+            databricks_profile="oss",
+            command=None,
+            args=[],
+            env={},
+        )
+    ]
+    block = prov.build_opencode_mcp_block(servers)
+    assert block["dbx"]["headers"] == {"Authorization": "Bearer tok123"}
+
+
+def test_strip_jsonc_comments_removes_line_and_block_comments() -> None:
+    raw = """{
+  // line comment
+  "key": "value", /* block comment */
+  "nested": /* another */ "val"
+}"""
+    cleaned = _strip_jsonc_comments(raw)
+    assert "//" not in cleaned
+    assert "/*" not in cleaned
+    assert "*/" not in cleaned
+    import json
+
+    parsed = json.loads(cleaned)
+    assert parsed == {"key": "value", "nested": "val"}
+
+
+def test_strip_jsonc_comments_preserves_valid_json() -> None:
+    raw = '{"key": "value", "nested": {"a": 1}}'
+    assert _strip_jsonc_comments(raw) == raw
+
+
+def test_strip_jsonc_comments_does_not_corrupt_urls() -> None:
+    """URLs containing // must not have the // stripped."""
+    raw = '{"baseURL": "https://my-gateway/v1"}'
+    cleaned = _strip_jsonc_comments(raw)
+    import json
+
+    parsed = json.loads(cleaned)
+    assert parsed["baseURL"] == "https://my-gateway/v1"
+
+
+def test_merge_user_provider_config_noop_without_user_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No user config file → config returned unchanged."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "nonexistent"))
+
+    config = {"model": "anthropic/claude-sonnet-4-5"}
+    result = maybe_merge_user_provider_config(config)
+    assert result == config
+
+
+def test_merge_user_provider_config_adds_user_providers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """User's provider definitions are merged into the synthesized config."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text(
+        '{"provider": {"my-openai": {"npm": "@ai-sdk/openai-compatible", '
+        '"options": {"baseURL": "https://my-gateway/v1", "apiKey": "sk-"}, '
+        '"models": {"gpt-4": {"name": "gpt-4"}}}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config: dict[str, object] = {}
+    result = maybe_merge_user_provider_config(config)
+
+    assert "provider" in result
+    providers = result["provider"]
+    assert isinstance(providers, dict)
+    assert "my-openai" in providers
+    assert providers["my-openai"]["options"]["baseURL"] == "https://my-gateway/v1"
+    # Synthesized $schema should have been added.
+    assert "$schema" in result
+
+
+def test_merge_user_provider_config_does_not_clobber_synthesized_providers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A user provider with the same key as a synthesized one is NOT overwritten."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text(
+        '{"provider": {"databricks-gateway": {"options": {"baseURL": "http://evil"}}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config = {
+        "provider": {
+            "databricks-gateway": {
+                "npm": "@ai-sdk/openai-compatible",
+                "options": {
+                    "baseURL": "https://real-databricks/serving-endpoints",
+                    "apiKey": "tok",
+                },
+            }
+        }
+    }
+    result = maybe_merge_user_provider_config(config)
+    assert (
+        result["provider"]["databricks-gateway"]["options"]["baseURL"]
+        == "https://real-databricks/serving-endpoints"
+    )
+
+
+def test_merge_user_provider_config_adopts_user_model_when_synthesized_has_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """User's default model is adopted when the synthesized config pins none.
+
+    Regression: with no gateway and no spec model_override, the synthesized
+    config had no ``model`` key; opencode-native then picked its own default
+    over the merged models map (landing on a served Gemini endpoint) instead of
+    the user's configured Claude default. The merge now carries ``model``.
+    """
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.json").write_text(
+        '{"model": "databricks/databricks-claude-opus-4-8", '
+        '"provider": {"databricks": {"npm": "@ai-sdk/openai-compatible", '
+        '"options": {"baseURL": "https://ws/serving-endpoints", "apiKey": "t"}, '
+        '"models": {"databricks-claude-opus-4-8": {"name": "Claude"}, '
+        '"databricks-gemini-2-5-pro": {"name": "Gemini"}}}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config: dict[str, object] = {}  # no gateway, no model_override
+    result = maybe_merge_user_provider_config(config)
+
+    assert result["model"] == "databricks/databricks-claude-opus-4-8"
+
+
+def test_merge_user_provider_config_does_not_override_synthesized_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A synthesized ``model`` (gateway / spec override) wins over the user's."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.json").write_text(
+        '{"model": "databricks/databricks-claude-opus-4-8", '
+        '"provider": {"databricks": {"models": {"m": {"name": "m"}}}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config: dict[str, object] = {"model": "databricks-gateway/pinned-model"}
+    result = maybe_merge_user_provider_config(config)
+
+    assert result["model"] == "databricks-gateway/pinned-model"
+
+
+def test_merge_user_provider_config_carries_model_without_user_providers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """User's default model is adopted even when the user declares no providers."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.json").write_text(
+        '{"model": "databricks/databricks-claude-opus-4-8"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config: dict[str, object] = {}
+    result = maybe_merge_user_provider_config(config)
+
+    assert result["model"] == "databricks/databricks-claude-opus-4-8"
+
+
+def test_merge_user_provider_config_preserves_plugins_and_deduplicates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Global plugins survive per-session config synthesis."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text(
+        '{"plugin": ["/opt/pulse-agents-harnesses/marshal-opencode", '
+        '"/opt/pulse-agents-harnesses/other"]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config: dict[str, object] = {
+        "plugin": ["/tmp/omnigent-policy.js", "/opt/pulse-agents-harnesses/other"]
+    }
+    result = maybe_merge_user_provider_config(config)
+
+    assert result["plugin"] == [
+        "/tmp/omnigent-policy.js",
+        "/opt/pulse-agents-harnesses/other",
+        "/opt/pulse-agents-harnesses/marshal-opencode",
+    ]
+
+
+def test_merge_user_provider_config_skips_non_string_plugins(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Malformed plugin entries are dropped rather than propagated."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text(
+        '{"plugin": ["/opt/pulse-agents-harnesses/marshal-opencode", {"bad": "entry"}, "", 42]}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config: dict[str, object] = {"plugin": ["/tmp/omnigent-policy.js"]}
+    result = maybe_merge_user_provider_config(config)
+
+    assert result["plugin"] == [
+        "/tmp/omnigent-policy.js",
+        "/opt/pulse-agents-harnesses/marshal-opencode",
+    ]
+
+
+def test_merge_user_provider_config_merges_alongside_synthesized_providers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """User providers appear alongside the synthesized ones when keys differ."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text(
+        '{"provider": {"my-openai": {"options": {"baseURL": "http://my-gw/v1"}}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    config = {
+        "provider": {
+            "databricks-gateway": {
+                "options": {"baseURL": "https://dbx/serving-endpoints", "apiKey": "tok"},
+            }
+        }
+    }
+    result = maybe_merge_user_provider_config(config)
+    providers = result["provider"]
+    assert "databricks-gateway" in providers
+    assert "my-openai" in providers
+    assert providers["my-openai"]["options"]["baseURL"] == "http://my-gw/v1"
+
+
+def test_merge_user_provider_config_handles_jsonc_comments(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The user's JSONC file with comments is parsed correctly."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text(
+        "{\n"
+        "  // my custom provider\n"
+        '  "provider": {\n'
+        '    "my-openai": {\n'
+        '      "options": {"baseURL": "https://my-gw/v1"}\n'
+        "    }\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    result = maybe_merge_user_provider_config({})
+    assert result["provider"]["my-openai"]["options"]["baseURL"] == "https://my-gw/v1"
+
+
+def test_strip_trailing_commas_object() -> None:
+    raw = '{"a": 1, "b": 2,}'
+    assert _strip_trailing_commas(raw) == '{"a": 1, "b": 2}'
+
+
+def test_strip_trailing_commas_array() -> None:
+    raw = "[1, 2, 3,]"
+    assert _strip_trailing_commas(raw) == "[1, 2, 3]"
+
+
+def test_strip_trailing_commas_nested() -> None:
+    raw = '{"a": [1, 2,], "b": {"c": 3,}}'
+    assert _strip_trailing_commas(raw) == '{"a": [1, 2], "b": {"c": 3}}'
+
+
+def test_strip_trailing_commas_noop_without_trailing_commas() -> None:
+    raw = '{"a": 1, "b": [1, 2]}'
+    assert _strip_trailing_commas(raw) == raw
+
+
+def test_strip_trailing_commas_preserves_commas_inside_strings() -> None:
+    """Commas followed by } or ] inside string literals must NOT be stripped."""
+    raw = '{"note": "a, }", "list": "b, ]"}'
+    assert _strip_trailing_commas(raw) == raw
+
+
+def test_strip_trailing_commas_nested_with_string_values() -> None:
+    """Trailing commas outside strings stripped; commas inside strings preserved."""
+    raw = '{"a": "x, }", "b": [1, 2,],}'
+    expected = '{"a": "x, }", "b": [1, 2]}'
+    assert _strip_trailing_commas(raw) == expected
+
+
+def test_merge_user_provider_config_handles_jsonc_trailing_commas(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Trailing commas in JSONC are handled (they're valid in JSONC but not JSON)."""
+    cfg_dir = tmp_path / "cfg" / "opencode"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "opencode.jsonc").write_text(
+        "{\n"
+        '  "provider": {\n'
+        '    "my-openai": {\n'
+        '      "options": {"baseURL": "https://my-gw/v1",},\n'  # trailing comma
+        "    },\n"  # trailing comma
+        "  },\n"  # trailing comma
+        "}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+
+    result = maybe_merge_user_provider_config({})
+    assert result["provider"]["my-openai"]["options"]["baseURL"] == "https://my-gw/v1"
+
+
+def test_build_mcp_block_preserves_custom_timeout() -> None:
+    from types import SimpleNamespace as N
+
+    from omnigent.harnesses.opencode_native.provider import build_opencode_mcp_block
+
+    servers = [
+        N(
+            name="local_custom",
+            transport="stdio",
+            command="python",
+            args=["-m", "custom_server"],
+            env={},
+            url=None,
+            headers={},
+            timeout=120,
+        ),
+        N(
+            name="remote_custom",
+            transport="http",
+            url="https://remote.mcp/api",
+            headers={},
+            command=None,
+            args=[],
+            env={},
+            timeout=45.5,
+        ),
+    ]
+    block = build_opencode_mcp_block(servers)
+    # MCPServerConfig.timeout is seconds; the opencode entry is milliseconds.
+    assert block["local_custom"]["timeout"] == 120_000
+    assert block["remote_custom"]["timeout"] == 45_500
+
+
+def test_extract_progress_token_variants() -> None:
+    from omnigent.harnesses.claude_native.bridge import _extract_progress_token
+
+    # Meta style (MCP standard)
+    assert _extract_progress_token({"_meta": {"progressToken": "tok-123"}}) == "tok-123"
+    assert _extract_progress_token({"_meta": {"progressToken": 42}}) == 42
+    # Top-level fallback
+    assert _extract_progress_token({"progressToken": "tok-456"}) == "tok-456"
+    # None or malformed
+    assert _extract_progress_token(None) is None
+    assert _extract_progress_token({}) is None
+    assert _extract_progress_token({"_meta": {}}) is None
+    assert _extract_progress_token({"_meta": {"progressToken": ["invalid"]}}) is None
+
+
+def test_mcp_progress_heartbeat_lifecycle() -> None:
+    import itertools
+    import threading
+    import time
+
+    lock = threading.Lock()
+    written_messages: list[dict[str, object]] = []
+
+    def fake_write(
+        payload: dict[str, object],
+        stdout_lock: threading.Lock,
+        **_kwargs: object,
+    ) -> None:
+        with stdout_lock:
+            written_messages.append(payload)
+
+    import omnigent.harnesses.claude_native.bridge as bridge_mod
+
+    orig_write = bridge_mod._write_jsonrpc
+    bridge_mod._write_jsonrpc = fake_write
+    try:
+        # With interval = 0.05s, should emit progress notifications
+        with bridge_mod._McpProgressHeartbeat("test-token", lock, interval_s=0.05):
+            time.sleep(0.12)
+        assert len(written_messages) >= 2
+        assert all(m["method"] == "notifications/progress" for m in written_messages)
+        assert all(m["params"]["progressToken"] == "test-token" for m in written_messages)
+        progresses = [m["params"]["progress"] for m in written_messages]
+        assert all(b > a for a, b in itertools.pairwise(progresses))
+
+        # Once exited, no more messages are emitted
+        count_at_exit = len(written_messages)
+        time.sleep(0.1)
+        assert len(written_messages) == count_at_exit
+    finally:
+        bridge_mod._write_jsonrpc = orig_write
+
+
+def test_managed_connect_opencode_config_consumes_ucode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a managed connect host, opencode reuses ucode's generated config
+    (provider block + system.ai model) and its refreshing auth plugin, copied into
+    the per-session XDG dir."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    # ucode's generated opencode config + auth plugin (its own XDG root).
+    ucode_dir = tmp_path / ".ucode" / "opencode-xdg" / "opencode"
+    (ucode_dir / "plugin").mkdir(parents=True)
+    (ucode_dir / "opencode.json").write_text(
+        json.dumps(
+            {
+                "model": "databricks-anthropic/system.ai.claude-opus-4-8",
+                "provider": {"databricks-anthropic": {"options": {"baseURL": "https://ws/x"}}},
+            }
+        )
+    )
+    (ucode_dir / "plugin" / "ucode-auth.js").write_text("// ucode auth plugin\n")
+    # A managed connect host (broker sidecar present) — and the ucode config
+    # already exists, so no on-demand configure is triggered.
+    monkeypatch.setattr(
+        "omnigent.host.databricks_credential._read_sidecar",
+        lambda path: {
+            "server": "s",
+            "host_id": "h",
+            "host_token": "t",
+            "workspace_host": "https://ws",
+        },
+    )
+
+    session_xdg = tmp_path / "session-xdg"
+    config = managed_connect_opencode_config(session_xdg)
+
+    assert config is not None
+    assert config["model"] == "databricks-anthropic/system.ai.claude-opus-4-8"  # system.ai
+    assert "databricks-anthropic" in config["provider"]
+    # auth plugin copied into the session dir and registered.
+    session_plugin = session_xdg / "opencode" / "plugin" / "ucode-auth.js"
+    assert session_plugin.exists()
+    assert config["plugin"] == [str(session_plugin)]
+
+
+def test_managed_connect_opencode_config_none_without_sidecar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No broker sidecar (e.g. a laptop) → None, so opencode's normal launch is
+    untouched off a managed sandbox."""
+    monkeypatch.setattr("omnigent.host.databricks_credential._read_sidecar", lambda path: None)
+    assert managed_connect_opencode_config(Path("/tmp/unused-xdg")) is None
+
+
+@pytest.mark.parametrize("bad_url", ["https://evil.example/x", "http://ws/x"])
+def test_managed_connect_opencode_config_rejects_untrusted_base_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_url: str
+) -> None:
+    """A ucode config whose provider baseURL is not HTTPS on the sidecar's
+    workspace host (a stale file from a prior connection, or a tampered one) is
+    refused, so the freshly-minted broker bearer is never forwarded to an
+    unverified origin."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    ucode_dir = tmp_path / ".ucode" / "opencode-xdg" / "opencode"
+    (ucode_dir / "plugin").mkdir(parents=True)
+    (ucode_dir / "opencode.json").write_text(
+        json.dumps(
+            {
+                "model": "databricks-anthropic/system.ai.claude-opus-4-8",
+                "provider": {"databricks-anthropic": {"options": {"baseURL": bad_url}}},
+            }
+        )
+    )
+    (ucode_dir / "plugin" / "ucode-auth.js").write_text("// ucode auth plugin\n")
+    monkeypatch.setattr(
+        "omnigent.host.databricks_credential._read_sidecar",
+        lambda path: {
+            "server": "s",
+            "host_id": "h",
+            "host_token": "t",
+            "workspace_host": "https://ws",  # bad_url points elsewhere / non-HTTPS
+        },
+    )
+
+    assert managed_connect_opencode_config(tmp_path / "session-xdg") is None

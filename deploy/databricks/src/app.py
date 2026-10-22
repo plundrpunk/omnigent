@@ -1,0 +1,348 @@
+"""Databricks Apps entry point for omnigent.
+
+Starts omnigent with Lakebase (managed PostgreSQL) as the
+database and UC Volumes as the artifact store.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+import threading
+import time
+import traceback
+from pathlib import Path as _Path
+
+from web_ui_archive import extract_web_ui_archive as _extract_web_ui_archive
+
+logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True)
+logger = logging.getLogger("omnigent-app")
+
+# ── Web UI location ────────────────────────────────────────
+#
+# The deploy ships the SPA outside the wheel as one archive beside this entry
+# point. Extract it before importing omnigent.server.app, which binds the
+# static-file directory at module import time. A loose directory is supported
+# for compatibility with deployments made by the earlier packaging scheme.
+
+
+def _prepare_web_ui() -> None:
+    import shutil as _shutil
+    import tarfile as _tarfile
+    import tempfile as _tempfile
+
+    here = _Path(__file__).resolve().parent
+    archive = here / "web-ui.tar.gz"
+    loose = here / "web-ui"
+    if loose.is_dir() and not archive.is_file():
+        os.environ.setdefault("OMNIGENT_WEB_UI_DIST", str(loose))
+        logger.info("Web UI: serving legacy loose assets from %s", loose)
+        return
+    if not archive.is_file():
+        logger.info("Web UI: no archive at %s; using packaged assets", archive)
+        return
+
+    extracted = _Path(_tempfile.mkdtemp(prefix="omnigent-web-ui-"))
+    try:
+        _extract_web_ui_archive(archive, extracted)
+    except (OSError, ValueError, _tarfile.TarError) as exc:
+        _shutil.rmtree(extracted, ignore_errors=True)
+        logger.warning("Web UI: failed to extract %s: %s; using packaged assets", archive, exc)
+        return
+
+    os.environ.setdefault("OMNIGENT_WEB_UI_DIST", str(extracted))
+    logger.info("Web UI: serving extracted assets from %s", extracted)
+
+
+_prepare_web_ui()
+
+# ── Lakebase token cache ──────────────────────────────────
+#
+# Lakebase tokens are valid for ~60 minutes. The previous design
+# minted a fresh token on every new physical Postgres connection
+# inside SQLAlchemy's ``do_connect`` event hook — a synchronous
+# Databricks SDK HTTPS round-trip costing 100–300 ms per call.
+# Under the 200-runner load test that meant ~20 mints/minute as
+# the pool churned overflow connections, with each mint blocking
+# whatever thread (sometimes the asyncio event-loop thread) was
+# establishing the connection.
+#
+# This cache mints once per endpoint and reuses the token across
+# all subsequent ``do_connect`` calls until the TTL expires. 50
+# minutes leaves a 10-minute safety margin before Lakebase rejects
+# the token. Concurrent first-time mints are NOT serialized — we
+# release the lock around the SDK call so a thundering herd of
+# initial connections all mints once each (worst case) rather than
+# waiting on a single in-flight mint. The cache is then populated
+# atomically with whichever mint finishes first; the late losers
+# just overwrite with their own (equally-valid) token.
+_TOKEN_TTL_SECONDS = 50 * 60
+_token_cache: dict[str, tuple[str, float]] = {}
+_token_cache_lock = threading.Lock()
+
+try:
+    import sqlalchemy
+    from databricks.sdk import WorkspaceClient
+
+    # ── Configuration ──────────────────────────────────────────
+
+    # Required env vars — injected by Databricks Apps runtime from
+    # the resources declared in databricks.yml / app.yaml.
+    LAKEBASE_ENDPOINT = os.environ["AP_LAKEBASE_ENDPOINT"]
+    VOLUME_PATH = os.environ["AP_ARTIFACT_VOLUME_PATH"]
+    PGHOST = os.environ["PGHOST"]
+    PGDATABASE = os.environ["PGDATABASE"]
+    PGUSER = os.environ["PGUSER"]
+
+    # Optional with documented defaults.
+    # Databricks Apps expects the app to listen on DATABRICKS_APP_PORT
+    # (8000 by convention) — deliberately decoupled from the CLI's
+    # local-server default (6767 in host/local_server.py).
+    PORT = int(os.environ.get("DATABRICKS_APP_PORT", "8000"))
+    PGPORT = os.environ.get("PGPORT", "5432")
+    PGSSLMODE = os.environ.get("PGSSLMODE", "require")
+    # Recycle DB connections before Lakebase 60-min token expiry.
+    # 300s (5 min) is conservative — well under the 60-min token TTL.
+    POOL_RECYCLE_SECONDS = int(os.environ.get("AP_POOL_RECYCLE_SECONDS", "300"))
+    logger.info(
+        "Config: PGHOST=%s PGDATABASE=%s PGUSER=%s VOLUME=%s PORT=%d",
+        PGHOST,
+        PGDATABASE,
+        PGUSER,
+        VOLUME_PATH,
+        PORT,
+    )
+
+    # ── Lakebase token injection ──────────────────────────────
+
+    _workspace_client = WorkspaceClient()
+
+    def _get_cached_token(endpoint: str) -> str:
+        """Return a cached Lakebase token for ``endpoint``, minting if needed.
+
+        Fast path: cached token whose expiry is in the future is returned
+        without contacting the workspace. Slow path: mint a new token via
+        the Databricks SDK (synchronous HTTPS). The mint runs OUTSIDE the
+        cache lock so multiple concurrent first-time mints don't serialize
+        behind one another — the last winner writes the cache, which is
+        safe since every minted token is independently valid for ~60 min.
+
+        :param endpoint: Lakebase endpoint resource name, e.g.
+            ``"projects/foo/branches/production/endpoints/primary"``.
+        :returns: A Lakebase database credential token.
+        :raises RuntimeError: If the SDK returns a credential with no token.
+        """
+        now = time.monotonic()
+        with _token_cache_lock:
+            cached = _token_cache.get(endpoint)
+            if cached is not None and cached[1] > now:
+                return cached[0]
+        credential = _workspace_client.postgres.generate_database_credential(
+            endpoint=endpoint,
+        )
+        if credential.token is None:
+            raise RuntimeError("Lakebase credential response did not include a token")
+        with _token_cache_lock:
+            _token_cache[endpoint] = (credential.token, now + _TOKEN_TTL_SECONDS)
+        return credential.token
+
+    # SQLAlchemy fixes the signature of do_connect; the dialect /
+    # conn_rec / cargs args aren't used here, but they have to be
+    # named so the hook accepts them. Underscore prefix tells the
+    # linter we know they're unused.
+    @sqlalchemy.event.listens_for(sqlalchemy.engine.Engine, "do_connect")
+    def _inject_lakebase_credentials(_dialect, _conn_rec, _cargs, cparams):
+        if cparams.get("host") != PGHOST:
+            return
+        cparams["password"] = _get_cached_token(LAKEBASE_ENDPOINT)
+        cparams["sslmode"] = PGSSLMODE
+
+    # ── Start omnigent ─────────────────────────────────────
+
+    import tempfile
+
+    import uvicorn
+
+    from omnigent.runtime import init as init_runtime
+    from omnigent.runtime import telemetry
+    from omnigent.runtime.agent_cache import AgentCache
+    from omnigent.runtime.caps import RuntimeCaps
+    from omnigent.server.app import create_app
+    from omnigent.server.auth import create_auth_provider, warn_if_single_user_exposed
+    from omnigent.server.managed_hosts import parse_sandbox_config
+    from omnigent.server.server_config import load_server_config
+    from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
+
+    # OTel: the Databricks Apps platform auto-injects
+    # OTEL_EXPORTER_OTLP_ENDPOINT when `telemetry_export_destinations`
+    # is set on the app — telemetry.init() picks that up and routes
+    # OTLP to the platform collector, which writes to the configured
+    # UC tables. No-op if neither OTEL nor MLflow env vars are set.
+    telemetry.init()
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+    from omnigent.stores.artifact_store.databricks_volumes import (
+        DatabricksVolumesArtifactStore,
+    )
+    from omnigent.stores.comment_store.sqlalchemy_store import (
+        SqlAlchemyCommentStore,
+    )
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+    from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+    from omnigent.stores.host_store import HostStore
+    from omnigent.stores.permission_store.sqlalchemy_store import (
+        SqlAlchemyPermissionStore,
+    )
+    from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+    from omnigent.stores.project_store.sqlalchemy_store import (
+        SqlAlchemyProjectStore,
+    )
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskStore,
+    )
+
+    DB_URI = f"postgresql+psycopg://{PGUSER}@{PGHOST}:{PGPORT}/{PGDATABASE}"
+    ARTIFACT_URI = f"dbfs:{VOLUME_PATH}"
+    CACHE_DIR = _Path(tempfile.mkdtemp(prefix="ap_cache_"))
+
+    logger.info("DB_URI: %s", DB_URI[:80])
+    logger.info("ARTIFACT_URI: %s", ARTIFACT_URI)
+
+    # The app SP owns the tables — run any pending Alembic upgrades
+    # before the stores boot, since the verify-schema check refuses
+    # to start a stale DB. Idempotent: a no-op when the DB is at head.
+    #
+    # Lakebase endpoints suspend after an idle window (default 24h). A
+    # boot that lands while the endpoint is cold/resuming raises a
+    # transient OperationalError, which the module-level catch-all below
+    # would turn into a fatal exit — the container then crash-loops and
+    # the app "doesn't load" until a manual redeploy happens to hit a
+    # warm endpoint. run_migrations_with_retry retries the connect+migrate
+    # with linear backoff so a cold start self-heals; a genuinely broken
+    # DB still fails after the attempts are exhausted. Both knobs are
+    # env-overridable (defaults: 8 attempts, 3s×attempt, ~84s budget).
+    from omnigent.db.utils import run_migrations_with_retry
+
+    run_migrations_with_retry(
+        DB_URI,
+        max_attempts=int(os.environ.get("AP_MIGRATE_MAX_ATTEMPTS", "8")),
+        backoff_seconds=float(os.environ.get("AP_MIGRATE_BACKOFF_SECONDS", "3")),
+    )
+
+    agent_store = SqlAlchemyAgentStore(DB_URI)
+    file_store = SqlAlchemyFileStore(DB_URI)
+    conversation_store = SqlAlchemyConversationStore(DB_URI)
+    artifact_store = DatabricksVolumesArtifactStore(ARTIFACT_URI)
+    file_comment_store = SqlAlchemyCommentStore(DB_URI)
+    permission_store = SqlAlchemyPermissionStore(DB_URI)
+    policy_store = SqlAlchemyPolicyStore(DB_URI)
+    project_store = SqlAlchemyProjectStore(DB_URI)
+    host_store = HostStore(DB_URI)
+    scheduled_task_store = SqlAlchemyScheduledTaskStore(DB_URI)
+
+    agent_cache = AgentCache(artifact_store=artifact_store, cache_dir=CACHE_DIR)
+
+    init_runtime(
+        agent_cache=agent_cache,
+        caps=RuntimeCaps(),
+        agent_store=agent_store,
+        file_store=file_store,
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        comment_store=file_comment_store,
+        policy_store=policy_store,
+    )
+
+    # The Databricks Apps proxy injects ``X-Forwarded-Email`` on
+    # every request, so we run in header mode. Header is the
+    # framework default, but pin it explicitly so the hosted product
+    # keeps its existing behavior regardless of any ambient
+    # OMNIGENT_AUTH_ENABLED in the deploy env (an explicit
+    # provider always wins over the enable switch).
+    os.environ.setdefault("OMNIGENT_AUTH_PROVIDER", "header")
+
+    # A single-user marker here would serve un-proxied requests as "local".
+    _exposure = warn_if_single_user_exposed("0.0.0.0")
+    if _exposure:
+        logger.warning("%s", _exposure)
+
+    auth_provider = create_auth_provider()
+
+    # Managed sandbox hosts (host_type="managed" sessions): parse the server
+    # config's ``sandbox:`` section like ``omnigent server`` does, so a typo
+    # stops startup here instead of 502-ing the first managed session.
+    try:
+        sandbox_config = parse_sandbox_config(load_server_config().get("sandbox"))
+    except ValueError as exc:
+        logger.error("Invalid 'sandbox' section in the server config: %s", exc)
+        raise
+    if sandbox_config is not None:
+        logger.info("Managed sandbox hosts configured from the server config")
+
+    # Databricks account connection: per-user OAuth tokens, which the
+    # `databricks` sandbox provider needs to run each sandbox as its owner.
+    from omnigent.server.databricks_app import DatabricksConfig
+
+    databricks_config = DatabricksConfig.from_env()
+    databricks_store = None
+    if databricks_config is not None:
+        from omnigent.stores.credential_store import build_secret_cipher
+
+        dbx_cipher = build_secret_cipher()
+        if dbx_cipher is None:
+            logger.error(
+                "Databricks account connection is configured but disabled: set the "
+                "credential store's key (OMNIGENT_CREDENTIAL_KMS_KEY_ID or "
+                "OMNIGENT_CREDENTIAL_VAULT_KEY) to enable it."
+            )
+        else:
+            from omnigent.connections.databricks import DatabricksConnectionStore
+
+            databricks_store = DatabricksConnectionStore(DB_URI, dbx_cipher)
+
+    app = create_app(
+        agent_store=agent_store,
+        file_store=file_store,
+        conversation_store=conversation_store,
+        artifact_store=artifact_store,
+        agent_cache=agent_cache,
+        comment_store=file_comment_store,
+        permission_store=permission_store,
+        policy_store=policy_store,
+        project_store=project_store,
+        host_store=host_store,
+        scheduled_task_store=scheduled_task_store,
+        auth_provider=auth_provider,
+        sandbox_config=sandbox_config,
+        databricks_config=databricks_config,
+        databricks_store=databricks_store,
+    )
+
+    if __name__ == "__main__":
+        from omnigent.server.graceful_shutdown import SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S, serve
+
+        logger.info("Starting omnigent on 0.0.0.0:%d", PORT)
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=PORT,
+            # Tunnel frame cap + keepalive: without them uvicorn's 20 s default closes
+            # a busy-but-healthy runner or host tunnel with 1011 after a client-path
+            # stall, while both clients tolerate 90 s.
+            **uvicorn_tunnel_kwargs(),
+            # Bound the graceful wait and drain SSE streams so a held session
+            # stream can't keep the app alive until the platform SIGKILLs it.
+            # Matches `omnigent server`.
+            timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_S,
+        )
+        serve(config)
+
+except Exception:  # noqa: BLE001 — startup catch-all; we want every failure logged
+    logger.error("FATAL: omnigent failed to start:\n%s", traceback.format_exc())
+    # Keep the process alive briefly so logs can be captured
+    import time
+
+    time.sleep(30)
+    sys.exit(1)

@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.builtins._arguments import parse_json_object_arguments
+from omnigent.tools.builtins.upload_file import safe_resolve
 
 
 class DownloadFileTool(Tool):
@@ -60,6 +62,7 @@ class DownloadFileTool(Tool):
                         },
                     },
                     "required": ["file_id"],
+                    "additionalProperties": False,
                 },
             },
         }
@@ -71,10 +74,21 @@ class DownloadFileTool(Tool):
         :param ctx: Provides workspace path for saving.
         :returns: JSON string with the local file path, or error.
         """
-        args: dict[str, Any] = json.loads(arguments)
+        args, error = parse_json_object_arguments(arguments)
+        if error is not None:
+            return json.dumps({"error": error})
+        assert args is not None
+
+        unsupported = sorted(set(args) - {"file_id"})
+        if unsupported:
+            names = ", ".join(repr(name) for name in unsupported)
+            return json.dumps({"error": f"unsupported argument(s): {names}"})
+
         file_id = args.get("file_id")
-        if not file_id:
+        if file_id is None or file_id == "":
             return json.dumps({"error": "missing required 'file_id'"})
+        if not isinstance(file_id, str):
+            return json.dumps({"error": "'file_id' must be a string"})
 
         from omnigent.runtime import get_artifact_store, get_file_store
 
@@ -93,7 +107,8 @@ class DownloadFileTool(Tool):
             return json.dumps({"error": f"File {file_id!r} not found."})
 
         try:
-            data = artifact_store.get(file_id)
+            # Bytes live under blob_key (a fork copy shares the source's blob).
+            data = artifact_store.get(record.blob_key or file_id)
         except KeyError:
             return json.dumps(
                 {
@@ -101,10 +116,13 @@ class DownloadFileTool(Tool):
                 }
             )
 
-        dest = _resolve_destination(
-            record.filename,
-            ctx.workspace,
-        )
+        try:
+            dest = _resolve_destination(
+                record.filename,
+                ctx.workspace,
+            )
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(data)
 
@@ -125,9 +143,22 @@ def _resolve_destination(
     """
     Resolve the save path for a downloaded file.
 
+    The stored ``filename`` is untrusted metadata. Path-bearing names are
+    rejected, and valid names are confined via :func:`safe_resolve`.
+
     :param filename: The file's original filename from the store.
     :param workspace: The agent's workspace directory, or ``None``.
-    :returns: Absolute path to save the file.
+    :returns: Absolute path to save the file, confined to ``workspace``.
+    :raises ValueError: If the filename contains path components or the
+        resolved path escapes the workspace.
     """
     base = workspace or Path.cwd()
-    return base / filename
+    if (
+        not filename
+        or filename in {".", ".."}
+        or Path(filename).name != filename
+        or "/" in filename
+        or "\\" in filename
+    ):
+        raise ValueError("Stored filename must be a single path component.")
+    return safe_resolve(filename, base)

@@ -39,6 +39,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -65,9 +66,6 @@ _ENV_TO_CLEAR = (
     "OMNIGENT_DATA_DIR",
     "OMNIGENT_CONFIG_HOME",
     "OMNIGENT_AUTH_ENABLED",
-    # Pre-rename alias for OMNIGENT_AUTH_ENABLED — still honored, so strip
-    # it too or a dev shell that exports it flips the server into accounts mode.
-    "OMNIGENT_ACCOUNTS_ENABLED",
     # An ambient issuer would select oidc once auth is (accidentally) enabled.
     "OMNIGENT_OIDC_ISSUER",
     "OMNIGENT_AUTH_PROVIDER",
@@ -170,18 +168,6 @@ def _health_ok(port: int) -> bool:
     except httpx.HTTPError:
         return False
     return resp.status_code == 200
-
-
-def _find_free_port() -> int:
-    """Find a free loopback TCP port.
-
-    :returns: An available port number on ``127.0.0.1``.
-    """
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
 
 
 def _wait_for_pidfile_server(
@@ -537,10 +523,10 @@ def test_explicit_port_servers_run_side_by_side(
     env = _isolated_env(home)
     # Two distinct free ports: the probe socket closes immediately, so the OS
     # could hand out the same ephemeral port twice — loop until they differ.
-    port_a = _find_free_port()
-    port_b = _find_free_port()
+    port_a = find_free_port()
+    port_b = find_free_port()
     while port_b == port_a:
-        port_b = _find_free_port()
+        port_b = find_free_port()
 
     srv_a = procs.spawn(
         ["server", "--port", str(port_a)], env=env, cwd=home, log=tmp_path / "a.log"

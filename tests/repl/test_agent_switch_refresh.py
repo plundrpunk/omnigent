@@ -18,6 +18,7 @@ is exercised — not a re-implementation of it.
 from __future__ import annotations
 
 import pytest
+from omnigent_client._errors import InvalidInputError
 from omnigent_client._sessions import Session as SessionSnapshot
 from omnigent_ui_sdk import RichBlockFormatter
 from rich.text import Text
@@ -303,3 +304,228 @@ def test_both_triggers_spawn_metadata_refresh() -> None:
         f"expected 2 _spawn_metadata_refresh() call sites (turn-start "
         f"catch-up + session.agent_changed), found {len(calls)}."
     )
+
+
+def _runner_snapshot(runner_id: str | None) -> SessionSnapshot:
+    """
+    Build a snapshot carrying a specific bound ``runner_id``.
+
+    :param runner_id: Runner bound to the session in the snapshot, or
+        ``None`` for a not-yet-bound session.
+    :returns: A real SDK :class:`SessionSnapshot`.
+    """
+    return SessionSnapshot(
+        id="conv_abc",
+        agent_id="ag_new",
+        status="idle",
+        created_at=0,
+        agent_name="nessie",
+        llm_model=None,
+        harness="claude-native",
+        context_window=200_000,
+        runner_id=runner_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_refresh_adopts_server_relaunched_runner_id() -> None:
+    """A relaunched runner_id in the snapshot becomes the adapter's own.
+
+    Regression for the idle-runner resume bug: a host-bound runner
+    idle-times-out and is relaunched server-side under a NEW runner_id
+    on the next message. This metadata refresh hydrates the snapshot's
+    new id into ``_bound_runner_id``; if ``_runner_id`` stayed frozen
+    at the launch-time runner, every subsequent ``_bind_runner_if_needed``
+    would PATCH the session back onto the dead, deregistered runner and
+    the server would 400 with "runner '<id>' is not registered". The
+    adapter must adopt the relaunched id so the two stay in sync.
+    """
+    client = _SnapshotClient(_runner_snapshot("runner_token_new"))
+    adapter = _make_adapter(client)
+    # Simulate the launch-time / prepare-time bind: both ids point at the
+    # original daemon runner, which has since idle-died and relaunched.
+    adapter._runner_id = "runner_token_old"
+    adapter._bound_runner_id = "runner_token_old"
+
+    await _refresh_session_metadata(
+        adapter,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        _SwitchHost(),  # type: ignore[arg-type]
+        RichBlockFormatter(),
+    )
+
+    # Both now point at the relaunched runner — a follow-up bind check
+    # sees them equal and skips the PATCH entirely.
+    assert adapter._bound_runner_id == "runner_token_new"
+    assert adapter._runner_id == "runner_token_new"
+    await adapter._bind_runner_if_needed()
+    # No PATCH issued: the stub client has no bind_runner surface, so a
+    # bind attempt would AttributeError. Reaching here proves it skipped.
+
+
+@pytest.mark.asyncio
+async def test_refresh_keeps_runner_id_when_snapshot_unbound() -> None:
+    """A snapshot with ``runner_id=None`` must not wipe the runner to bind.
+
+    A freshly-created session is not yet bound (snapshot runner_id None);
+    the launch-time ``_runner_id`` is the runner we still need to PATCH,
+    so the adopt-from-snapshot logic must guard on a non-empty id.
+    """
+    client = _SnapshotClient(_runner_snapshot(None))
+    adapter = _make_adapter(client)
+    adapter._runner_id = "runner_token_launch"
+
+    await _refresh_session_metadata(
+        adapter,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        _SwitchHost(),  # type: ignore[arg-type]
+        RichBlockFormatter(),
+    )
+
+    assert adapter._runner_id == "runner_token_launch"
+
+
+@pytest.mark.asyncio
+async def test_refresh_preserves_client_owned_runner_id() -> None:
+    """With a recovery callback, the client owns ``_runner_id`` — keep it.
+
+    The ``runner_recover`` path relaunches a CLIENT-owned runner and
+    drives ``_runner_id`` itself; the server snapshot must not override
+    that, or a refresh racing recovery would rebind the stale runner.
+    """
+    client = _SnapshotClient(_runner_snapshot("runner_token_server"))
+    adapter = _SessionsChatReplAdapter(
+        client,  # type: ignore[arg-type]
+        "nessie",
+        session_id="conv_abc",
+        runner_id="runner_token_client",
+        runner_recover=lambda: "runner_token_client",
+    )
+
+    await _refresh_session_metadata(
+        adapter,  # type: ignore[arg-type]
+        client,  # type: ignore[arg-type]
+        _SwitchHost(),  # type: ignore[arg-type]
+        RichBlockFormatter(),
+    )
+
+    assert adapter._runner_id == "runner_token_client"
+
+
+class _StaleBindSessions:
+    """
+    ``client.sessions`` stub modelling a server-relaunched runner.
+
+    ``bind_runner`` 400s any runner but the live one; ``get`` reports the
+    live runner the session is now bound to.
+
+    :param live_runner_id: Runner the snapshot is bound to, e.g.
+        ``"runner_token_new"``.
+    """
+
+    def __init__(self, live_runner_id: str) -> None:
+        self._live_runner_id = live_runner_id
+        self.bind_calls: list[str] = []
+        self.get_calls: list[str] = []
+
+    async def bind_runner(self, session_id: str, *, runner_id: str) -> SessionSnapshot:
+        """
+        Accept the live runner; 400 any other id like the server does.
+
+        :param session_id: Session being bound (ignored).
+        :param runner_id: Runner id the adapter is binding.
+        :returns: Snapshot bound to *runner_id* when it is live.
+        :raises InvalidInputError: When *runner_id* is not the live runner.
+        """
+        self.bind_calls.append(runner_id)
+        if runner_id != self._live_runner_id:
+            raise InvalidInputError(
+                f"runner {runner_id!r} is not registered",
+                status_code=400,
+                code="invalid_input",
+            )
+        return _runner_snapshot(runner_id)
+
+    async def get(self, session_id: str) -> SessionSnapshot:
+        """
+        Serve the snapshot bound to the live runner.
+
+        :param session_id: Session id requested (ignored).
+        :returns: Snapshot bound to the live runner.
+        """
+        self.get_calls.append(session_id)
+        return _runner_snapshot(self._live_runner_id)
+
+
+class _StaleBindClient:
+    """Client stub whose sessions surface models a relaunched runner."""
+
+    def __init__(self, live_runner_id: str) -> None:
+        self.sessions = _StaleBindSessions(live_runner_id)
+
+
+@pytest.mark.asyncio
+async def test_bind_reconciles_to_relaunched_runner_on_not_registered() -> None:
+    """A "not registered" bind failure adopts the snapshot's live runner.
+
+    Regression for the stale-runner deadlock: the adapter is pinned to a
+    dead runner the server has relaunched under a new id, so the bind 400s
+    on every send. The bind path must re-read the snapshot, adopt the live
+    runner, and rebind.
+    """
+    client = _StaleBindClient("runner_token_new")
+    adapter = _make_adapter(client)
+    adapter._runner_id = "runner_token_old"
+    adapter._bound_runner_id = None
+
+    await adapter._bind_runner_if_needed()
+
+    assert adapter._runner_id == "runner_token_new"
+    assert adapter._bound_runner_id == "runner_token_new"
+    # First bind uses the stale id (fails), second uses the reconciled id.
+    assert client.sessions.bind_calls == ["runner_token_old", "runner_token_new"]
+    assert client.sessions.get_calls == ["conv_abc"]
+
+
+@pytest.mark.asyncio
+async def test_bind_reraises_when_snapshot_has_no_live_runner() -> None:
+    """A snapshot with no runner leaves nothing to adopt — re-raise.
+
+    With no bound runner to reconcile onto, the original error must
+    propagate so the REPL shows its recovery message instead of hanging.
+    """
+    client = _StaleBindClient("runner_token_new")
+    # Snapshot reports no live runner despite the bind rejection.
+    client.sessions._live_runner_id = None  # type: ignore[assignment]
+    adapter = _make_adapter(client)
+    adapter._runner_id = "runner_token_old"
+    adapter._bound_runner_id = None
+
+    with pytest.raises(InvalidInputError):
+        await adapter._bind_runner_if_needed()
+
+    assert adapter._runner_id == "runner_token_old"
+
+
+@pytest.mark.asyncio
+async def test_bind_does_not_reconcile_with_client_owned_runner() -> None:
+    """With a recovery callback set, the bind path leaves the runner alone.
+
+    A client-owned runner is driven by ``_recover_runner_if_needed``, so
+    reconciliation must not fetch the snapshot or override ``_runner_id``.
+    """
+    client = _StaleBindClient("runner_token_new")
+    adapter = _SessionsChatReplAdapter(
+        client,  # type: ignore[arg-type]
+        "nessie",
+        session_id="conv_abc",
+        runner_id="runner_token_client",
+        runner_recover=lambda: "runner_token_client",
+    )
+    adapter._bound_runner_id = None
+
+    with pytest.raises(InvalidInputError):
+        await adapter._bind_runner_if_needed()
+
+    assert adapter._runner_id == "runner_token_client"
+    assert client.sessions.get_calls == []

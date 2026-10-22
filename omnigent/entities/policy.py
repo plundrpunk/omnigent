@@ -31,6 +31,8 @@ class Policy:
     :param session_id: The session this policy is scoped to,
         e.g. ``"conv_abc123"``. ``None`` for server-wide
         default policies.
+    :param scope: ``"default"`` for server-wide policies;
+        ``"session"`` for session-scoped policies.
     :param created_at: Unix epoch seconds at row creation.
     :param type: Handler discriminator: ``"python"`` or
         ``"url"``.
@@ -47,11 +49,17 @@ class Policy:
     :param created_by: User ID of the admin who created this
         policy, e.g. ``"alice@example.com"``. ``None`` in
         single-user mode or for session-scoped policies.
+    :param workspace_id: Databricks workspace id that owns this
+        policy row (0 on single-workspace OSS). The store reads
+        are workspace-scoped, so this equals the reader's
+        workspace; carried so a denial can be attributed to the
+        owning workspace in logs.
     """
 
     id: str
     name: str
     session_id: str | None
+    scope: str
     created_at: int
     type: str
     handler: str
@@ -59,3 +67,4 @@ class Policy:
     enabled: bool = True
     updated_at: int | None = None
     created_by: str | None = None
+    workspace_id: int | None = None

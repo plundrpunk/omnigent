@@ -1,24 +1,26 @@
-"""Fixtures for browser-driven e2e tests of the ap-web SPA.
+"""Fixtures for browser-driven e2e tests of the web SPA.
 
 The suite spawns a real ``omnigent server --agent`` subprocess against
 ``examples/hello_world.yaml`` and drives the rendered SPA with
-Playwright. The agent calls a real LLM, so the suite is excluded from
-the default ``pytest`` run via ``--ignore=tests/e2e_ui`` in
+Playwright. The server is wired to a mock LLM server so the suite
+runs deterministically without real credentials. The suite is excluded
+from the default ``pytest`` run via ``--ignore=tests/e2e_ui`` in
 ``pyproject.toml`` and gated to ``workflow_dispatch`` in CI for now.
 
 Local usage::
 
     # one-time setup
-    uv sync --extra e2e-ui
-    uv run playwright install --with-deps chromium
+    uv sync --extra all --group test
+    uv run --no-sync playwright install --with-deps chromium
 
     # run against a freshly built SPA + spawned server
-    uv run pytest tests/e2e_ui -v
+    uv run --no-sync pytest tests/e2e_ui -v
 
-    # iterate against an already-running dev server
-    cd ap-web && npm run dev &
+    # iterate against an already-running server (dev hosts/ports need opt-in)
+    cd web && npm run dev &
     omnigent server --agent examples/hello_world.yaml &
-    uv run pytest tests/e2e_ui --ui-base-url http://127.0.0.1:5173
+    OMNIGENT_E2E_ALLOW_DEV_BASE_URL=1 \
+      uv run --no-sync pytest tests/e2e_ui --ui-base-url http://127.0.0.1:5173
 
 ``omnigent server`` is documented at ``omnigent/cli.py:server``:
 it spins up uvicorn with the Omnigent app and spawns an out-of-process
@@ -30,24 +32,107 @@ pytest tmp dir so the test never touches the user's default
 
 from __future__ import annotations
 
+import contextlib
 import io
+import json
+import math
+import mimetypes
 import os
+import re
+import shutil
 import signal
 import socket
 import subprocess
 import sys
-import tarfile
 import time
-from collections.abc import Iterator
+import warnings
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import filelock
 import httpx
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import APIResponse, Error, Locator, Page, Route, expect
+
+from tests._helpers.compat import (
+    apply_runner_env,
+    apply_server_env,
+    compat_runner_cwd,
+    compat_server_cwd,
+    runner_executable,
+    server_executable,
+)
+from tests._helpers.native_session import create_native_session
+from tests._helpers.operator_agents import operator_agent_store, post_operator_session
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
+from tests._helpers.workspace_geometry import (
+    workspace_bar_needs_collapse as workspace_bar_needs_collapse,
+)
+from tests.codex_parity.helpers import ev_assistant_message, ev_completed, ev_response_created
+from tests.codex_parity.sidecar_harness import (
+    CodexResponsesSidecar,
+    build_sidecar_bin,
+    start_codex_responses_sidecar,
+)
+from tests.helpers import ui_timings as timings
+from tests.helpers.ui_configuration import (
+    _ALLOW_DEV_BASE_URL_ENV,
+    ServerState,
+    prepared_repro_environment,
+    validate_native_claude_mock_routing,
+)
+from tests.helpers.ui_configuration import (
+    _CLAUDE_MOCK_MODEL as _CLAUDE_MOCK_MODEL,
+)
+from tests.helpers.ui_configuration import (
+    _CODEX_MOCK_MODEL as _CODEX_MOCK_MODEL,
+)
+from tests.helpers.ui_configuration import (
+    pytest_configure as pytest_configure,
+)
+from tests.helpers.ui_configuration import (
+    temp_omnigent_mock_config as _temp_omnigent_mock_config,
+)
+from tests.helpers.ui_server_compat import (
+    _enforce_min_server_version as _enforce_min_server_version,
+)
+from tests.helpers.ui_server_compat import (
+    server_version as server_version,
+)
+from tests.helpers.ui_url_safety import DEV_PORTS
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+_RECORD_DIR_ENV = "OMNIGENT_E2E_RECORD_DIR"
+_CODEX_GOAL_MIN_VERSION = (0, 139, 0)
+_PUBLIC_LOOPBACK_HOST = "omnigent-e2e-public.test"
+
+
+# A pooled connection the server closes as the replay goes out surfaces as one
+# of these; the request itself is fine on a retry.
+_TRANSIENT_FETCH_ERRORS = ("ECONNRESET", "socket hang up")
+
+
+def fetch_with_retry(route: Route, *, attempts: int = 3) -> APIResponse:
+    """Replay *route*'s request upstream, retrying a dropped connection.
+
+    Intercepting a request opts out of the browser's own connection handling,
+    which retries an idempotent GET when the server closes a pooled keep-alive
+    connection. Replaying by hand does not, so a reset fails the test on
+    something it never meant to assert.
+
+    :param route: Route whose request to replay upstream.
+    :param attempts: Total tries before the error surfaces.
+    :returns: The upstream response.
+    """
+    for _ in range(attempts - 1):
+        try:
+            return route.fetch()
+        except Error as exc:
+            if not any(marker in str(exc) for marker in _TRANSIENT_FETCH_ERRORS):
+                raise
+    return route.fetch()
 
 
 def open_right_rail(page: Page) -> None:
@@ -73,30 +158,84 @@ def open_right_rail(page: Page) -> None:
     expect(page.get_by_role("complementary", name="Workspace")).to_be_visible()
 
 
-# Populated by ``live_server`` so test-scoped fixtures can access the
-# server PID and runner id without changing ``live_server``'s return
-# type (which other tests depend on).
-_server_state: dict[str, int | str] = {}
-_AP_WEB_DIR = _REPO_ROOT / "ap-web"
+def switch_markdown_view_mode(page: Page, file_viewer: Locator, mode: str) -> None:
+    """Switch a markdown FileViewer to Preview / Edit / Source via the toolbar.
+
+    Markdown files default to the rendered Preview pane; the three modes live
+    behind a single "View mode" dropdown in the toolbar. Open that dropdown and
+    pick the option. The menu renders in a portal (outside ``file_viewer``), so
+    the menuitem is queried off ``page``, not the viewer locator.
+
+    :param page: Playwright page with the file viewer open.
+    :param file_viewer: The visible ``[data-testid="file-viewer"]`` locator.
+    :param mode: One of ``"Preview"``, ``"Edit"``, ``"Source"``.
+    :returns: None.
+    """
+    file_viewer.get_by_role("button", name=re.compile(r"^View mode")).first.click()
+    page.get_by_role("menuitem", name=mode, exact=True).click()
+
+
+def open_previewable_files_in_preview(page: Page) -> None:
+    """Make Markdown, HTML, and notebook files open on the rendered Preview.
+
+    Seeds the stored FileViewer preferences before the app loads (Markdown
+    otherwise opens in the rich-text editor), so call it before ``page.goto``.
+
+    :param page: Playwright page that has not yet loaded the app.
+    :returns: None.
+    """
+    page.add_init_script(
+        """
+        window.localStorage.setItem(
+          "omnigent:file-view-preferences",
+          JSON.stringify({
+            diffActive: false,
+            diffLayout: "unified",
+            previewableViewMode: "preview",
+            hideWhitespace: false,
+            wrapLines: false,
+          }),
+        );
+        """
+    )
+
+
+# Populated by live_server for fixtures that need the server PID or runner ID.
+_server_state: dict[str, object] = ServerState()
+
+
+_WEB_DIR = _REPO_ROOT / "web"
 _BUILD_OUTPUT = _REPO_ROOT / "omnigent" / "server" / "static" / "web-ui"
 
 # ``omnigent server --agent`` runs the spec through the strict
 # validator at registration time (no shim defaults applied), so the
 # YAML must carry an explicit ``executor`` block — otherwise the
 # server rejects with ``executor.config.harness: required when
-# executor.type is 'omnigent'``. The legacy ``serve --omnigent`` path
-# filled ``model: databricks-gpt-5-4`` in via ``_apply_overrides_to_yaml``
-# and let harness auto-pick resolve it to ``openai-agents``; we mirror
-# the same effective config here so the test agent is byte-identical
-# to what the previous fixture spawned.
+# executor.type is 'omnigent'``. The model name (gpt-4o-mini) is a plain
+# (non-``databricks-``) name on purpose: the openai-agents harness then
+# resolves no provider auth and falls back to ``OPENAI_BASE_URL`` (the
+# in-process mock) rather than routing to the Databricks gateway, which
+# would need real credentials CI does not have. A ``databricks-``-prefixed
+# model forces Databricks DEFAULT-profile auth (see
+# omnigent/runtime/workflow.py) and fails with DatabricksAuthError in CI.
 _TEST_AGENT_YAML = """\
 name: hello_world
 prompt: You are a friendly assistant. Say hello and answer questions.
 
 executor:
-  model: databricks-gpt-5-4
-  config:
-    harness: openai-agents
+  model: gpt-4o-mini
+  harness: openai-agents
+
+# ``researcher`` sub-agent declared inline so the sub-agent create tests
+# (mobile workflow, subagent tab title) can spawn a child named
+# "researcher"; the create route rejects an undeclared sub_agent_name.
+tools:
+  researcher:
+    type: agent
+    prompt: You research questions and report findings.
+    executor:
+      model: gpt-4o-mini
+      harness: openai-agents
 
 # Required for PUT /filesystem/{path} seeding in UI tests (e.g. markdown
 # editor comments) — the runner returns 404 when os_env is absent.
@@ -143,10 +282,8 @@ def _build_hello_world_bundle() -> bytes:
 _HEALTH_TIMEOUT_S = 30.0
 _HEALTH_POLL_INTERVAL_S = 0.5
 
-# Switch-target built-ins for the Files-tab os_env-boundary test
-# (test_switch_agent_files_tab.py). The in-place switch dialog lists
-# BUILT-IN agents only (``session_id IS NULL`` — see
-# ``switch_session_agent``), and built-ins can only be seeded at server
+# Fork-into-another-agent target built-ins (test_fork_switch_agent.py).
+# Built-ins can only be seeded at server
 # startup via ``OMNIGENT_BUILTIN_AGENT_DIRS``, so ``live_server`` writes
 # these two specs to disk and threads them through that env var. Both run
 # the same openai-agents harness as ``hello_world`` (same provider family
@@ -161,18 +298,16 @@ name: {_FILES_PROBE_NO_ENV_AGENT_NAME}
 prompt: You are a terse assistant with no filesystem.
 
 executor:
-  model: databricks-gpt-5-4
-  config:
-    harness: openai-agents
+  model: gpt-4o-mini
+  harness: openai-agents
 """
 _FILES_PROBE_ENV_AGENT_YAML = f"""\
 name: {_FILES_PROBE_ENV_AGENT_NAME}
 prompt: You are a terse assistant with a filesystem.
 
 executor:
-  model: databricks-gpt-5-4
-  config:
-    harness: openai-agents
+  model: gpt-4o-mini
+  harness: openai-agents
 
 os_env:
   type: caller_process
@@ -188,12 +323,23 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     :param parser: The pytest option parser.
     """
     parser.addoption(
+        "--ui-dependency-smoke",
+        action="store_true",
+        default=False,
+        help="Deprecated; removal in 0.21.0. Run compatibility smoke and Codex sidecar consumers.",
+    )
+    parser.addoption(
+        "--ui-codex-sidecar-only",
+        action="store_true",
+        help="Run consumers of the Codex Responses sidecar before splitting into shards.",
+    )
+    parser.addoption(
         "--ui-base-url",
         default=None,
         help=(
             "Skip both the SPA build and the server spawn; point Playwright "
-            "at this URL instead. Useful when iterating with `npm run dev` + "
-            "a long-lived `omnigent server` process."
+            "at this URL instead. Refuses known dev hosts/ports unless "
+            f"{_ALLOW_DEV_BASE_URL_ENV}=1 is set."
         ),
     )
     parser.addoption(
@@ -205,6 +351,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "instead of rebuilding. Fails if no build is present."
         ),
     )
+    timings.pytest_addoption(parser)
     # Round-robin shard split for the e2e-ui CI matrix. We roll our own
     # (rather than pull in pytest-shard / pytest-split) so the partition
     # is a dependency-free strided slice -- see pytest_collection_modifyitems
@@ -223,6 +370,62 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+@pytest.fixture(scope="session")
+def browser_type_launch_args(
+    browser_type_launch_args: dict[str, Any],
+    pytestconfig: pytest.Config,
+) -> dict[str, Any]:
+    """Default UI e2e browser launches to headless, with CI enforcement."""
+    launch_args = {**browser_type_launch_args}
+    if os.environ.get("CI"):
+        launch_args["headless"] = True
+    elif not pytestconfig.getoption("--headed", default=False):
+        launch_args.setdefault("headless", True)
+    launch_args["args"] = [
+        *launch_args.get("args", []),
+        f"--host-resolver-rules=MAP {_PUBLIC_LOOPBACK_HOST} 127.0.0.1",
+        # Headless Chromium has no microphone; the dictation test
+        # (chat/test_dictation.py) needs getUserMedia to yield a fake
+        # input stream without a permission prompt. No effect on tests
+        # that never touch media capture.
+        "--use-fake-device-for-media-stream",
+        "--use-fake-ui-for-media-stream",
+    ]
+    # The pinned Playwright Docker image (the visual-snapshot renderer, both in
+    # ui-snapshot.yml and the local regen script) runs as root, where Chromium
+    # refuses to start without --no-sandbox; --disable-dev-shm-usage avoids the
+    # container's small /dev/shm. Neither flag changes rasterized output, so a
+    # baseline stays identical to a sandboxed run. Env-gated so the unpinned
+    # e2e-ui runners (non-root) are unaffected.
+    if os.environ.get("OMNIGENT_PW_NO_SANDBOX"):
+        launch_args["args"] = [
+            *launch_args.get("args", []),
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ]
+    return launch_args
+
+
+@pytest.fixture
+def browser_context_args(
+    browser_context_args: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a new context options dict for each test.
+
+    pytest-playwright already creates a fresh context for its function-scoped
+    ``context`` and ``page`` fixtures. Keeping this wrapper function-scoped
+    makes that contract explicit and prevents accidental mutable option reuse.
+    When ``OMNIGENT_E2E_RECORD_DIR`` is set, those fixtures record their video
+    there unless ``--video`` already chose a directory.
+    """
+    context_args = {**browser_context_args}
+    record_dir = os.environ.get(_RECORD_DIR_ENV)
+    if record_dir:
+        Path(record_dir).mkdir(parents=True, exist_ok=True)
+        context_args.setdefault("record_video_dir", record_dir)
+    return context_args
+
+
 @pytest.hookimpl(trylast=True)
 def pytest_collection_modifyitems(
     config: pytest.Config,
@@ -238,11 +441,23 @@ def pytest_collection_modifyitems(
     bucket. That averages cost across shards without maintaining a
     durations file.
 
-    No-op unless both ``--splits`` and ``--group`` are passed, so local
-    runs and the non-sharded suites are unaffected. ``trylast`` lets the
-    repo-wide known-failures marking in ``tests/conftest.py`` tag items
-    first; markers travel with the items the slice keeps.
+    Optional sidecar selection precedes the split and includes indirect fixture
+    consumers. ``trylast`` lets repo-wide known-failure marking tag items first;
+    markers travel with the items the slice keeps.
     """
+    dependency = config.getoption("--ui-dependency-smoke")
+    if config.getoption("--ui-codex-sidecar-only") or dependency:
+        selected = [
+            item
+            for item in items
+            if "mocked_native_codex_session" in item.fixturenames
+            or (dependency and item.get_closest_marker("compat_smoke") is not None)
+        ]
+        if not selected:
+            raise pytest.UsageError("No Codex sidecar consumers collected")
+        config.hook.pytest_deselected(items=[item for item in items if item not in selected])
+        items[:] = selected
+
     splits = config.getoption("--splits")
     group = config.getoption("--group")
     if splits is None and group is None:
@@ -272,21 +487,11 @@ def _register_agent_yaml(
     Returns the new agent id on 201, or None on 409 (already registered against
     a long-lived ``--ui-base-url`` server).
     """
-    import json as _json
 
     yaml_bytes = yaml_text.encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        info = tarfile.TarInfo(arcname)
-        info.size = len(yaml_bytes)
-        tar.addfile(info, io.BytesIO(yaml_bytes))
+    bundle_bytes = bundle_files({arcname: yaml_bytes})
 
-    resp = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=10.0,
-    )
+    resp = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle_bytes, timeout=10.0)
     if resp.status_code == 409:
         return None
     resp.raise_for_status()
@@ -318,52 +523,351 @@ def _find_free_port() -> int:
 
     :returns: An available port number.
     """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+    max_attempts = 100
+    for _ in range(max_attempts):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        if port not in DEV_PORTS:
+            return port
+    raise RuntimeError(
+        f"Could not find a free e2e UI port outside dev ports "
+        f"{sorted(DEV_PORTS)} after {max_attempts} attempts"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Mock LLM server fixtures and helpers
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def mock_llm_server_url(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[str]:
+    """Start a mock LLM server for the test session.
+
+    The mock server is a lightweight FastAPI/uvicorn subprocess that
+    serves an OpenAI-compatible ``/v1/`` endpoint. The ``live_server``
+    fixture points the spawned omnigent server at this URL so all agent
+    LLM calls hit the mock rather than a real provider.
+
+    :param tmp_path_factory: Pytest temp path factory for logs.
+    :returns: The mock server base URL, e.g. ``"http://127.0.0.1:51235"``.
+    """
+    if url := prepared_repro_environment()["OMNIGENT_REPRO_MODEL_URL"]:
+        yield url
+        return
+    mock_port = _find_free_port()
+    mock_log = tmp_path_factory.mktemp("mock_llm_logs") / "mock_llm.log"
+    log_handle = open(mock_log, "w")  # noqa: SIM115
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "tests" / "server" / "integration" / "mock_llm_server.py"),
+            str(mock_port),
+        ],
+        env={**os.environ, "PYTHONPATH": str(_REPO_ROOT)},
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+    )
+    base_url = f"http://127.0.0.1:{mock_port}"
+
+    # Wait for the mock server to be ready
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            resp = httpx.get(f"{base_url}/stats", timeout=1.0)
+            if resp.status_code == 200:
+                break
+        except httpx.ConnectError:
+            # Expected while the mock server is still booting.
+            pass
+        time.sleep(0.1)
+    else:
+        proc.kill()
+        log_handle.close()
+        log_contents = mock_log.read_text() if mock_log.exists() else ""
+        raise RuntimeError(
+            f"Mock LLM server didn't start within 10s.\nLog at {mock_log}:\n{log_contents[-2000:]}"
+        )
+
+    try:
+        yield base_url
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        log_handle.close()
+
+
+def configure_mock_llm(
+    mock_url: str,
+    responses: list[dict[str, Any]],
+    *,
+    key: str | None = None,
+    match: str | None = None,
+    required_tools: list[str] | None = None,
+) -> None:
+    """Configure a keyed response queue on the mock LLM server.
+
+    Each dict in *responses* maps to a ``QueuedResponse`` on the mock
+    server. The *key* determines which queue the responses are stored in
+    — the mock server routes each request to the queue whose key matches
+    the request's ``model`` field. When *match* is set, the queue fires
+    whenever the user text contains that substring, regardless of model.
+
+    :param mock_url: Mock server base URL.
+    :param responses: List of response configs. Keys:
+        ``text``, ``tool_calls``, ``block``, ``stream``,
+        ``error``, ``status_code``, ``delay``, ``truncate_after``
+        (emit only N SSE events then end the stream, dropping the
+        completion event — a mid-stream fault for exercising the SPA's
+        stream error/recovery UI).
+    :param key: Queue key — typically the model name baked into the
+        agent spec. Omitting it allocates an independent content queue when
+        ``match`` is supplied, otherwise uses ``"default"``. Explicit keys replace
+        existing queues. The helper in ``tests/e2e/conftest.py`` instead uses
+        the match token as its explicit key and has no ``required_tools`` parameter.
+    :param match: Optional substring to match against the user text for
+        content-based routing (in addition to model-name routing).
+    :param required_tools: Only consume responses when these tools are advertised.
+        Use this to exclude title-generation requests containing the same nonce.
+        When omitted, the next scripted tool call requires a request with any
+        tools. Pass an empty list to allow calls even on requests without tools.
+    """
+    body: dict[str, Any] = {"responses": responses}
+    if key is not None:
+        body["key"] = key
+    if required_tools is not None:
+        body["required_tools"] = required_tools
+    if match is not None:
+        body["match"] = match
+    resp = httpx.post(
+        f"{mock_url}/mock/configure",
+        json=body,
+        timeout=5.0,
+    )
+    resp.raise_for_status()
+
+
+def reset_mock_llm(mock_url: str) -> None:
+    """Clear all regular keyed queues, captured requests, and gates.
+
+    Fallbacks set via :func:`set_fallback_mock_llm` are preserved.
+
+    :param mock_url: Mock server base URL.
+    """
+    resp = httpx.post(f"{mock_url}/mock/reset", timeout=5.0)
+    resp.raise_for_status()
+
+
+def seed_committed_items(session_id: str, items: list[Any]) -> None:
+    """Append committed ``NewConversationItem``s straight into the store.
+
+    For tests that need a settled transcript to act on but not the model's
+    behaviour. Skips the runner and the LLM entirely, so the test neither
+    waits on a turn nor inherits the mock-LLM harness's flakiness. Seed
+    BEFORE navigating — the chat hydrates its history on load.
+
+    Items go through the same store the server writes with, so they are
+    indistinguishable from a real turn's (same shape, ids, FTS rows).
+
+    :param session_id: Session to append to, e.g. ``"conv_abc123"``.
+    :param items: ``omnigent.entities.NewConversationItem`` values, in
+        transcript order.
+    :raises RuntimeError: If the server under test isn't one we spawned
+        (``--ui-base-url``), so its database isn't reachable from here.
+    """
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    database_uri = _server_state.get("database_uri")
+    if not database_uri:
+        raise RuntimeError(
+            "seeding needs the spawned server's database; it is "
+            "unavailable with --ui-base-url or a workflow-owned reproduction environment."
+        )
+    SqlAlchemyConversationStore(str(database_uri)).append(session_id, items)
+
+
+def seed_committed_turn(
+    session_id: str,
+    *,
+    prompt: str,
+    reply: str,
+    response_id: str = "resp_seeded",
+) -> None:
+    """Write one committed user+assistant exchange straight into the store.
+
+    Thin wrapper over :func:`seed_committed_items` for the common case: a
+    settled exchange per-message actions can anchor on (a fork's truncation
+    point, say).
+
+    :param session_id: Session to append to, e.g. ``"conv_abc123"``.
+    :param prompt: User message text, e.g. ``"ping"``.
+    :param reply: Assistant message text, e.g. ``"pong"``.
+    :param response_id: Response id shared by both items — per-message
+        actions pass it as the turn anchor (e.g. a fork's truncation point).
+    """
+    from omnigent.entities import MessageData, NewConversationItem
+
+    seed_committed_items(
+        session_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=response_id,
+                data=MessageData(role="user", content=[{"type": "input_text", "text": prompt}]),
+            ),
+            NewConversationItem(
+                type="message",
+                response_id=response_id,
+                data=MessageData(
+                    role="assistant",
+                    content=[{"type": "output_text", "text": reply}],
+                    agent="hello_world",
+                ),
+            ),
+        ],
+    )
+
+
+def set_session_task_summary(session_id: str, task_summary: str) -> None:
+    """Write a session's ``task_summary`` straight into the store.
+
+    The background title coordinator is the only writer of this column —
+    there is no REST path for it — so a UI test that needs a settled label
+    seeds it here rather than waiting on LLM-backed generation. Seed BEFORE
+    navigating; the sub-agents rail reads the label when it hydrates.
+
+    :param session_id: Session to label, e.g. ``"conv_abc123"``.
+    :param task_summary: Human-readable label, e.g. ``"Investigate auth flow"``.
+    :raises RuntimeError: If the server under test isn't one we spawned
+        (``--ui-base-url``), so its database isn't reachable from here.
+    """
+    from omnigent.stores.conversation_store.sqlalchemy_store import (
+        SqlAlchemyConversationStore,
+    )
+
+    database_uri = _server_state.get("database_uri")
+    if not database_uri:
+        raise RuntimeError(
+            "set_session_task_summary needs the spawned server's database; it "
+            "is unavailable with --ui-base-url or a workflow-owned reproduction environment."
+        )
+    SqlAlchemyConversationStore(str(database_uri)).set_task_summary(session_id, task_summary)
+
+
+def set_fallback_mock_llm(
+    mock_url: str,
+    key: str,
+    text: str,
+) -> None:
+    """Set a non-resettable fallback response for a queue key.
+
+    The fallback is returned when the regular queue for *key* is
+    exhausted. Unlike regular entries, the fallback survives
+    :func:`reset_mock_llm` — use it for session-level queues that
+    must return a valid response even when per-test resets clear the
+    regular queue (e.g. the server-level policy-classifier LLM queue).
+
+    :param mock_url: Mock server base URL.
+    :param key: Queue key (typically the server's ``llm.model``).
+    :param text: Fallback response text.
+    """
+    resp = httpx.post(
+        f"{mock_url}/mock/set_fallback",
+        json={"key": key, "text": text},
+        timeout=5.0,
+    )
+    resp.raise_for_status()
+
+
+def _codex_cli_supports_mocked_app_server(codex_path: str) -> bool:
+    """Return whether the Codex CLI supports the mocked app-server tests."""
+    version = subprocess.run(
+        [codex_path, "--version"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if version.returncode != 0:
+        return False
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", f"{version.stdout}\n{version.stderr}")
+    if not match:
+        return False
+    return tuple(int(part) for part in match.groups()) >= _CODEX_GOAL_MIN_VERSION
+
+
+def _write_codex_unknown_version_shim(directory: Path, codex_path: str) -> Path:
+    """Write a Codex shim whose version probe fails without blocking launches."""
+    shim = directory / "codex-unknown-version"
+    shim.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n"
+        "if sys.argv[1:] == ['--version']:\n"
+        "    print('codex-cli version unavailable')\n"
+        "    raise SystemExit(0)\n"
+        f"os.execv({codex_path!r}, [{codex_path!r}, *sys.argv[1:]])\n",
+        encoding="utf-8",
+    )
+    shim.chmod(0o755)
+    return shim
 
 
 @pytest.fixture(scope="session")
 def built_spa(request: pytest.FixtureRequest) -> None:
     """
-    Build the ap-web SPA into ``omnigent/server/static/web-ui/``.
+    Build the web SPA into ``omnigent/server/static/web-ui/``.
 
-    Vite's ``emptyOutDir: true`` (see ``ap-web/vite.config.ts``)
+    Vite's ``emptyOutDir: true`` (see ``web/vite.config.ts``)
     nukes the output directory before writing, so concurrent
     pytest sessions or worktrees would clobber each other. A
-    cross-process file lock at ``ap-web/.build.lock`` serializes
+    cross-process file lock at ``web/.build.lock`` serializes
     builds; the second caller waits for the first to finish and
-    then no-ops past its own build (npm is idempotent enough that
-    double-building is harmless, but the lock keeps the static
-    output consistent during the window the FastAPI app reads it).
+    then no-ops past its own build.
 
     :param request: pytest request — reads ``--ui-base-url`` /
         ``--ui-skip-build``.
     :returns: ``None``. Side effect is the populated build dir.
     """
-    if request.config.getoption("--ui-base-url"):
+    if prepared_repro_environment()["OMNIGENT_REPRO_SERVER_URL"] or request.config.getoption(
+        "--ui-base-url"
+    ):
         return
     if request.config.getoption("--ui-skip-build"):
-        if not (_BUILD_OUTPUT / "index.html").is_file():
-            pytest.fail(
-                f"--ui-skip-build was passed but no SPA build exists at "
-                f"{_BUILD_OUTPUT}. Run `cd ap-web && npm run build` first."
-            )
         return
 
-    lock_path = _AP_WEB_DIR / ".build.lock"
+    lock_path = _WEB_DIR / ".build.lock"
     with filelock.FileLock(str(lock_path), timeout=600):
-        # --legacy-peer-deps: package-lock.json already pins the tree;
-        # without this flag npm spends the full job re-resolving the
-        # @emoji-mart/react / React 19 peer conflict. This matches the
-        # workflow-side fix for parity with local runs and the case
-        # where conftest installs override CI's build.
+        # pnpm frozen-lockfile uses the root workspace lockfile, which
+        # keeps the pinned tree matching CI and avoids re-resolving the
+        # React peer conflicts that used to require --legacy-peer-deps.
+        # COREPACK_ENABLE_DOWNLOAD_PROMPT=0 keeps a corepack `pnpm` shim
+        # from blocking on its download confirmation under captured
+        # pytest output, which reads as a hung test run.
+        env = {**os.environ, "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
         subprocess.run(
-            ["npm", "ci", "--legacy-peer-deps", "--no-audit", "--no-fund"],
-            cwd=_AP_WEB_DIR,
+            ["pnpm", "install", "--frozen-lockfile", "--filter", "web"],
+            cwd=_REPO_ROOT,
             check=True,
+            stdin=subprocess.DEVNULL,
+            env=env,
         )
-        subprocess.run(["npm", "run", "build"], cwd=_AP_WEB_DIR, check=True)
+        subprocess.run(
+            ["pnpm", "--filter", "web", "run", "build"],
+            cwd=_REPO_ROOT,
+            check=True,
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
 
 
 def _spawn_runner_against_external_server(
@@ -403,8 +907,9 @@ def _spawn_runner_against_external_server(
     }
     log_handle = open(log_path, "w")  # noqa: SIM115 — closed in finally
     proc = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env=env,
+        [runner_executable(), "-m", "omnigent.runner._entry"],
+        env=apply_runner_env(env),
+        cwd=compat_runner_cwd(),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
@@ -449,6 +954,7 @@ def _spawn_runner_against_external_server(
     # that depend on ``server_pid`` (only valid when this fixture spawns
     # the server too) will KeyError, which is the right failure shape.
     _server_state["runner_id"] = runner_id
+    _server_state["runner_pid"] = proc.pid
     # Exposed so a test whose predecessor killed the shared runner (e.g.
     # test_stale_stream) can respawn one via :func:`_ensure_runner_online`.
     _server_state["binding_token"] = binding_token
@@ -470,6 +976,7 @@ def _spawn_runner_against_external_server(
 @pytest.fixture(scope="session")
 def live_server(
     built_spa: None,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
     request: pytest.FixtureRequest,
 ) -> Iterator[str]:
@@ -483,13 +990,15 @@ def live_server(
     Teardown is SIGTERM with a 10s grace period, escalating to
     SIGKILL.
 
-    The agent calls a real LLM. The hello_world spec defaults to
-    Databricks-hosted Claude via the FM API, so locally the user's
-    ``~/.databrickscfg`` must have a working profile; in CI the
-    workflow exchanges OAuth credentials before pytest runs.
+    The spawned server is wired to the session-scoped mock LLM server
+    via ``OPENAI_BASE_URL`` so all agent LLM calls are served by the
+    mock without any real provider credentials.
 
     :param built_spa: Required to ensure the static SPA bundle is on
         disk before the server boots and tries to mount it.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL;
+        injected into the server's environment so the openai-agents
+        harness hits the mock instead of a real provider.
     :param tmp_path_factory: Pytest temp path factory for the log,
         the SQLite DB, and the artifact dir — all per-session, so
         the test never reads from or writes to the user's default
@@ -501,6 +1010,19 @@ def live_server(
         the expected local runner does not report online within
         :data:`_HEALTH_TIMEOUT_S` seconds.
     """
+    prepared = prepared_repro_environment()
+    if base_url := prepared["OMNIGENT_REPRO_SERVER_URL"]:
+        _server_state.update(
+            runner_id=prepared["OMNIGENT_REPRO_RUNNER_ID"],
+            server_url=base_url,
+            mock_llm_url=mock_llm_server_url,
+            workflow_owned=True,
+        )
+        try:
+            yield base_url
+        finally:
+            _server_state.clear()
+        return
     override = request.config.getoption("--ui-base-url")
     if override:
         yield from _spawn_runner_against_external_server(override, tmp_path_factory)
@@ -538,44 +1060,73 @@ def live_server(
     # helper uses (tests/_helpers/live_server.py:160-167).
     # OMNIGENT_RUNNER_TUNNEL_TOKEN lets the server accept
     # exactly the sibling runner's WebSocket tunnel.
-    env = {
+    mock_url = mock_llm_server_url
+    env: dict[str, str] = {
         **os.environ,
-        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
         "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
         "OMNIGENT_BUILTIN_AGENT_DIRS": os.pathsep.join(builtin_dirs),
+        # Point the openai-agents harness at the mock LLM server so no
+        # real provider credentials are needed.
+        "OPENAI_BASE_URL": f"{mock_url}/v1",
+        "OPENAI_API_KEY": "mock-key",
+        # Strip any ambient Anthropic credentials so they don't leak in.
+        "ANTHROPIC_API_KEY": "",
+        # Deterministic dictation engine: /v1/info advertises dictation and
+        # WS /v1/dictation/stream transcribes any audio into FAKE_SCRIPT,
+        # so chat/test_dictation.py needs no sherpa models or real ASR.
+        "OMNIGENT_DICTATION_ENGINE": os.environ.get("OMNIGENT_DICTATION_ENGINE", "fake"),
+        # In compat mode the server binary runs from the pinned old venv, but
+        # the SPA was built from HEAD into _BUILD_OUTPUT. Point the old server
+        # at that directory so it serves the HEAD bundle instead of whatever
+        # stale (or absent) bundle ships in its own site-packages.
+        "OMNIGENT_WEB_UI_DIST": str(_BUILD_OUTPUT),
     }
+    # In normal runs, prepend the worktree so the server imports from the
+    # checked-out source. In compat mode (OMNIGENT_COMPAT_SERVER_PYTHON set),
+    # drop PYTHONPATH so the pinned old build in the compat venv resolves
+    # instead of being shadowed by the worktree.
+    apply_server_env(env, _REPO_ROOT)
     log_handle = open(log_path, "w")  # noqa: SIM115 — handle lives for Popen lifetime; closed in finally
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            # Equivalent of the unit tests' ``monkeypatch.setattr(presence,
-            # "_LEAVE_GRACE_S", ...)``, but applied INSIDE this spawned
-            # interpreter — a monkeypatch in the test process can't reach a
-            # subprocess. ``-c`` patches the module global before the CLI
-            # runs; the presence route reads it live at call time, so the
-            # presence-leave assertion in test_collab_realtime clears in ~1s
-            # instead of the prod 15s dwell (which only exists to absorb the
-            # ingress' ~5-min stream recycle a test server never hits).
-            # Mirrors ``python -m omnigent`` (omnigent/__main__.py).
-            "-c",
-            "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
-            + "from omnigent.cli import main; main()",
-            "server",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{db_path}",
-            "--artifact-location",
-            str(artifact_dir),
-            "--agent",
-            str(agent_yaml_path),
-        ],
-        env=env,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
+    server_argv = [
+        server_executable(),
+        # Equivalent of the unit tests' ``monkeypatch.setattr(presence,
+        # "_LEAVE_GRACE_S", ...)``, but applied INSIDE this spawned
+        # interpreter — a monkeypatch in the test process can't reach a
+        # subprocess. ``-c`` patches the module global before the CLI
+        # runs; the presence route reads it live at call time, so the
+        # presence-leave assertion in test_collab_realtime clears in ~1s
+        # instead of the prod 15s dwell (which only exists to absorb the
+        # ingress' ~5-min stream recycle a test server never hits).
+        # Mirrors ``python -m omnigent`` (omnigent/__main__.py).
+        "-c",
+        "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
+        + "from omnigent.cli import main; main()",
+        "server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--database-uri",
+        f"sqlite:///{db_path}",
+        "--artifact-location",
+        str(artifact_dir),
+        "--agent",
+        str(agent_yaml_path),
+    ]
+    server_cwd = compat_server_cwd()
+
+    def _spawn_server() -> subprocess.Popen[bytes]:
+        return subprocess.Popen(
+            server_argv,
+            env=env,
+            # Compat mode: neutral CWD so the worktree doesn't shadow the pinned
+            # old server install via sys.path[0]. None (inherit) in normal runs.
+            cwd=server_cwd,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+
+    proc = _spawn_server()
     base_url = f"http://127.0.0.1:{port}"
 
     # Spawn the runner as a sibling subprocess (the server no longer
@@ -590,44 +1141,53 @@ def live_server(
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
         "RUNNER_SERVER_URL": base_url,
+        # Route the openai-agents harness to the mock LLM server so no
+        # real provider credentials are needed for agent turns. Without
+        # these the openai SDK falls back to real OpenAI, which fails.
+        "OPENAI_BASE_URL": f"{mock_url}/v1",
+        "OPENAI_API_KEY": "mock-key",
     }
     runner_proc = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env=runner_env,
+        [runner_executable(), "-m", "omnigent.runner._entry"],
+        env=apply_runner_env(runner_env),
+        cwd=compat_runner_cwd(),
         stdout=runner_log_handle,
         stderr=subprocess.STDOUT,
     )
 
-    # Poll /health and the runner status until the server can
-    # actually route a turn. Time-based polling mirrors
-    # tests/_helpers/live_server.py:start_live_server — the
-    # alternative (asyncio.Event signalling) doesn't apply because
-    # the subprocess is opaque to this process.
-    deadline = time.monotonic() + _HEALTH_TIMEOUT_S
-    ready = False
-    last_error = "not polled yet"
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            last_error = f"process exited early with code {proc.returncode}"
-            break
-        try:
-            resp = httpx.get(f"{base_url}/health", timeout=2)
-            if resp.status_code == 200:
-                status_resp = httpx.get(
-                    f"{base_url}/v1/runners/{runner_id}/status",
-                    timeout=2,
-                )
-                if status_resp.status_code == 200 and status_resp.json()["online"] is True:
-                    ready = True
-                    break
-                last_error = (
-                    f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
-                )
-            else:
-                last_error = f"health HTTP {resp.status_code}: {resp.text[:200]}"
-        except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-        time.sleep(_HEALTH_POLL_INTERVAL_S)
+    def _wait_until_ready(
+        server_process: subprocess.Popen[bytes],
+        *,
+        timeout_s: float = _HEALTH_TIMEOUT_S,
+    ) -> tuple[bool, str]:
+        """Wait until this server generation can route through the runner."""
+        deadline = time.monotonic() + timeout_s
+        last_error = "not polled yet"
+        while time.monotonic() < deadline:
+            if server_process.poll() is not None:
+                return False, f"process exited early with code {server_process.returncode}"
+            try:
+                resp = httpx.get(f"{base_url}/health", timeout=2)
+                if resp.status_code == 200:
+                    status_resp = httpx.get(
+                        f"{base_url}/v1/runners/{runner_id}/status",
+                        timeout=2,
+                    )
+                    if status_resp.status_code == 200 and status_resp.json()["online"] is True:
+                        return True, "ready"
+                    last_error = (
+                        f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
+                    )
+                else:
+                    last_error = f"health HTTP {resp.status_code}: {resp.text[:200]}"
+            except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            time.sleep(_HEALTH_POLL_INTERVAL_S)
+        return False, last_error
+
+    # Poll /health and the runner status until the server can actually route a
+    # turn. The same readiness gate is reused after a server-only restart.
+    ready, last_error = _wait_until_ready(proc)
 
     if not ready:
         if runner_proc.poll() is None:
@@ -656,13 +1216,49 @@ def live_server(
 
     _server_state["pid"] = proc.pid
     _server_state["runner_id"] = runner_id
+    _server_state["runner_pid"] = runner_proc.pid
     # Exposed so a test whose predecessor killed the shared runner (e.g.
     # test_stale_stream) can respawn one via :func:`_ensure_runner_online`.
     _server_state["binding_token"] = binding_token
     _server_state["server_url"] = base_url
+    _server_state["mock_llm_url"] = mock_url
+    # Exposed so a test can seed a committed transcript straight into the
+    # store (see :func:`seed_committed_turn`) instead of driving the LLM.
+    _server_state["database_uri"] = f"sqlite:///{db_path}"
+
+    def _restart_server() -> None:
+        """Replace only the server process, preserving its runner and database."""
+        nonlocal proc
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        proc = _spawn_server()
+        ready, restart_error = _wait_until_ready(proc, timeout_s=120.0)
+        if not ready:
+            log_text = log_path.read_text() if log_path.exists() else ""
+            raise RuntimeError(
+                f"restarted server did not become ready on {base_url} "
+                f"(last_error={restart_error}).\n{log_text[-3000:]}"
+            )
+        _server_state["pid"] = proc.pid
+
+    _server_state["restart_server"] = _restart_server
+
+    # Set a non-resettable fallback for the policy-classifier LLM queue so
+    # every per-test reset leaves the server's guardrails path functional.
+    set_fallback_mock_llm(mock_url, "_policy_llm_", '{"action": "allow", "reason": ""}')
+    # Fallback for the openai-agents harness: any agent turn that doesn't
+    # match a content-based queue gets a generic reply (sufficient for tests
+    # that only assert an assistant bubble appears, not its exact content).
+    set_fallback_mock_llm(mock_url, "gpt-4o-mini", "Mock LLM response.")
 
     try:
-        yield base_url
+        with operator_agent_store(base_url, f"sqlite:///{db_path}", artifact_dir):
+            yield base_url
     finally:
         _server_state.clear()
         if runner_proc.poll() is None:
@@ -680,6 +1276,30 @@ def live_server(
             proc.kill()
             proc.wait(timeout=5)
         log_handle.close()
+
+
+@pytest.fixture(scope="session")
+def _recover_shared_runner(
+    live_server: str, tmp_path_factory: pytest.TempPathFactory
+) -> Iterator[Callable[[], None]]:
+    """Keep a recovered runner alive until the shared server is torn down."""
+    recovered: list[subprocess.Popen[bytes]] = []
+
+    def recover() -> None:
+        runner = _ensure_runner_online(live_server, tmp_path_factory)
+        if runner is not None:
+            recovered.append(runner)
+
+    try:
+        yield recover
+    finally:
+        for runner in recovered:
+            runner.terminate()
+            try:
+                runner.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                runner.kill()
+                runner.wait(timeout=5)
 
 
 @pytest.fixture
@@ -710,7 +1330,6 @@ def seeded_session(
     :returns: ``(base_url, session_id)``. Tests typically navigate to
         ``f"{base_url}/c/{session_id}"``.
     """
-    import json as _json
 
     respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
@@ -718,21 +1337,13 @@ def seeded_session(
     # pre-registered the agent via --agent, but since /api/agents is
     # removed we create a fresh session-scoped agent via multipart.
     bundle = _build_hello_world_bundle()
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        timeout=30.0,
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", bundle, timeout=30.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
     try:
         yield (live_server, session_id)
@@ -761,24 +1372,13 @@ def _create_runner_bound_session(base_url: str, runner_id: str) -> str:
         e.g. ``"runner_token_abc123"``.
     :returns: The new session/conversation id, e.g. ``"conv_abc123"``.
     """
-    import json as _json
 
     bundle = _build_hello_world_bundle()
-    create_resp = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-        timeout=30.0,
-    )
+    create_resp = post_session_bundle(httpx.post, f"{base_url}/v1/sessions", bundle, timeout=30.0)
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
     return session_id
 
 
@@ -819,7 +1419,12 @@ def _ensure_runner_online(
     if _online():
         return None
 
+    if _server_state.get("workflow_owned"):
+        raise RuntimeError(
+            "Workflow-owned reproduction runner is offline; inspect .omnigent/repro-env logs"
+        )
     binding_token = str(_server_state["binding_token"])
+    mock_url = str(_server_state.get("mock_llm_url", ""))
     runner_tmp = tmp_path_factory.mktemp("e2e_ui_respawn_runner")
     log_path = runner_tmp / "runner.log"
     log_handle = open(log_path, "w")  # noqa: SIM115 — fd dup'd into child; closed below
@@ -830,10 +1435,16 @@ def _ensure_runner_online(
         "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
         "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
         "RUNNER_SERVER_URL": base_url,
+        # Mirror the live_server runner's mock-LLM routing so the
+        # respawned runner's harness also hits the mock.
+        **(
+            {"OPENAI_BASE_URL": f"{mock_url}/v1", "OPENAI_API_KEY": "mock-key"} if mock_url else {}
+        ),
     }
     proc = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env=env,
+        [runner_executable(), "-m", "omnigent.runner._entry"],
+        env=apply_runner_env(env),
+        cwd=compat_runner_cwd(),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
     )
@@ -847,6 +1458,7 @@ def _ensure_runner_online(
                 f"log:\n{log_path.read_text()[-3000:]}"
             )
         if _online():
+            _server_state["runner_pid"] = proc.pid
             return proc
         time.sleep(_HEALTH_POLL_INTERVAL_S)
 
@@ -959,9 +1571,8 @@ prompt: |
   other tools.
 
 executor:
-  model: databricks-gpt-5-4
-  config:
-    harness: openai-agents
+  model: gpt-4o-mini
+  harness: openai-agents
 
 os_env:
   type: caller_process
@@ -1005,6 +1616,7 @@ def terminal_agent(live_server: str) -> Iterator[str]:
 @pytest.fixture
 def terminal_session(
     terminal_agent: str,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[str, str]]:
     """Create a runner-bound session using the terminal-capable agent.
@@ -1017,6 +1629,9 @@ def terminal_session(
 
     :param terminal_agent: Live server base URL with the terminal agent
         registered.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL; used to
+        queue the deterministic launch/send/confirm tool sequence the agent
+        runs in response to "spin up zsh".
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: ``(base_url, session_id)``.
     """
@@ -1026,6 +1641,46 @@ def terminal_session(
     import tarfile
 
     live_server = terminal_agent
+
+    # The "spin up zsh" prompt drives three ordered LLM turns: launch the
+    # terminal, type the file-writing command, then confirm. Content-route on
+    # the prompt text so the queue fires only for this fixture's turns, and
+    # order the three responses to match the agent's prompted sequence.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_launch",
+                        "name": "sys_terminal_launch",
+                        "arguments": _json.dumps({"terminal": "zsh", "session": "main"}),
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_send",
+                        "name": "sys_terminal_send",
+                        "arguments": _json.dumps(
+                            {
+                                "terminal": "zsh",
+                                "session": "main",
+                                "text": (
+                                    f"printf '%s\\n' '{_TERMINAL_PANEL_FILE_CONTENT}' "
+                                    f"> {_TERMINAL_PANEL_FILE}"
+                                ),
+                            }
+                        ),
+                    }
+                ]
+            },
+            {"text": "The zsh terminal is running and the file was written."},
+        ],
+        key="terminal-spin-up-zsh",
+        match="spin up zsh",
+    )
     respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
     # Create a session with the terminal agent bundle inline.
@@ -1042,35 +1697,32 @@ def terminal_session(
         info = tarfile.TarInfo(name=f"{_TERMINAL_AGENT_NAME}.yaml")
         info.size = len(data)
         tar.addfile(info, io.BytesIO(data))
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=10.0,
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", buf.getvalue(), timeout=10.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
     try:
         yield (live_server, session_id)
     finally:
-        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
-        # Restore the "found" state: if we respawned the runner (a prior
-        # test had killed it), tear our copy down so it doesn't outlive us.
-        if respawned_runner is not None:
-            respawned_runner.terminate()
+        try:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        finally:
             try:
-                respawned_runner.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                respawned_runner.kill()
-                respawned_runner.wait(timeout=5)
+                reset_mock_llm(mock_llm_server_url)
+            finally:
+                # Restore the "found" state: if we respawned the runner (a prior
+                # test had killed it), tear our copy down so it doesn't outlive us.
+                if respawned_runner is not None:
+                    respawned_runner.terminate()
+                    try:
+                        respawned_runner.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        respawned_runner.kill()
+                        respawned_runner.wait(timeout=5)
 
 
 _TWO_AGENT_PARENT_NAME = "hitchhikers_chat"
@@ -1086,12 +1738,14 @@ class TwoAgentChatSession:
         carries, e.g. ``"vogon-3a7f9c2e1b"``.
     :param question_code: Per-run nonce only Deep Thought's QUESTION reply
         carries (round 2), e.g. ``"babelfish-9c2e1b3a7f"``.
+    :param routing_token: Per-run token that selects Arthur's mock queue.
     """
 
     base_url: str
     session_id: str
     verification_code: str
     question_code: str
+    routing_token: str
 
 
 def _two_agent_chat_yaml(verification_code: str, question_code: str) -> str:
@@ -1141,7 +1795,7 @@ prompt: |
   sub-agent session via `sys_session_send` — NEVER spawn a second one.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   harness: openai-agents
 
 tools:
@@ -1151,7 +1805,7 @@ tools:
       Deep Thought, the supercomputer built to compute the Answer to the
       Ultimate Question of Life, the Universe, and Everything.
     executor:
-      model: databricks-gpt-5-4
+      model: gpt-4o-mini
       harness: openai-agents
     prompt: |
       You are Deep Thought from The Hitchhiker's Guide to the Galaxy.
@@ -1174,51 +1828,100 @@ tools:
 @pytest.fixture
 def two_agent_chat_session(
     live_server: str,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[TwoAgentChatSession]:
     """Create a runner-bound session for the two-agent Hitchhiker's chat.
 
     Same runner-respawn and bind contract as :func:`terminal_session`.
-    Yields the per-run nonces so the test can assert that the sub-agent's
-    replies (and only the sub-agent's) reached the UI.
+    Separate content-routed mock queues drive Arthur and Deep Thought,
+    including both dispatch, child, and auto-wake turns. The original
+    model ids remain in the spec for a future real-gateway job.
 
     :param live_server: Spawned server fixture.
+    :param mock_llm_server_url: Mock LLM server used by credential-free runs.
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: A :class:`TwoAgentChatSession` handle.
     """
-    import json as _json
     import uuid
 
     verification_code = f"vogon-{uuid.uuid4().hex[:10]}"
     question_code = f"babelfish-{uuid.uuid4().hex[:10]}"
+    suffix = uuid.uuid4().hex[:10]
+    routing_token = f"hitchhiker-parent-{suffix}"
+    child_token = f"hitchhiker-child-{suffix}"
     yaml_text = _two_agent_chat_yaml(verification_code, question_code)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_deep_thought_answer",
+                        "name": "sys_session_send",
+                        "arguments": json.dumps(
+                            {
+                                "agent": "deep_thought",
+                                "title": "deep_thought",
+                                "args": (
+                                    "What is the Answer to the Ultimate Question? "
+                                    f"Routing marker: {child_token}"
+                                ),
+                            }
+                        ),
+                    }
+                ]
+            },
+            {"text": "Dispatched Deep Thought; waiting for the answer."},
+            {"text": f"Deep Thought replied: 42. Verification code: {verification_code}."},
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_deep_thought_question",
+                        "name": "sys_session_send",
+                        "arguments": json.dumps(
+                            {
+                                "agent": "deep_thought",
+                                "title": "deep_thought",
+                                "args": (
+                                    "What is the Ultimate Question itself? "
+                                    f"Routing marker: {child_token}"
+                                ),
+                            }
+                        ),
+                    }
+                ]
+            },
+            {"text": "Dispatched the follow-up; waiting for the question."},
+            {"text": f"Deep Thought replied with question code {question_code}."},
+        ],
+        key=routing_token,
+        match=routing_token,
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": f"The Answer is 42. Verification code: {verification_code}."},
+            {"text": f"The Ultimate Question is unknown. Question code: {question_code}."},
+        ],
+        key=child_token,
+        match=child_token,
+    )
     respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
 
     yaml_bytes = yaml_text.encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        # Non-config.yaml arcname routes the bundle through the omnigent
-        # compat adapter, whose loader parses the inline `type: agent`
-        # tool. The spec_version:1 parser does not accept this shorthand.
-        info = tarfile.TarInfo(name=f"{_TWO_AGENT_PARENT_NAME}.yaml")
-        info.size = len(yaml_bytes)
-        tar.addfile(info, io.BytesIO(yaml_bytes))
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=10.0,
+    # Non-config.yaml arcname routes the bundle through the omnigent
+    # compat adapter, whose loader parses the inline `type: agent`
+    # tool. The spec_version:1 parser does not accept this shorthand.
+    bundle_bytes = bundle_files({f"{_TWO_AGENT_PARENT_NAME}.yaml": yaml_bytes})
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", bundle_bytes, timeout=10.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
     try:
         yield TwoAgentChatSession(
@@ -1226,6 +1929,7 @@ def two_agent_chat_session(
             session_id=session_id,
             verification_code=verification_code,
             question_code=question_code,
+            routing_token=routing_token,
         )
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
@@ -1277,7 +1981,7 @@ prompt: |
   other command or call any other tool.
 
 executor:
-  model: databricks-gpt-5-4
+  model: gpt-4o-mini
   config:
     harness: openai-agents
 
@@ -1305,6 +2009,7 @@ guardrails:
 @pytest.fixture
 def approval_session(
     live_server: str,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[tuple[str, str]]:
     """Create a runner-bound session whose agent triggers an approval prompt.
@@ -1315,38 +2020,59 @@ def approval_session(
     ``guardrails`` blocks that path supports — see ``examples/polly``).
 
     :param live_server: Spawned server fixture.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL; used to
+        pre-configure the ``sys_os_shell`` tool call the approval agent emits.
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
     :returns: ``(base_url, session_id)``. Send a "run the command" turn to
         raise the gated-push approval.
     """
     import json as _json
+    import uuid as _uuid
+
+    # Each approval_session gets a unique model name so the mock queue is
+    # isolated between test runs. Using content-based routing (match=) on a
+    # shared model name caused a race: the previous test's runner (making its
+    # post-approval second LLM call) would steal the freshly-configured queue
+    # from the next test. A unique model per fixture call eliminates that race
+    # entirely — no other request will ever use this model key.
+    approval_model = f"approval-probe-{_uuid.uuid4().hex[:8]}"
+    # Substitute the unique model into the agent spec.
+    agent_yaml_text = _APPROVAL_AGENT_YAML.replace("gpt-4o-mini", approval_model)
+
+    # First LLM call: return the gated sys_os_shell tool call.
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_git_push",
+                        "name": "sys_os_shell",
+                        "arguments": _json.dumps({"command": "git push origin main"}),
+                    }
+                ]
+            }
+        ],
+        key=approval_model,
+    )
+    # Fallback for the second LLM call (after the tool result arrives): the
+    # agent prompt asks for one short sentence, so any text suffices.
+    set_fallback_mock_llm(mock_llm_server_url, approval_model, "Command executed.")
 
     respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
     runner_id = str(_server_state["runner_id"])
 
-    yaml_bytes = _APPROVAL_AGENT_YAML.encode()
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        # Strict path: arcname config.yaml keeps it on the spec_version:1
-        # parser, which is the one that honors `guardrails`.
-        info = tarfile.TarInfo(name="config.yaml")
-        info.size = len(yaml_bytes)
-        tar.addfile(info, io.BytesIO(yaml_bytes))
-    create_resp = httpx.post(
-        f"{live_server}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
+    yaml_bytes = agent_yaml_text.encode()
+    # Strict path: arcname config.yaml keeps it on the spec_version:1
+    # parser, which is the one that honors `guardrails`.
+    bundle_bytes = bundle_files({"config.yaml": yaml_bytes})
+    create_resp = post_session_bundle(
+        httpx.post, f"{live_server}/v1/sessions", bundle_bytes, timeout=30.0
     )
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
 
-    patch_resp = httpx.patch(
-        f"{live_server}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch_resp.raise_for_status()
+    bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
 
     try:
         yield (live_server, session_id)
@@ -1361,6 +2087,172 @@ def approval_session(
                 respawned_runner.wait(timeout=5)
 
 
+# ---------------------------------------------------------------------------
+# Tool-run fold probe: an ``os_env`` agent whose mock LLM queue emits a
+# deterministic sys_os_shell("ls") → sys_os_read("README.md") tool sequence,
+# then a short text reply. Used to assert the chat view's collapsed tool-run
+# summary carries the semantic action label ("Listed 1 directory, read 1
+# file") rather than a generic step count. Same registration/bind contract
+# as :func:`approval_session`, minus the guardrails block (nothing gated).
+# ---------------------------------------------------------------------------
+
+_TOOL_FOLD_AGENT_NAME = "tool_fold_probe"
+_TOOL_FOLD_AGENT_YAML = """\
+spec_version: 1
+name: {name}
+prompt: |
+  You are a deterministic tool-run assistant. When the user asks you to
+  inspect the workspace, you MUST do exactly this and nothing else:
+
+  1. Call sys_os_shell with command set to exactly: ls
+  2. Call sys_os_read with path set to exactly: README.md
+  3. Reply with one short sentence.
+
+executor:
+  model: {model}
+  config:
+    harness: openai-agents
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+"""
+
+
+@pytest.fixture
+def tool_fold_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session whose turn runs a shell + read tool pair.
+
+    The mock queue is keyed by a per-fixture unique model name (same
+    isolation rationale as :func:`approval_session`): two tool-call
+    responses, then a text fallback for the wrap-up LLM call.
+
+    :param live_server: Spawned server fixture.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``. Send any turn to run the
+        deterministic ls → read → reply sequence.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    model = f"tool-fold-probe-{_uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_ls",
+                        "name": "sys_os_shell",
+                        "arguments": _json.dumps({"command": "ls"}),
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_read",
+                        "name": "sys_os_read",
+                        "arguments": _json.dumps({"path": "README.md"}),
+                    }
+                ]
+            },
+        ],
+        key=model,
+    )
+    set_fallback_mock_llm(mock_llm_server_url, model, "Workspace inspected.")
+
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    yaml_text = _TOOL_FOLD_AGENT_YAML.format(name=_TOOL_FOLD_AGENT_NAME, model=model)
+    session_id = _create_bundled_session(live_server, runner_id, yaml_text)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def paused_mid_turn_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str, str]]:
+    """A runner-bound session whose turn PAUSES between two tool calls.
+
+    Same agent and bind contract as :func:`tool_fold_session`, except the
+    second LLM call blocks on the mock server's gate. That holds the turn
+    open — running, with its first tool already rendered — for as long as
+    the test needs, so a test can inject a mid-turn event (an elicitation,
+    say), act on it, then release the gate and let the same turn finish
+    with a second tool call and its wrap-up text. Without the gate the
+    ordering is a race against a turn that takes well under a second.
+
+    :param live_server: Spawned server fixture.
+    :param mock_llm_server_url: Session-scoped mock LLM server URL.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id, mock_llm_url)``. Send any turn, wait
+        for ``GET {mock_llm_url}/gate/pending``, then ``POST
+        {mock_llm_url}/gate/release`` to resume it.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    model = f"paused-turn-probe-{_uuid.uuid4().hex[:8]}"
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_ls",
+                        "name": "sys_os_shell",
+                        "arguments": _json.dumps({"command": "ls"}),
+                    }
+                ]
+            },
+            {
+                "block": True,
+                "tool_calls": [
+                    {
+                        "call_id": "call_read",
+                        "name": "sys_os_read",
+                        "arguments": _json.dumps({"path": "README.md"}),
+                    }
+                ],
+            },
+        ],
+        key=model,
+    )
+    set_fallback_mock_llm(mock_llm_server_url, model, "Workspace inspected.")
+
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    yaml_text = _TOOL_FOLD_AGENT_YAML.format(name=_TOOL_FOLD_AGENT_NAME, model=model)
+    session_id = _create_bundled_session(live_server, runner_id, yaml_text)
+    try:
+        yield (live_server, session_id, mock_llm_server_url)
+    finally:
+        # Never leave a runner blocked on the gate — a stuck turn outlives
+        # the test and wedges the shared runner for the next one.
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0)
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            respawned.wait(timeout=5)
+
+
 @pytest.fixture(autouse=True)
 def _ui_defaults() -> None:
     """
@@ -1372,6 +2264,239 @@ def _ui_defaults() -> None:
     for streaming-text assertions without masking real hangs.
     """
     expect.set_options(timeout=15_000)
+
+
+@pytest.fixture(autouse=True)
+def _workspace_panel_test_baseline(request: pytest.FixtureRequest) -> None:
+    """Keep unrelated UI tests explicit about requiring an open Workspace panel."""
+    if request.node.get_closest_marker("workspace_panel_product_default") is not None:
+        return
+    if "page" not in request.fixturenames:
+        return
+    page = request.getfixturevalue("page")
+    page.add_init_script("window.localStorage.setItem('omnigent:default-workspace-panel', 'open')")
+
+
+def _install_record_video_patches(monkeypatch: pytest.MonkeyPatch, record_dir: str) -> None:
+    """Inject ``record_video_dir`` into every page/context a ``Browser`` opens,
+    on both the async and sync Playwright APIs. A caller that already passes
+    ``record_video_dir`` is left alone."""
+    from playwright.async_api import Browser as _AsyncBrowser
+    from playwright.sync_api import Browser as _SyncBrowser
+
+    _orig_new_page = _AsyncBrowser.new_page
+    _orig_new_context = _AsyncBrowser.new_context
+    _orig_sync_new_page = _SyncBrowser.new_page
+    _orig_sync_new_context = _SyncBrowser.new_context
+
+    async def _new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return await _orig_new_page(self, *args, **kwargs)
+
+    async def _new_context(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return await _orig_new_context(self, *args, **kwargs)
+
+    def _sync_new_page(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return _orig_sync_new_page(self, *args, **kwargs)
+
+    def _sync_new_context(self: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.setdefault("record_video_dir", record_dir)
+        return _orig_sync_new_context(self, *args, **kwargs)
+
+    monkeypatch.setattr(_AsyncBrowser, "new_page", _new_page)
+    monkeypatch.setattr(_AsyncBrowser, "new_context", _new_context)
+    monkeypatch.setattr(_SyncBrowser, "new_page", _sync_new_page)
+    monkeypatch.setattr(_SyncBrowser, "new_context", _sync_new_context)
+
+
+@pytest.fixture(autouse=True)
+def _record_video(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[None]:
+    """Record async and sync browser journeys when OMNIGENT_E2E_RECORD_DIR is set.
+
+    Patch Browser methods for direct calls; browser_context_args covers sync
+    fixtures. Preserve explicit recording paths. Playwright writes the video
+    when the context closes; an unset environment variable leaves recording off."""
+    record_dir = os.environ.get(_RECORD_DIR_ENV)
+    if not record_dir:
+        yield
+        return
+
+    Path(record_dir).mkdir(parents=True, exist_ok=True)
+    _install_record_video_patches(monkeypatch, record_dir)
+    yield
+
+
+def _recording_requested(item: pytest.Item) -> bool:
+    """True when this test films the journey: env var, ``--video``, or a recording context."""
+    if os.environ.get(_RECORD_DIR_ENV):
+        return True
+    if item.config.getoption("--video", default="off") not in (None, "off"):
+        return True
+    # Authored reproductions sometimes hard-code ``record_video_dir`` themselves.
+    context_args = getattr(item, "funcargs", {}).get("browser_context_args") or {}
+    if context_args.get("record_video_dir"):
+        return True
+    marker = item.get_closest_marker("browser_context_args")
+    return marker is not None and bool(marker.kwargs.get("record_video_dir"))
+
+
+def _stop_recorded_context(item: pytest.Item) -> None:
+    """Close the pytest-playwright context so its video ends on the test's final state."""
+    context = getattr(item, "funcargs", {}).get("context")
+    # No open page means the test closed it and the video is already finalized.
+    if context is None or not context.pages:
+        return
+    # pytest-playwright's close wrapper still takes its screenshots and traces.
+    try:
+        context.close()
+    except Error as exc:
+        # A diagnostic from the report hook must not replace the test result,
+        # even when the suite promotes warnings to errors.
+        with warnings.catch_warnings():
+            warnings.simplefilter("always", pytest.PytestWarning)
+            item.warn(
+                pytest.PytestWarning(f"Could not finalize recording for {item.nodeid}: {exc}")
+            )
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(
+    item: pytest.Item, call: pytest.CallInfo[None]
+) -> Generator[None, Any, None]:
+    """Finalize recordings and reject skipped tests in selected sidecar runs.
+
+    The ``context`` behind ``page`` otherwise outlives the session fixtures' teardown."""
+    outcome = yield
+    report = outcome.get_result()
+    if (
+        item.config.getoption("--ui-codex-sidecar-only")
+        or item.config.getoption("--ui-dependency-smoke")
+    ) and report.skipped:
+        report.outcome = "failed"
+        report.longrepr = f"Selected sidecar test skipped: {report.longrepr}"
+    if call.when == "call" and _recording_requested(item):
+        _stop_recorded_context(item)
+
+
+# Screenshot kwargs that describe the clipped result rather than the
+# full-viewport capture it is cropped from.
+_CLIP_RESULT_KEYS = frozenset({"clip", "path", "type", "quality"})
+
+
+def _recorded_clip_format(kwargs: dict[str, Any]) -> str | None:
+    """Resolve supported output formats without bypassing native path validation."""
+    kind = kwargs.get("type")
+    if kind is None:
+        path = kwargs.get("path")
+        if path is None:
+            return "png"
+        if not isinstance(path, (str, Path)):
+            return None
+        kind = {"image/png": "png", "image/jpeg": "jpeg"}.get(mimetypes.guess_type(path)[0])
+    return kind if kind in ("png", "jpeg") else None
+
+
+def _recorded_clip_capture(page: Any, kwargs: dict[str, Any]) -> dict[str, Any] | None:
+    """Full-viewport screenshot kwargs for a clip of a video-recorded page, or
+    ``None`` when Playwright's native clip path is fine (no clip, ``full_page``,
+    or a page whose context is not recording video)."""
+    if kwargs.get("clip") is None or kwargs.get("full_page") or page.video is None:
+        return None
+    browser = page.context.browser
+    if browser is not None and browser.browser_type.name != "chromium":
+        return None
+    # Keep malformed options on Playwright's native path so it owns validation
+    # and raises the same errors before attempting a clipped capture.
+    kind = _recorded_clip_format(kwargs)
+    if kind is None:
+        return None
+    quality = kwargs.get("quality")
+    if quality is not None and (
+        kind != "jpeg"
+        or type(quality) not in (int, float)
+        or not 0 <= quality <= 100
+        or quality != int(quality)
+    ):
+        return None
+    clip = kwargs["clip"]
+    if not isinstance(clip, dict) or any(
+        type(clip.get(key)) not in (int, float) or not math.isfinite(clip[key])
+        for key in ("x", "y", "width", "height")
+    ):
+        return None
+    if clip["width"] <= 0 or clip["height"] <= 0:
+        return None
+    return {**{k: v for k, v in kwargs.items() if k not in _CLIP_RESULT_KEYS}, "type": "png"}
+
+
+def _crop_recorded_clip(png: bytes, page: Any, kwargs: dict[str, Any]) -> bytes:
+    """Cut ``kwargs["clip"]`` out of a full-viewport PNG, encoding and saving it
+    the way the clipped screenshot would have been."""
+    from PIL import Image
+
+    clip = kwargs["clip"]
+    image = Image.open(io.BytesIO(png))
+    viewport = page.viewport_size
+    # CSS pixels to image pixels; covers device_scale_factor and scale="css".
+    factor = image.width / viewport["width"] if viewport else 1.0
+    x = max(0, clip["x"])
+    y = max(0, clip["y"])
+    width = min(image.width / factor, clip["x"] + clip["width"]) - x
+    height = min(image.height / factor, clip["y"] + clip["height"]) - y
+    # Chromium rounds the origin to device pixels and truncates the CSS size.
+    left = math.floor(x * factor + 0.5)
+    top = math.floor(y * factor + 0.5)
+    right = min(image.width, left + math.floor(math.floor(width + 1e-3) * factor + 0.5))
+    bottom = min(image.height, top + math.floor(math.floor(height + 1e-3) * factor + 0.5))
+    if right <= left or bottom <= top:
+        raise Error("Clipped area is either empty or outside the resulting image")
+    cropped = image.crop((left, top, right, bottom))
+
+    path = kwargs.get("path")
+    kind = _recorded_clip_format(kwargs)
+    encoded = io.BytesIO()
+    if kind == "jpeg":
+        quality = kwargs.get("quality")
+        cropped.convert("RGB").save(
+            encoded, "JPEG", quality=80 if quality is None else int(quality)
+        )
+    else:
+        cropped.save(encoded, "PNG")
+    data = encoded.getvalue()
+    if path:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(data)
+    return data
+
+
+@pytest.fixture(autouse=True)
+def _undistorted_clip_screenshots(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep ``page.screenshot(clip=...)`` from distorting a page's video recording:
+    Chromium resizes the view to the clip for the capture and the screencast films
+    that, so a recorded page gets a full-viewport capture cropped to the clip."""
+    from playwright.async_api import Page as _AsyncPage
+
+    orig_sync = Page.screenshot
+    orig_async = _AsyncPage.screenshot
+
+    def sync_screenshot(self: Page, **kwargs: Any) -> bytes:
+        viewport_kwargs = _recorded_clip_capture(self, kwargs)
+        if viewport_kwargs is None:
+            return orig_sync(self, **kwargs)
+        return _crop_recorded_clip(orig_sync(self, **viewport_kwargs), self, kwargs)
+
+    async def async_screenshot(self: Any, **kwargs: Any) -> bytes:
+        viewport_kwargs = _recorded_clip_capture(self, kwargs)
+        if viewport_kwargs is None:
+            return await orig_async(self, **kwargs)
+        return _crop_recorded_clip(await orig_async(self, **viewport_kwargs), self, kwargs)
+
+    monkeypatch.setattr(Page, "screenshot", sync_screenshot)
+    monkeypatch.setattr(_AsyncPage, "screenshot", async_screenshot)
 
 
 @pytest.fixture
@@ -1433,11 +2558,11 @@ def server_pid(live_server: str) -> int:
 # The native codex render-parity suite drives it.
 # ---------------------------------------------------------------------------
 
-# A precise-echo agent on the openai-agents harness (same provider family as
-# hello_world, so it authenticates against the same gateway in CI). spec_version
-# 1 + executor.config.harness routes through the strict parser; arcname
-# config.yaml keeps it on that path.
+# A precise-echo agent for mock-backed render-parity tests. Use the strict
+# config.yaml parser with spec_version: 1 and executor.config.harness.
 _CUSTOM_AGENT_NAME = "echo_probe"
+# A separate mock model keeps the empty parity fallback away from other tests.
+_CUSTOM_AGENT_MODEL = "render-parity-probe"
 _CUSTOM_AGENT_YAML = f"""\
 spec_version: 1
 name: {_CUSTOM_AGENT_NAME}
@@ -1447,7 +2572,7 @@ prompt: |
   and nothing else — no preamble, no quotes, no trailing punctuation.
 
 executor:
-  model: databricks-gpt-5-4
+  model: {_CUSTOM_AGENT_MODEL}
   config:
     harness: openai-agents
 """
@@ -1460,41 +2585,29 @@ def _bind_session_runner(base_url: str, session_id: str, runner_id: str) -> None
     :param session_id: The session/conversation id to bind.
     :param runner_id: The token-bound runner id the session dispatches to.
     """
-    patch = httpx.patch(
-        f"{base_url}/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-        timeout=10.0,
-    )
-    patch.raise_for_status()
+    bind_session_runner(httpx.patch, base_url, session_id, runner_id, timeout=10.0)
 
 
-def _create_bundled_session(base_url: str, runner_id: str, yaml_text: str) -> str:
+def _create_bundled_session(
+    base_url: str, runner_id: str, yaml_text: str, *, operator_authored: bool = False
+) -> str:
     """Register a session-scoped agent from *yaml_text* and bind its session.
 
-    The multipart ``POST /v1/sessions`` both registers the agent and creates
-    the session it is scoped to, returning that ``session_id`` directly — so
-    no separate create call is needed.
+    HTTP uploads validate user-authored specs. Operator fixtures with Python
+    tools or host paths use trusted local registration before creating by id.
 
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
     :param yaml_text: The agent spec body.
+    :param operator_authored: Provision a trusted operator fixture through local stores.
     :returns: The new session/conversation id.
     """
-    import json as _json
 
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        info = tarfile.TarInfo("config.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
+    data = yaml_text.encode()
+    bundle_bytes = bundle_files({"config.yaml": data})
 
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps({})},
-        files={"bundle": ("agent.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
+    provision = post_operator_session if operator_authored else post_session_bundle
+    create = provision(httpx.post, f"{base_url}/v1/sessions", bundle_bytes, timeout=30.0)
     create.raise_for_status()
     session_id = str(create.json()["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
@@ -1533,7 +2646,7 @@ def _create_native_claude_session(
     """Register the ``claude-native`` wrapper agent and bind its session.
 
     Reuses the exact terminal-first spec ``omnigent claude`` ships
-    (:func:`omnigent.claude_native._materialize_claude_agent_spec`) so the
+    (:func:`omnigent.harnesses.claude_native.main._materialize_claude_agent_spec`) so the
     fixture never drifts from production, and stamps the same wrapper /
     terminal-first labels (``omnigent.wrapper`` + ``omnigent.ui = terminal``)
     the CLI writes. The spec carries no ``spec_version``, so it is bundled
@@ -1557,45 +2670,11 @@ def _create_native_claude_session(
         launches with the production defaults.
     :returns: The new session/conversation id.
     """
-    import json as _json
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        CLAUDE_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
-    )
-    from omnigent.claude_native import _materialize_claude_agent_spec
-
-    with tempfile.TemporaryDirectory() as _tmp:
-        spec_path = _materialize_claude_agent_spec(Path(_tmp))
-        yaml_text = spec_path.read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname → omnigent compat translator (the spec has
-        # no spec_version), matching the terminal_session fixture.
-        info = tarfile.TarInfo("claude-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CLAUDE_NATIVE_WRAPPER_VALUE,
-    }
-    metadata: dict[str, object] = {"labels": labels}
+    metadata: dict[str, object] = {}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps(metadata)},
-        files={"bundle": ("claude-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    session_id = str(create.json()["session_id"])
+    created = create_native_session(httpx, base_url, harness="claude", metadata=metadata)
+    session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
     return session_id
 
@@ -1643,13 +2722,25 @@ def native_claude_plan_session(
     """A native ``claude-native`` session launched in **plan mode**.
 
     Identical to :func:`native_claude_session` except the session carries
-    ``terminal_launch_args=["--permission-mode", "plan"]`` so the runner boots
-    Claude Code into plan mode. In plan mode Claude researches a task and then
-    calls its built-in ``ExitPlanMode`` tool to present the plan for approval;
-    that call rides the native ``PermissionRequest`` hook to the server, which
-    stamps the ``exit_plan_mode`` extras and publishes an elicitation the SPA
-    renders as ``ExitPlanModeReview`` inside an ``ApprovalCard``. Drives the
-    Exit-Plan-Mode review e2e (``approvals/test_exit_plan_mode.py``).
+    ``terminal_launch_args=["--permission-mode", "plan", "--disallowedTools",
+    "AskUserQuestion"]`` so the runner boots Claude Code into plan mode *with
+    the AskUserQuestion tool removed*. In plan mode Claude researches a task and
+    then calls its built-in ``ExitPlanMode`` tool to present the plan for
+    approval; that call rides the native ``PermissionRequest`` hook to the
+    server, which stamps the ``exit_plan_mode`` extras and publishes an
+    elicitation the SPA renders as ``ExitPlanModeReview`` inside an
+    ``ApprovalCard``. Drives the Exit-Plan-Mode review e2e
+    (``approvals/test_exit_plan_mode.py``).
+
+    The ``--disallowedTools AskUserQuestion`` is the load-bearing flake fix:
+    given the deliberately under-specified plan prompt, Claude would otherwise
+    sometimes reach for its built-in ``AskUserQuestion`` tool first (to clarify
+    the comment text/location) instead of going straight to ``ExitPlanMode``,
+    surfacing the *wrong* approval card and timing the test out. Removing the
+    tool eliminates that degree of freedom structurally rather than relying on
+    the model's sampling. The AskUserQuestion render path keeps its own
+    dedicated coverage in ``approvals/test_ask_user_question.py``, so disabling
+    it here costs no coverage.
 
     :param live_server: Spawned server fixture; its runner is reused.
     :param tmp_path_factory: Pytest temp path factory (for a respawn log).
@@ -1660,7 +2751,15 @@ def native_claude_plan_session(
     session_id = _create_native_claude_session(
         live_server,
         runner_id,
-        terminal_launch_args=["--permission-mode", "plan"],
+        terminal_launch_args=[
+            "--permission-mode",
+            "plan",
+            # Remove AskUserQuestion so the under-specified plan prompt can only
+            # surface via ExitPlanMode (the card under test), never a clarifying
+            # question. See this fixture's docstring + test_exit_plan_mode.py.
+            "--disallowedTools",
+            "AskUserQuestion",
+        ],
     )
     try:
         yield (live_server, session_id)
@@ -1675,11 +2774,16 @@ def native_claude_plan_session(
                 respawned.wait(timeout=5)
 
 
-def _create_native_codex_session(base_url: str, runner_id: str) -> str:
+def _create_native_codex_session(
+    base_url: str,
+    runner_id: str,
+    *,
+    model: str | None = None,
+) -> str:
     """Register the ``codex-native`` wrapper agent and bind its session.
 
     Reuses the exact terminal-first spec ``omnigent codex`` ships
-    (:func:`omnigent.codex_native._materialize_codex_agent_spec`) so the
+    (:func:`omnigent.harnesses.codex_native.main._materialize_codex_agent_spec`) so the
     fixture never drifts from production, and stamps the same wrapper /
     terminal-first labels (``omnigent.wrapper`` + ``omnigent.ui = terminal``)
     the CLI writes. The spec carries no ``spec_version``, so it is bundled
@@ -1691,58 +2795,24 @@ def _create_native_codex_session(base_url: str, runner_id: str) -> str:
     auto-bootstrap: it launches Codex in the session terminal, derives the
     gateway auth from its own credentials, and pre-accepts the first-run
     trust/onboarding prompts — no CLI client required. ``model=None`` lets the
-    configured provider's default model win (matching ``_build_codex_native_bundle``).
+    configured provider's default model win (matching the seeded codex bundle
+    built via ``_build_native_bundle``); tests can pin a specific catalog model
+    to exercise model-specific startup behavior.
 
     :param base_url: Spawned server base URL.
     :param runner_id: The token-bound runner id to bind.
+    :param model: Optional Codex model to pin in the wrapper spec.
     :returns: The new session/conversation id.
     """
-    import json as _json
-    import tempfile
-
-    from omnigent._wrapper_labels import (
-        CODEX_NATIVE_WRAPPER_VALUE,
-        UI_MODE_LABEL_KEY,
-        UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY,
+    # Keep workspace session-local; runner-wide cwd changes other file surfaces.
+    created = create_native_session(
+        httpx,
+        base_url,
+        harness="codex",
+        model=model,
+        metadata={"workspace": str(_REPO_ROOT)},
     )
-    from omnigent.codex_native import _materialize_codex_agent_spec
-
-    with tempfile.TemporaryDirectory() as _tmp:
-        spec_path = _materialize_codex_agent_spec(Path(_tmp), model=None)
-        yaml_text = spec_path.read_text()
-
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        data = yaml_text.encode()
-        # Non-config.yaml arcname → omnigent compat translator (the spec has
-        # no spec_version), matching the terminal_session fixture.
-        info = tarfile.TarInfo("codex-native-ui.yaml")
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
-    labels = {
-        UI_MODE_LABEL_KEY: UI_MODE_TERMINAL_VALUE,
-        WRAPPER_LABEL_KEY: CODEX_NATIVE_WRAPPER_VALUE,
-    }
-    # Runner-owned Codex terminals hard-require a workspace: unlike the
-    # claude-native path (which falls back to Path.cwd()),
-    # _codex_session_workspace raises if neither the session's stored
-    # ``workspace`` nor OMNIGENT_RUNNER_WORKSPACE is set. Pin it on THIS
-    # session only (via metadata.workspace) rather than exporting
-    # OMNIGENT_RUNNER_WORKSPACE on the shared runner — a runner-wide value
-    # changes file-surface advertisement for every other session on the runner
-    # (it regressed the mobile file-drawer suite). The repo root is the same cwd
-    # claude falls back to, and is a valid dir on the runner's filesystem.
-    metadata = {"labels": labels, "workspace": str(_REPO_ROOT)}
-    create = httpx.post(
-        f"{base_url}/v1/sessions",
-        data={"metadata": _json.dumps(metadata)},
-        files={"bundle": ("codex-native-ui.tar.gz", buf.getvalue(), "application/gzip")},
-        timeout=30.0,
-    )
-    create.raise_for_status()
-    session_id = str(create.json()["session_id"])
+    session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
     return session_id
 
@@ -1775,6 +2845,675 @@ def native_codex_session(
             # Escalate to SIGKILL if the runner ignores SIGTERM, so a wedged
             # process can't raise in teardown and leak / fail unrelated tests
             # (matching terminal_session / seeded_session_pair).
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+@contextlib.contextmanager
+def native_claude_mock_session_context(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+    *,
+    terminal_launch_args: list[str] | None = None,
+) -> Iterator[tuple[str, str]]:
+    """A real Claude CLI using an explicitly configured mock provider.
+
+    Workflow-owned runners are already configured. Standalone tests temporarily
+    install a mock provider regardless of ambient credential placeholders.
+    ``terminal_launch_args`` are persisted on the session and passed to ``claude``.
+    Callers request ``claude_managed_settings`` to expose real machine routing.
+    """
+    validate_native_claude_mock_routing(mock_llm_server_url)
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    with _temp_omnigent_mock_config(
+        mock_llm_server_url, "claude", workflow_owned=bool(_server_state.get("workflow_owned"))
+    ):
+        # Keep the default create call unchanged; tests/test_ui_fixture_wiring.py pins it.
+        launch_args = (
+            {} if terminal_launch_args is None else {"terminal_launch_args": terminal_launch_args}
+        )
+        session_id = _create_native_claude_session(live_server, runner_id, **launch_args)
+        try:
+            yield (live_server, session_id)
+        finally:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned.kill()
+                    respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def native_claude_mock_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+    claude_managed_settings: None,
+) -> Iterator[tuple[str, str]]:
+    """A real Claude CLI using an explicitly configured mock provider."""
+    with native_claude_mock_session_context(
+        live_server, mock_llm_server_url, tmp_path_factory
+    ) as session:
+        yield session
+
+
+@pytest.fixture
+def native_codex_mock_session(
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A real Codex CLI using an explicitly configured mock provider.
+
+    Workflow-owned runners reuse their startup config; standalone tests install
+    a temporary mock provider regardless of ambient credentials.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    with _temp_omnigent_mock_config(
+        mock_llm_server_url, "codex", workflow_owned=bool(_server_state.get("workflow_owned"))
+    ):
+        session_id = _create_native_codex_session(live_server, runner_id)
+        try:
+            yield (live_server, session_id)
+        finally:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+            if respawned is not None:
+                respawned.terminate()
+                try:
+                    respawned.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned.kill()
+                    respawned.wait(timeout=5)
+
+
+@dataclass(frozen=True)
+class MockedCodexNativeSession:
+    """Session handle for native Codex e2e tests with mocked Responses API."""
+
+    base_url: str
+    session_id: str
+    sidecar: CodexResponsesSidecar
+    restart_server: Callable[[], None]
+
+
+def _write_mock_codex_provider_config(
+    config_home: Path,
+    base_url: str,
+    *,
+    model: str = "mock-model",
+) -> None:
+    """Write provider config that routes native Codex to the sidecar."""
+    config_home.mkdir(parents=True, exist_ok=True)
+    (config_home / "config.yaml").write_text(
+        f"""\
+providers:
+  codex-e2e-mock:
+    kind: key
+    default: openai
+    openai:
+      base_url: "{base_url}"
+      api_key: "sk-e2e-mock"
+      wire_api: responses
+      models:
+        default: {model}
+""",
+        encoding="utf-8",
+    )
+
+
+@pytest.fixture
+def mocked_native_codex_session(
+    built_spa: None,
+    tmp_path_factory: pytest.TempPathFactory,
+    request: pytest.FixtureRequest,
+) -> Iterator[MockedCodexNativeSession]:
+    """Spawn native Codex against Codex's mock Responses sidecar.
+
+    This intentionally does not reuse the session-scoped ``live_server``:
+    native Codex reads provider config and bridge roots in subprocesses, so
+    the mock ``OMNIGENT_CONFIG_HOME`` / ``HOME`` / source ``CODEX_HOME`` must
+    be present before the AP server and runner start. Keeping a dedicated
+    server prevents those mock-only env vars from affecting unrelated UI tests
+    in the same shard.
+    """
+    if request.config.getoption("--ui-base-url"):
+        pytest.skip("mocked native Codex e2e requires an isolated spawned server")
+
+    codex_path = shutil.which("codex")
+    if codex_path is None:
+        pytest.skip("codex CLI is required for mocked native Codex e2e")
+    if not _codex_cli_supports_mocked_app_server(codex_path):
+        pytest.skip("codex CLI >= 0.139.0 is required for mocked app-server e2e")
+
+    fixture_param = getattr(request, "param", None)
+    model = fixture_param if isinstance(fixture_param, str) else "mock-model"
+
+    try:
+        sidecar_bin = build_sidecar_bin()
+    except RuntimeError:
+        pytest.skip("cargo is required for Codex parity sidecar")
+
+    server_tmp = tmp_path_factory.mktemp("e2e_ui_mocked_codex_server")
+    responses = (
+        fixture_param
+        if isinstance(fixture_param, list)
+        else [
+            [
+                ev_response_created("resp-goal-ui-bootstrap"),
+                ev_assistant_message("msg-goal-ui-bootstrap", "E2E_GOAL_BOOTSTRAP"),
+                ev_completed("resp-goal-ui-bootstrap"),
+            ]
+        ]
+    )
+    sidecar = start_codex_responses_sidecar(
+        sidecar_bin,
+        server_tmp / "responses.json",
+        responses,
+    )
+
+    config_home = server_tmp / "config-home"
+    source_codex_home = server_tmp / "source-codex-home"
+    home_dir = server_tmp / "home"
+    state_dir = server_tmp / "codex-native-state"
+    artifact_dir = server_tmp / "artifacts"
+    for path in (source_codex_home, home_dir, state_dir, artifact_dir):
+        path.mkdir(parents=True, exist_ok=True)
+    # Reproduce the intermittent production path deterministically: a user
+    # hook needs review while the runner's version probe is unparseable. The
+    # real Codex binary still handles every non-version invocation.
+    (source_codex_home / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type": "command", "command": "/usr/bin/true"}]}
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    codex_shim = _write_codex_unknown_version_shim(server_tmp, codex_path)
+    _write_mock_codex_provider_config(config_home, sidecar.base_url, model=model)
+
+    port = _find_free_port()
+    log_path = server_tmp / "server.log"
+    runner_log_path = server_tmp / "runner.log"
+    db_path = server_tmp / "test.db"
+    agent_yaml_path = server_tmp / "hello_world.yaml"
+    agent_yaml_path.write_text(_TEST_AGENT_YAML, encoding="utf-8")
+
+    import secrets as _secrets
+
+    from omnigent.runner.identity import token_bound_runner_id
+
+    binding_token = _secrets.token_urlsafe(32)
+    runner_id = token_bound_runner_id(binding_token)
+    base_url = f"http://127.0.0.1:{port}"
+    shared_env = {
+        **os.environ,
+        "PYTHONPATH": f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}",
+        "OMNIGENT_CONFIG_HOME": str(config_home),
+        "OMNIGENT_CODEX_NATIVE_STATE_DIR": str(state_dir),
+        "CODEX_HOME": str(source_codex_home),
+        "HOME": str(home_dir),
+        "OMNIGENT_CODEX_PATH": str(codex_shim),
+    }
+    server_env = {
+        **shared_env,
+        "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token,
+    }
+    runner_env = {
+        **shared_env,
+        "OMNIGENT_RUNNER_ID": runner_id,
+        "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
+        "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
+        "RUNNER_SERVER_URL": base_url,
+    }
+
+    server_command = [
+        sys.executable,
+        "-c",
+        "import omnigent.server.presence as _p; _p._LEAVE_GRACE_S = 1.0; "
+        + "from omnigent.cli import main; main()",
+        "server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--database-uri",
+        f"sqlite:///{db_path}",
+        "--artifact-location",
+        str(artifact_dir),
+        "--agent",
+        str(agent_yaml_path),
+    ]
+
+    log_handle = open(log_path, "w")  # noqa: SIM115
+    runner_log_handle = open(runner_log_path, "w")  # noqa: SIM115
+    proc: subprocess.Popen[bytes] | None = None
+    runner_proc: subprocess.Popen[bytes] | None = None
+    session_id: str | None = None
+
+    def _spawn_server() -> subprocess.Popen[bytes]:
+        """Start one server generation against the fixture's durable store."""
+        return subprocess.Popen(
+            server_command,
+            env=server_env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+
+    def _wait_until_ready(
+        server_process: subprocess.Popen[bytes],
+        runner_process: subprocess.Popen[bytes],
+    ) -> None:
+        """Wait until both the server generation and surviving runner are ready."""
+        deadline = time.monotonic() + _HEALTH_TIMEOUT_S
+        last_error = "not polled yet"
+        while time.monotonic() < deadline:
+            if server_process.poll() is not None:
+                last_error = f"process exited early with code {server_process.returncode}"
+                break
+            if runner_process.poll() is not None:
+                last_error = f"runner exited early with code {runner_process.returncode}"
+                break
+            try:
+                resp = httpx.get(f"{base_url}/health", timeout=2)
+                if resp.status_code == 200:
+                    status_resp = httpx.get(
+                        f"{base_url}/v1/runners/{runner_id}/status",
+                        timeout=2,
+                    )
+                    if status_resp.status_code == 200 and status_resp.json()["online"] is True:
+                        return
+                    last_error = (
+                        f"runner status HTTP {status_resp.status_code}: {status_resp.text[:200]}"
+                    )
+                else:
+                    last_error = f"health HTTP {resp.status_code}: {resp.text[:200]}"
+            except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            time.sleep(_HEALTH_POLL_INTERVAL_S)
+        raise RuntimeError(
+            f"mocked Codex e2e server did not become healthy within "
+            f"{_HEALTH_TIMEOUT_S:.0f}s on {base_url} "
+            f"(last_error={last_error}).\n"
+            f"Server log at {log_path}:\n"
+            f"{log_path.read_text()[-3000:] if log_path.exists() else ''}\n"
+            f"Runner log at {runner_log_path}:\n"
+            f"{runner_log_path.read_text()[-3000:] if runner_log_path.exists() else ''}"
+        )
+
+    try:
+        proc = _spawn_server()
+        runner_proc = subprocess.Popen(
+            [runner_executable(), "-m", "omnigent.runner._entry"],
+            env=apply_runner_env(runner_env),
+            cwd=compat_runner_cwd(),
+            stdout=runner_log_handle,
+            stderr=subprocess.STDOUT,
+        )
+        _wait_until_ready(proc, runner_proc)
+
+        session_id = _create_native_codex_session(base_url, runner_id, model=model)
+
+        def _restart_server() -> None:
+            """Recycle only the server, preserving the runner and Codex turn."""
+            nonlocal proc
+            assert proc is not None
+            assert runner_proc is not None
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+            proc = _spawn_server()
+            _wait_until_ready(proc, runner_proc)
+
+        yield MockedCodexNativeSession(
+            base_url=base_url,
+            session_id=session_id,
+            sidecar=sidecar,
+            restart_server=_restart_server,
+        )
+    finally:
+        if session_id is not None:
+            with contextlib.suppress(httpx.HTTPError):
+                httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+        if runner_proc is not None and runner_proc.poll() is None:
+            runner_proc.send_signal(signal.SIGTERM)
+            try:
+                runner_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                runner_proc.kill()
+                runner_proc.wait(timeout=5)
+        if proc is not None and proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+        runner_log_handle.close()
+        log_handle.close()
+        sidecar.close()
+
+
+# ---------------------------------------------------------------------------
+# ``native_cursor_session`` is the sibling native-CLI fixture for the
+# ``cursor-native`` ("Cursor") wrapper: it spins up a real Cursor wrapper
+# session — the same terminal-first spec ``omnigent cursor`` ships — and yields
+# ``(base_url, session_id)``. The runner auto-launches ``cursor-agent`` in the
+# session terminal on bind (``_auto_create_cursor_terminal`` in
+# ``omnigent/runner/app.py``), exactly like the claude/codex fixtures.
+#
+# Two things differ from claude/codex, both stemming from cursor-agent owning
+# its own auth/approval:
+#
+# * **Auth has NO Databricks-gateway path.** cursor-agent talks only to
+#   Cursor's backend, so it does not derive auth from the runner's gateway
+#   credentials the way Claude Code / Codex do. It authenticates from the
+#   ambient ``cursor-agent login`` (``$HOME/.cursor``, inherited by the runner)
+#   or an ambient ``CURSOR_API_KEY``. The render-parity test is therefore gated
+#   to skip when neither the binary nor a usable login is present (CI does not
+#   provision a Cursor account by default), so it stays green there while
+#   running for real wherever Cursor is logged in.
+# * **``-f`` (force/trust) is passed as a launch arg.** cursor-agent blocks on a
+#   per-directory "Workspace Trust" prompt and per-tool approval prompts; in a
+#   runner-owned tmux pane there is no one to answer them, so the TUI would
+#   hang. ``-f`` (Cursor's force/yolo flag) clears both. It is threaded through
+#   ``terminal_launch_args`` exactly as the plan-mode claude fixture threads
+#   ``--permission-mode``.
+# ---------------------------------------------------------------------------
+
+
+def _create_native_cursor_session(
+    base_url: str, runner_id: str, *, launch_args: tuple[str, ...] = ("-f",)
+) -> str:
+    """Register the ``cursor-native`` wrapper agent and bind its session.
+
+    Reuses the exact terminal-first spec ``omnigent cursor`` ships
+    (:func:`omnigent.harnesses.cursor_native.main._materialize_cursor_agent_spec`) so the
+    fixture never drifts from production, and stamps the same wrapper /
+    terminal-first labels (``omnigent.wrapper`` + ``omnigent.ui = terminal``)
+    the CLI writes. The spec carries no ``spec_version``, so it is bundled
+    under a ``*.yaml`` arcname to route through the omnigent compat translator
+    (which preserves ``executor.harness`` + ``terminals:``); a ``config.yaml``
+    arcname would hit the strict parser and reject it.
+
+    Binding the session to the runner triggers the runner's cursor-native
+    auto-bootstrap (:func:`omnigent.runner.app._auto_create_cursor_terminal`):
+    it launches ``cursor-agent`` in the session terminal — with the ``-f``
+    force/trust arg threaded via ``terminal_launch_args`` so the unattended
+    tmux pane never blocks on Cursor's workspace-trust / per-tool prompts — and
+    starts the forwarder that mirrors the TUI transcript back as conversation
+    items.
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :returns: The new session/conversation id.
+    """
+    # An empty launch_args enables approval prompts; the default trusts the workspace.
+    created = create_native_session(
+        httpx,
+        base_url,
+        harness="cursor",
+        metadata={"workspace": str(_REPO_ROOT), "terminal_launch_args": list(launch_args)},
+    )
+    session_id = str(created["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+def _create_native_goose_session(base_url: str, runner_id: str) -> str:
+    """Register the ``goose-native`` wrapper agent and bind its session.
+
+    Mirrors :func:`_create_native_cursor_session`: reuses the exact terminal-first
+    spec ``omnigent goose`` ships
+    (:func:`omnigent.harnesses.goose_native.main._materialize_goose_agent_spec`) and stamps the
+    same wrapper / terminal-first labels. Binding triggers the runner's
+    goose-native auto-bootstrap
+    (:func:`omnigent.runner.app._auto_create_goose_terminal`), which launches
+    ``goose session`` in the session terminal and starts the forwarder that
+    mirrors the TUI transcript back as conversation items. Goose's tool-approval
+    gating is its own ``GOOSE_MODE`` (no ``-f`` equivalent), so no launch args.
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :returns: The new session/conversation id.
+    """
+    created = create_native_session(
+        httpx,
+        base_url,
+        harness="goose",
+        metadata={"workspace": str(_REPO_ROOT)},
+    )
+    session_id = str(created["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+@pytest.fixture
+def native_goose_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the real ``goose-native`` ("Goose") wrapper.
+
+    The runner auto-launches ``goose session`` in the session terminal on bind,
+    so the SPA's Terminal view attaches to a live Goose TUI and its Chat view
+    renders the same canonical transcript. Drives the goose render-parity suite.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_goose_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+def _create_native_kiro_session(base_url: str, runner_id: str) -> str:
+    """Register the ``kiro-native`` wrapper agent and bind its session.
+
+    Mirrors :func:`_create_native_goose_session`: reuses the terminal-first spec
+    ``omnigent kiro`` ships
+    (:func:`omnigent.harnesses.kiro_native.main._materialize_kiro_agent_spec`) and stamps the
+    same wrapper / terminal-first labels. Binding triggers the runner's
+    kiro-native auto-bootstrap
+    (:func:`omnigent.runner.app._auto_create_kiro_terminal`), which launches the
+    ``kiro-cli`` TUI in the session terminal and starts the forwarder that mirrors
+    the TUI transcript back as conversation items.
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :returns: The new session/conversation id.
+    """
+    created = create_native_session(
+        httpx,
+        base_url,
+        harness="kiro",
+        metadata={"workspace": str(_REPO_ROOT)},
+    )
+    session_id = str(created["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+@pytest.fixture
+def native_kiro_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the real ``kiro-native`` ("Kiro") wrapper.
+
+    The runner auto-launches the ``kiro-cli`` TUI in the session terminal on bind,
+    so the SPA's Terminal view attaches to a live Kiro TUI and its Chat view
+    renders the same canonical transcript. Drives the kiro render-parity suite.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_kiro_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+def _create_native_hermes_session(base_url: str, runner_id: str) -> str:
+    """Register the ``hermes-native`` wrapper agent and bind its session.
+
+    Mirrors :func:`_create_native_goose_session`: reuses the exact terminal-first
+    spec ``omnigent hermes`` ships
+    (:func:`omnigent.harnesses.hermes_native.main._materialize_hermes_agent_spec`) and stamps the
+    same wrapper / terminal-first labels. Binding triggers the runner's
+    hermes-native auto-bootstrap
+    (:func:`omnigent.runner.app._auto_create_hermes_terminal`), which launches the
+    ``hermes`` TUI in the session terminal and starts the forwarder that mirrors
+    the TUI transcript back as conversation items.
+
+    :param base_url: Spawned server base URL.
+    :param runner_id: The token-bound runner id to bind.
+    :returns: The new session/conversation id.
+    """
+    created = create_native_session(
+        httpx,
+        base_url,
+        harness="hermes",
+        metadata={"workspace": str(_REPO_ROOT)},
+    )
+    session_id = str(created["session_id"])
+    _bind_session_runner(base_url, session_id, runner_id)
+    return session_id
+
+
+@pytest.fixture
+def native_hermes_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the real ``hermes-native`` ("Hermes") wrapper.
+
+    The runner auto-launches the ``hermes`` TUI in the session terminal on bind,
+    so the SPA's Terminal view attaches to a live Hermes TUI and its Chat view
+    renders the same canonical transcript. Drives the hermes render-parity suite.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_hermes_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def native_cursor_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A runner-bound session on the real ``cursor-native`` ("Cursor") wrapper.
+
+    The runner auto-launches ``cursor-agent`` in the session terminal on bind
+    (ambient ``cursor-agent login`` / ``CURSOR_API_KEY`` auth + ``-f`` trust
+    handled runner-side), so the SPA's Terminal view attaches to a live Cursor
+    TUI and its Chat view renders the same canonical transcript. Drives the
+    native cursor render-parity suite.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_cursor_session(live_server, runner_id)
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
+            # Escalate to SIGKILL if the runner ignores SIGTERM, so a wedged
+            # process can't raise in teardown and leak / fail unrelated tests
+            # (matching terminal_session / seeded_session_pair).
+            try:
+                respawned.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                respawned.kill()
+                respawned.wait(timeout=5)
+
+
+@pytest.fixture
+def native_cursor_approval_session(
+    live_server: str,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """A ``cursor-native`` session launched WITHOUT ``-f`` (prompts fire).
+
+    Identical to :func:`native_cursor_session` but omits the force/trust flag,
+    so ``cursor-agent`` raises its real per-tool approval prompts. The runner-
+    side mirror (:mod:`omnigent.harnesses.cursor_native.permissions`) surfaces those as
+    web ``response.elicitation_request`` cards — what the approval-ordering test
+    drives. The first-run workspace-trust modal is dismissed by the executor's
+    inject path on the first composer turn.
+
+    :param live_server: Spawned server fixture; its runner is reused.
+    :param tmp_path_factory: Pytest temp path factory (for a respawn log).
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned = _ensure_runner_online(live_server, tmp_path_factory)
+    runner_id = str(_server_state["runner_id"])
+    session_id = _create_native_cursor_session(live_server, runner_id, launch_args=())
+    try:
+        yield (live_server, session_id)
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        if respawned is not None:
+            respawned.terminate()
             try:
                 respawned.wait(timeout=5)
             except subprocess.TimeoutExpired:

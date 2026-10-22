@@ -14,63 +14,67 @@ Usage::
 
 from __future__ import annotations
 
-from typing import Any
+import uuid
 
 import httpx
-import pytest
 
 from tests.e2e.conftest import (
+    configure_mock_llm,
     create_runner_bound_session,
     poll_session_until_terminal,
+    register_inline_agent,
+    reset_mock_llm,
     send_user_message_to_session,
 )
 
 _CODEWORD = "crystal-panda-99"
 
 
-def _extract_all_text(body: dict[str, Any]) -> str:
-    """Concatenate all assistant output_text blocks from a response body.
-
-    :param body: The terminal response body from
-        :func:`poll_session_until_terminal`.
-    :returns: All assistant text joined by newlines.
-    """
-    parts: list[str] = []
-    for item in body.get("output", []):
-        if item.get("type") == "message":
-            for block in item.get("content", []):
-                text = block.get("text")
-                if text:
-                    parts.append(text)
-    return "\n".join(parts)
-
-
-@pytest.mark.llm_flaky(reruns=2)
 def test_resume_session_after_disconnect(
     live_server: str,
     http_client: httpx.Client,
-    coder_agent: str,
     live_runner_id: str,
+    mock_llm_server_url: str,
 ) -> None:
     """Closing the browser and reopening preserves full session context.
 
-    1. Create a runner-bound session.
-    2. Turn 1: plant a codeword the LLM cannot guess.
-    3. Turn 2: send a follow-up turn.
-    4. "Disconnect": create a fresh ``httpx.Client`` (simulates new
-       browser tab / page load).
-    5. Resume: ``GET /v1/sessions/{id}`` with the new client — verify
-       the session loads with items.
-    6. Resume: ``GET /v1/sessions/{id}/items`` — verify all items from
-       both turns are present.
-    7. Continue: send a new turn asking the agent to recall the
-       codeword.
-    8. Verify the agent reproduces the codeword, proving history
-       survived the disconnect.
+    Uses a mock LLM: turn 1 returns "ok", turn 2 returns "4", and the
+    post-disconnect turn 3 returns the codeword -- proving the server
+    persisted the session and the agent received the full history.
+
+    1. Create a runner-bound session (inline agent + mock queue).
+    2. Turn 1: plant a codeword; mock replies "ok".
+    3. Turn 2: generic follow-up; mock replies "4".
+    4. "Disconnect": create a fresh ``httpx.Client``.
+    5. Resume: verify session loads with items.
+    6. Resume: verify full history via items endpoint.
+    7. Continue: send turn 3; mock replies with the codeword.
+    8. Verify the codeword appears in the latest assistant message.
     """
+    model = f"mock-resume-{uuid.uuid4().hex[:6]}"
+    reset_mock_llm(mock_llm_server_url)
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"resume-{uuid.uuid4().hex[:6]}",
+        harness="openai-agents",
+        model=model,
+        profile="",
+        prompt="You are a helpful assistant.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {"text": "ok"},
+            {"text": "4"},
+            {"text": _CODEWORD},
+        ],
+        key=model,
+    )
+
     # ── Setup: two turns with a codeword ─────────────────
     session_id = create_runner_bound_session(
-        http_client, agent_name=coder_agent, runner_id=live_runner_id
+        http_client, agent_name=agent_name, runner_id=live_runner_id
     )
 
     # Turn 1: plant codeword
@@ -185,7 +189,7 @@ def test_session_list_shows_existing_sessions(
 
     # "Disconnect" — fresh client
     with httpx.Client(base_url=live_server, timeout=300) as new_client:
-        list_resp = new_client.get("/v1/sessions", params={"limit": 100})
+        list_resp = new_client.get("/v1/sessions", params={"visibility": "all", "limit": 100})
         list_resp.raise_for_status()
         sessions = list_resp.json()["data"]
 

@@ -203,9 +203,61 @@ async def test_evaluate_policy_timeout_returns_allow(
     result = await ctx.evaluate_policy("poleval_timeout_001", "PHASE_LLM_REQUEST", {})
 
     assert result.action == "POLICY_ACTION_ALLOW", (
-        "Timed-out policy evaluation should default to ALLOW (fail-open). "
+        "Timed-out LLM-phase policy evaluation should default to ALLOW "
+        "(fail-open) so a transient outage never hangs the turn. "
         "If DENY, the timeout path is returning the wrong default. "
         "If this test hangs, the timeout isn't being applied."
+    )
+    assert result.reason is None
+
+
+@pytest.mark.asyncio()
+async def test_evaluate_policy_tool_call_timeout_fails_closed(
+    _turn_ctx: TurnContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out ``PHASE_TOOL_CALL`` evaluation defaults to DENY.
+
+    TOOL_CALL is the authoritative gate for connector-native MCP tools
+    (the harness ``can_use_tool`` callback consumes this verdict and the
+    call is never re-checked server-side). If the verdict never arrives,
+    the tool must be blocked, not allowed — the LLM-phase fail-open above
+    must NOT extend to the tool *call*.
+    """
+    import omnigent.runtime.harnesses._scaffold as _scaffold_mod
+
+    monkeypatch.setattr(_scaffold_mod, "_POLICY_EVAL_TIMEOUT_S", 0.1)
+
+    ctx = _turn_ctx
+    # Start evaluation but never deliver the verdict.
+    result = await ctx.evaluate_policy("poleval_toolcall_timeout", "PHASE_TOOL_CALL", {})
+
+    assert result.action == "POLICY_ACTION_DENY", (
+        f"Timed-out TOOL_CALL policy evaluation must fail CLOSED (DENY); got {result.action!r}."
+    )
+    assert result.reason is not None
+
+
+@pytest.mark.asyncio()
+async def test_evaluate_policy_tool_result_timeout_fails_open(
+    _turn_ctx: TurnContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A timed-out ``PHASE_TOOL_RESULT`` evaluation defaults to ALLOW.
+
+    By the result phase the tool has already executed, so a missing verdict
+    need not block — TOOL_RESULT fails OPEN like the advisory LLM phases,
+    unlike TOOL_CALL. (Maintainer design decision — see PR review thread.)
+    """
+    import omnigent.runtime.harnesses._scaffold as _scaffold_mod
+
+    monkeypatch.setattr(_scaffold_mod, "_POLICY_EVAL_TIMEOUT_S", 0.1)
+
+    ctx = _turn_ctx
+    result = await ctx.evaluate_policy("poleval_toolresult_timeout", "PHASE_TOOL_RESULT", {})
+
+    assert result.action == "POLICY_ACTION_ALLOW", (
+        f"Timed-out TOOL_RESULT policy evaluation must fail OPEN (ALLOW); got {result.action!r}."
     )
     assert result.reason is None
 
@@ -231,3 +283,54 @@ def test_policy_verdict_payload_defaults() -> None:
     assert payload.action == "POLICY_ACTION_ALLOW"
     assert payload.reason is None
     assert payload.data is None
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("phase", ["PHASE_LLM_RESPONSE", "PHASE_TOOL_RESULT"])
+async def test_evaluate_policy_ungated_phase_lost_verdict_fails_open_quickly(
+    _turn_ctx: TurnContext,
+    monkeypatch: pytest.MonkeyPatch,
+    phase: str,
+) -> None:
+    """A lost verdict for a phase that never waits on a human does not stall the turn.
+
+    Only TOOL_CALL / LLM_REQUEST / REQUEST can park server-side on an ASK, so
+    the other phases get the short ungated budget instead of the one-day
+    human-wait budget, and they must not hold the idle watchdog open.
+    """
+    import omnigent.runtime.harnesses._scaffold as _scaffold_mod
+
+    monkeypatch.setattr(_scaffold_mod, "_UNGATED_POLICY_EVAL_TIMEOUT_S", 0.05)
+    assert _scaffold_mod._POLICY_EVAL_TIMEOUT_S >= 3600
+
+    ctx = _turn_ctx
+    task = asyncio.create_task(ctx.evaluate_policy(f"poleval_lost_{phase}", phase, {}))
+    await asyncio.sleep(0)
+    assert ctx._pending_human_waits == 0, "ungated phases must not hold the idle watchdog"
+
+    result = await asyncio.wait_for(task, timeout=5)
+    assert result.action == "POLICY_ACTION_ALLOW"
+    assert not ctx._pending_policy_evaluations
+
+
+@pytest.mark.asyncio()
+async def test_evaluate_policy_human_gated_phase_keeps_long_wait(
+    _turn_ctx: TurnContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TOOL_CALL can park on a human ASK, so it keeps the full budget and holds the watchdog."""
+    import omnigent.runtime.harnesses._scaffold as _scaffold_mod
+
+    monkeypatch.setattr(_scaffold_mod, "_UNGATED_POLICY_EVAL_TIMEOUT_S", 0.05)
+
+    ctx = _turn_ctx
+    task = asyncio.create_task(ctx.evaluate_policy("poleval_gated", "PHASE_TOOL_CALL", {}))
+    await asyncio.sleep(0.2)
+    assert not task.done(), "a human-gated evaluation must outlive the ungated budget"
+    assert ctx._pending_human_waits == 1
+
+    ctx._complete_policy_evaluation(
+        "poleval_gated", _scaffold_mod.PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+    )
+    assert (await task).action == "POLICY_ACTION_ALLOW"
+    assert ctx._pending_human_waits == 0

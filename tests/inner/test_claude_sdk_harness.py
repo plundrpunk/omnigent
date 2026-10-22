@@ -79,6 +79,7 @@ def test_executor_factory_reads_env_vars(
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH_INTERVAL_MS", "900000")
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_CWD", "/tmp/test-cwd")
     monkeypatch.setenv("HARNESS_CLAUDE_SDK_PERMISSION_MODE", "acceptEdits")
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET", "claude_code")
 
     captured: dict[str, Any] = {}
 
@@ -89,6 +90,7 @@ def test_executor_factory_reads_env_vars(
         os_env: Any,
         model: str | None,
         permission_mode: str,
+        system_prompt_preset: str | None,
         gateway: bool,
         databricks_profile: str | None,
         gateway_host: str | None,
@@ -101,6 +103,7 @@ def test_executor_factory_reads_env_vars(
         captured["os_env"] = os_env
         captured["model"] = model
         captured["permission_mode"] = permission_mode
+        captured["system_prompt_preset"] = system_prompt_preset
         captured["gateway"] = gateway
         captured["databricks_profile"] = databricks_profile
         captured["gateway_host"] = gateway_host
@@ -125,6 +128,7 @@ def test_executor_factory_reads_env_vars(
     assert captured["gateway_auth_refresh_interval_ms"] == "900000"
     assert captured["cwd"] == "/tmp/test-cwd"
     assert captured["permission_mode"] == "acceptEdits"
+    assert captured["system_prompt_preset"] == "claude_code"
     # When ``HARNESS_CLAUDE_SDK_OS_ENV`` is unset (this test
     # doesn't set it), the wrap defaults to ``caller_process +
     # sandbox=none`` so the SDK exposes its native tools to the
@@ -139,6 +143,54 @@ def test_executor_factory_reads_env_vars(
     assert os_env_value.type == "caller_process"
     assert os_env_value.sandbox is not None
     assert os_env_value.sandbox.type == "none"
+
+
+def test_executor_factory_cwd_falls_back_to_runner_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no ``HARNESS_CLAUDE_SDK_CWD``, the factory falls back to the
+    runner's ``OMNIGENT_RUNNER_WORKSPACE`` (the folder the user launched
+    in, and what the tmux terminal uses) rather than leaving cwd unset —
+    which let the SDK root the CLI at the daemon's ``$HOME``. Mirrors the
+    kimi / pi / hermes harnesses.
+    """
+    monkeypatch.delenv("HARNESS_CLAUDE_SDK_CWD", raising=False)
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/home/bobby/code/agents")
+
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, *, cwd: str | None, **_kwargs: Any) -> None:
+        captured["cwd"] = cwd
+
+    with patch(
+        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        _fake_init,
+    ):
+        claude_sdk_harness._build_claude_sdk_executor()
+
+    assert captured["cwd"] == "/home/bobby/code/agents"
+
+
+def test_executor_factory_explicit_cwd_wins_over_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``HARNESS_CLAUDE_SDK_CWD`` takes precedence over the
+    ``OMNIGENT_RUNNER_WORKSPACE`` fallback."""
+    monkeypatch.setenv("HARNESS_CLAUDE_SDK_CWD", "/tmp/explicit")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", "/home/bobby/code/agents")
+
+    captured: dict[str, Any] = {}
+
+    def _fake_init(self: Any, *, cwd: str | None, **_kwargs: Any) -> None:
+        captured["cwd"] = cwd
+
+    with patch(
+        "omnigent.inner.claude_sdk_harness.ClaudeSDKExecutor.__init__",
+        _fake_init,
+    ):
+        claude_sdk_harness._build_claude_sdk_executor()
+
+    assert captured["cwd"] == "/tmp/explicit"
 
 
 def test_executor_factory_decodes_os_env_json(
@@ -394,7 +446,7 @@ def test_bundle_dir_and_agent_name_env_vars_thread_through(
     inner executor.
 
     Together they wire the SDK ``--plugin-dir`` so any
-    ``<bundle>/skills/<name>/SKILL.md`` files in the agent's
+    ``<bundle>/skills/<dir>/SKILL.md`` files in the agent's
     bundle get exposed as bundled skills, with a stable
     ``<agent>:<skill>`` plugin namespace via the
     ``.claude-plugin/plugin.json`` manifest the inner executor

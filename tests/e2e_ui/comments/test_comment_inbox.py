@@ -154,9 +154,10 @@ def test_comment_surfaces_in_inbox_until_opened_in_file_browser(
     item = page.locator('[data-testid="inbox-comment"]').filter(has_text=_COMMENT_BODY)
     expect(item).to_be_visible(timeout=15_000)
 
-    # Deep-link into the file browser. The viewer opens the file, the
-    # linked comment auto-opens the comments panel, and the panel
-    # being open is what marks it seen.
+    # Expand the row, then deep-link into the file browser. The viewer
+    # opens the file, the linked comment auto-opens the comments panel,
+    # and the panel being open is what marks it seen.
+    item.locator("button[aria-expanded]").click()
     item.get_by_role("link", name="Open file").click()
     file_viewer = page.locator('[data-testid="file-viewer"]:visible')
     expect(file_viewer).to_be_visible(timeout=30_000)
@@ -166,6 +167,77 @@ def test_comment_surfaces_in_inbox_until_opened_in_file_browser(
     # the badge is gone, and the empty state renders. If this still
     # shows the item, the FileViewer never recorded it as seen.
     page.goto(f"{base_url}/inbox")
+    expect(page.get_by_text("Nothing waiting on you")).to_be_visible(timeout=15_000)
+    expect(page.locator('[data-testid="inbox-comment"]')).to_have_count(0)
+    expect(page.get_by_label("1 inbox item waiting")).to_have_count(0)
+
+
+@pytest.fixture
+def self_commented_session(
+    seeded_session: tuple[str, str],
+) -> Iterator[tuple[str, str, str]]:
+    """Seed a file plus one comment authored by the viewer themselves.
+
+    Unlike :func:`alice_commented_session`, the comment POST carries no
+    ``X-Forwarded-Email`` header, so the server records it as the
+    ``local`` identity — stored with ``created_by = null``, exactly like a
+    single-user deployment or a private session the viewer owns. The inbox
+    should never surface such a comment: it only lists comments an
+    identifiable *other* person left.
+
+    :param seeded_session: Base fixture providing a runner-bound
+        ``(base_url, session_id)`` pair.
+    :returns: ``(base_url, session_id, comment_id)``.
+    """
+    base_url, session_id = seeded_session
+    file_url = (
+        f"{base_url}/v1/sessions/{session_id}"
+        f"/resources/environments/default/filesystem/{_FILE_PATH}"
+    )
+    httpx.put(
+        file_url,
+        json={"content": _FILE_CONTENT, "encoding": "utf-8"},
+        timeout=10.0,
+    ).raise_for_status()
+
+    start = _FILE_CONTENT.find(_ANCHOR_TEXT)
+    assert start != -1, "fixture bug: anchor text missing from file content"
+    # No X-Forwarded-Email: the "local" owner authors the comment, so the
+    # server stores created_by = null (attribution_user drops the sentinel).
+    comment_resp = httpx.post(
+        f"{base_url}/v1/sessions/{session_id}/comments",
+        json={
+            "path": _FILE_PATH,
+            "body": _COMMENT_BODY,
+            "start_index": start,
+            "end_index": start + len(_ANCHOR_TEXT),
+            "anchor_content": _ANCHOR_TEXT,
+        },
+        timeout=10.0,
+    )
+    comment_resp.raise_for_status()
+    yield (base_url, session_id, comment_resp.json()["id"])
+
+
+def test_own_comment_never_surfaces_in_inbox(
+    page: Page,
+    self_commented_session: tuple[str, str, str],
+) -> None:
+    """A comment the viewer authored themselves stays out of the inbox.
+
+    The inbox is "comments other people left you". A comment stored with
+    ``created_by = null`` (single-user / private session) is your own, so
+    it must never list — even though the session reports ``comments_count
+    > 0`` and the draft is unseen. Guards the ``collectCommentInboxItems``
+    author filter against regressing to showing self-authored comments.
+    """
+    base_url, _session_id, _comment_id = self_commented_session
+
+    page.goto(f"{base_url}/inbox")
+
+    # The empty state must render and no comment card may appear, despite
+    # the session carrying an unseen draft comment. A visible card here
+    # means the author filter regressed (self / unauthored comments leak).
     expect(page.get_by_text("Nothing waiting on you")).to_be_visible(timeout=15_000)
     expect(page.locator('[data-testid="inbox-comment"]')).to_have_count(0)
     expect(page.get_by_label("1 inbox item waiting")).to_have_count(0)

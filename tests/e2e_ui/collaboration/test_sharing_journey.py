@@ -22,7 +22,6 @@ the sidebar.
 
 from __future__ import annotations
 
-import json
 import subprocess
 import uuid
 from collections.abc import Iterator
@@ -30,15 +29,17 @@ from dataclasses import dataclass
 
 import httpx
 import pytest
-from playwright.sync_api import Browser, BrowserContext, Page, expect
+from playwright.sync_api import Browser, Page, expect
 
+from tests._helpers.browser import user_page
+from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import (
     _build_hello_world_bundle,
     _ensure_runner_online,
     _server_state,
 )
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _READONLY_PLACEHOLDER = "You have read-only access to this session"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _BUBBLE = '[data-testid="message-bubble"]'
@@ -46,6 +47,9 @@ _BUBBLE = '[data-testid="message-bubble"]'
 # Permission levels mirrored from omnigent/server/auth.py.
 _LEVEL_READ = 1
 _LEVEL_EDIT = 2
+
+_AGENT_INFO_TRIGGER = '[data-testid="agent-info-trigger"]'
+_OWNER_ROW = '[data-testid="agent-info-session-owner"]'
 
 
 @dataclass
@@ -97,11 +101,7 @@ def shared(
         timeout=30.0,
         limits=no_pool,
     )
-    create_resp = owner.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", _build_hello_world_bundle(), "application/gzip")},
-    )
+    create_resp = post_session_bundle(owner.post, "/v1/sessions", _build_hello_world_bundle())
     create_resp.raise_for_status()
     session_id = create_resp.json()["session_id"]
     owner.patch(
@@ -130,11 +130,6 @@ def shared(
                 respawned_runner.wait(timeout=5)
 
 
-def _user_context(browser: Browser, email: str) -> BrowserContext:
-    """A browser context whose fetch/XHR/SSE requests carry *email*."""
-    return browser.new_context(extra_http_headers={"X-Forwarded-Email": email})
-
-
 def _goto_expecting_snapshot(page: Page, base_url: str, session_id: str) -> int:
     """Navigate to the session and return the snapshot GET's status code.
 
@@ -142,19 +137,22 @@ def _goto_expecting_snapshot(page: Page, base_url: str, session_id: str) -> int:
     assertions deterministic: a 404 means the SPA cannot render a
     composer afterwards, with no settle-time race.
     """
+    request_id = uuid.uuid4().hex
+    page_url = f"{base_url}/c/{session_id}?e2e_snapshot_request={request_id}"
     with page.expect_response(
-        # Match on the path: the chat surface requests the slim snapshot
-        # (?include_items=false&include_liveness=false), so the URL no
-        # longer *ends* with the session id.
+        # A previous document can still have a snapshot in flight when the
+        # next navigation begins. Match the same-origin referrer of this load.
         lambda r: (
             r.url.split("?")[0].endswith(f"/v1/sessions/{session_id}")
             and r.request.method == "GET"
+            and f"e2e_snapshot_request={request_id}" in r.request.headers.get("referer", "")
         )
     ) as resp_info:
-        page.goto(f"{base_url}/c/{session_id}")
+        page.goto(page_url)
     return resp_info.value.status
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=5)
 def test_share_grant_downgrade_revoke_journey(
     browser: Browser,
     live_server: str,
@@ -164,18 +162,17 @@ def test_share_grant_downgrade_revoke_journey(
     marker = f"bob-turn-{uuid.uuid4().hex[:8]}"
     # The owner context is headerless (the ``local`` identity), same
     # as every other e2e_ui browser context.
-    owner_ctx = browser.new_context()
-    bob_ctx = _user_context(browser, shared.bob_email)
-    try:
+    with (
+        user_page(browser, headers={}) as owner_page,
+        user_page(browser, headers={"X-Forwarded-Email": shared.bob_email}) as bob_page,
+    ):
         # ── Pre-grant: Bob has nothing, and is told nothing ──────
-        bob_page = bob_ctx.new_page()
         status = _goto_expecting_snapshot(bob_page, live_server, sid)
         # 404 (not 403): existence must not leak to ungranted users.
         assert status == 404
         expect(bob_page.get_by_placeholder(_COMPOSER)).to_have_count(0)
 
         # ── Grant EDIT; Bob collaborates; owner sees it live ─────
-        owner_page = owner_ctx.new_page()
         assert _goto_expecting_snapshot(owner_page, live_server, sid) == 200
 
         shared.owner.put(
@@ -221,6 +218,67 @@ def test_share_grant_downgrade_revoke_journey(
         assert _goto_expecting_snapshot(bob_page, live_server, sid) == 404
         expect(bob_page.get_by_placeholder(_COMPOSER)).to_have_count(0)
         assert shared.bob.get(f"/v1/sessions/{sid}").status_code == 404
-    finally:
-        owner_ctx.close()
-        bob_ctx.close()
+
+
+def _open_agent_info(page: Page) -> None:
+    """Open the header agent-info popover from a known-closed state.
+
+    Escape first so we re-open from closed rather than toggling shut, mirroring
+    ``agents/test_agent_info_popover.py``. The trigger is desktop-only
+    (``md:inline-flex``), which the e2e viewport satisfies.
+    """
+    page.keyboard.press("Escape")
+    trigger = page.locator(_AGENT_INFO_TRIGGER)
+    expect(trigger).to_be_visible(timeout=30_000)
+    trigger.click()
+
+
+def test_agent_info_popover_shows_session_owner(
+    browser: Browser,
+    live_server: str,
+    shared: _SharedFixture,
+) -> None:
+    """The info popover's Owner row surfaces the session owner per viewer.
+
+    Covers ``components/AgentInfo.tsx`` → ``AgentInfoContent``'s owner row
+    (``GET /v1/sessions/<id>/owner`` via ``useSessionOwner``):
+
+    * a collaborator (Bob, edit) sees the owner **without** the ``(you)`` hint;
+    * the owner (headerless ``local``) sees the same row **with** ``(you)``.
+
+    The expected owner string is read from the API, not hard-coded, so the
+    assertion doesn't bake in the headerless-owner sentinel.
+    """
+    sid = shared.session_id
+    owner_id = shared.owner.get(f"/v1/sessions/{sid}/owner").json()["owner"]
+    # The row only renders for a resolvable owner; a null here would mean
+    # permissions are off in this env (then the feature has nothing to show).
+    assert owner_id, "expected a resolvable session owner"
+    # The headerless browser context resolves to the same identity that owns the
+    # session, so the owner view is the "(you)" case.
+    assert shared.owner.get("/v1/me").json()["user_id"] == owner_id
+
+    # Bob needs at least read to open the session + popover.
+    shared.owner.put(
+        f"/v1/sessions/{sid}/permissions",
+        json={"user_id": shared.bob_email, "level": _LEVEL_EDIT},
+    ).raise_for_status()
+
+    # ── Collaborator (Bob): sees the owner, but not "(you)" ──────────
+    with user_page(browser, headers={"X-Forwarded-Email": shared.bob_email}) as bob_page:
+        bob_page.goto(f"{live_server}/c/{sid}")
+        expect(bob_page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+        _open_agent_info(bob_page)
+        bob_row = bob_page.locator(_OWNER_ROW)
+        expect(bob_row).to_be_visible(timeout=15_000)
+        expect(bob_row).to_contain_text(owner_id)
+        expect(bob_row).not_to_contain_text("(you)")
+
+    # ── Owner (headerless): same row, now with "(you)" ───────────────
+    with user_page(browser, headers={}) as owner_page:
+        owner_page.goto(f"{live_server}/c/{sid}")
+        expect(owner_page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
+        _open_agent_info(owner_page)
+        owner_row = owner_page.locator(_OWNER_ROW)
+        expect(owner_row).to_be_visible(timeout=15_000)
+        expect(owner_row).to_contain_text("(you)")

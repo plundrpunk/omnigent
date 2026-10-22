@@ -9,19 +9,35 @@ from unittest.mock import MagicMock
 
 import pytest
 from alembic import command
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, text
 
 from omnigent.db.utils import (
+    _LAKEBASE_POOL_RECYCLE_SECONDS,
+    _SERVER_POOL_RECYCLE_SECONDS,
     _build_alembic_config,
     _get_current_db_revision,
     _get_head_db_revision,
     _initialize_or_verify_schema,
+    _install_lakebase_token_refresh,
+    _resolve_lakebase_token_provider,
+    _run_migrations,
+    _shared_read_sessions,
+    _translate_missing_driver_error,
+    build_search_snippet,
     builtin_agent_id,
     clear_engine_cache,
     extract_search_text,
     generate_agent_id,
     generate_item_id,
     get_or_create_engine,
+    is_cockroachdb,
+    is_postgresql_family,
+    make_managed_session_maker,
+    normalize_database_url,
+    run_migrations_with_retry,
+    run_write_transaction,
+    set_lakebase_token_provider,
+    shared_read_scope,
     strip_nul_bytes,
 )
 from omnigent.entities.conversation import (
@@ -79,6 +95,305 @@ def test_non_sqlite_engine_has_pool_settings(
     assert captured_kwargs.get("pool_recycle") == 1800
 
 
+def test_cockroachdb_dialect_helpers_and_url() -> None:
+    assert normalize_database_url("cockroachdb://root@host/db") == (
+        "cockroachdb+psycopg://root@host/db"
+    )
+    assert is_cockroachdb("cockroachdb")
+    assert is_postgresql_family("cockroachdb")
+    assert is_postgresql_family("postgresql")
+    assert not is_postgresql_family("mysql")
+
+
+def test_cockroachdb_engine_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.db import utils
+
+    captured: dict[str, Any] = {}
+    mock_engine = MagicMock()
+
+    def capture(uri: str, **kwargs: Any) -> MagicMock:
+        captured["uri"] = uri
+        captured.update(kwargs)
+        return mock_engine
+
+    monkeypatch.setattr(utils, "create_engine", capture)
+    engine = utils._create_engine("cockroachdb://root@host/db")
+
+    assert engine is mock_engine
+    assert captured["uri"] == "cockroachdb+psycopg://root@host/db"
+    assert captured["isolation_level"] == "READ COMMITTED"
+    assert captured["pool_size"] == 200
+    assert captured["max_overflow"] == 20
+    assert captured["pool_timeout"] == 10.0
+
+
+@pytest.mark.parametrize("dialect", ["cockroachdb", "mysql"])
+def test_run_write_transaction_retries_rolled_back_concurrency_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    dialect: str,
+) -> None:
+    from collections.abc import Iterator
+    from contextlib import contextmanager
+
+    from sqlalchemy.exc import DBAPIError
+
+    from omnigent.db import current_query_name, query_name_scope
+
+    class SerializationFailure(Exception):
+        sqlstate = "40001"
+
+    class NamedMaker:
+        def __init__(self) -> None:
+            self.engine = MagicMock()
+            self.engine.dialect.name = dialect
+            self.query_name_prefix = "omnigent.test"
+            self.sessions: list[MagicMock] = []
+
+        @contextmanager
+        def __call__(self, query_name: str) -> Iterator[MagicMock]:
+            session = MagicMock()
+            self.sessions.append(session)
+            with query_name_scope(f"{self.query_name_prefix}.{query_name}"):
+                try:
+                    yield session
+                    session.commit()
+                except Exception:
+                    session.rollback()
+                    raise
+
+    maker = NamedMaker()
+    attempts = 0
+    observed_names: list[str | None] = []
+    retry_metrics: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "omnigent.db.utils.record_transaction_retry",
+        lambda operation, outcome: retry_metrics.append((operation, outcome)),
+    )
+
+    def write(_session: object) -> str:
+        nonlocal attempts
+        attempts += 1
+        observed_names.append(current_query_name())
+        if attempts < 3:
+            raise DBAPIError("statement", {}, SerializationFailure(1213, "deadlock"), False)
+        return "committed"
+
+    sleeps: list[float] = []
+    result = run_write_transaction(
+        maker,
+        "write",
+        write,
+        sleep=sleeps.append,
+        random_value=lambda: 1.0,
+    )
+
+    assert result == "committed"
+    assert attempts == 3
+    assert sleeps == [0.025, 0.05]
+    assert observed_names == ["omnigent.test.write"] * 3
+    assert retry_metrics == [
+        ("omnigent.test.write", "scheduled"),
+        ("omnigent.test.write", "scheduled"),
+    ]
+    assert [session.rollback.call_count for session in maker.sessions] == [1, 1, 0]
+    assert [session.commit.call_count for session in maker.sessions] == [0, 0, 1]
+
+    maker.engine.dialect.name = "postgresql"
+    attempts = 0
+    with pytest.raises(DBAPIError):
+        run_write_transaction(maker, "write", write, sleep=sleeps.append)
+    assert attempts == 1
+
+    class DeadlockFailure(Exception):
+        sqlstate = "40P01"
+
+    maker.engine.dialect.name = "cockroachdb"
+
+    def deadlock(_session: object) -> None:
+        raise DBAPIError("statement", {}, DeadlockFailure(), False)
+
+    session_count = len(maker.sessions)
+    with pytest.raises(DBAPIError):
+        run_write_transaction(maker, "write", deadlock, sleep=sleeps.append)
+    assert len(maker.sessions) == session_count + 1
+
+    def serialization_failure(_session: object) -> None:
+        raise DBAPIError("statement", {}, SerializationFailure(), False)
+
+    with pytest.raises(DBAPIError):
+        run_write_transaction(maker, "exhausted", serialization_failure, max_retries=0)
+    assert retry_metrics[-1] == ("omnigent.test.exhausted", "exhausted")
+
+
+def test_missing_psycopg_translates_to_actionable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A Postgres URI whose driver is uninstalled must surface an actionable
+    install hint, not SQLAlchemy's bare ``No module named 'psycopg'``.
+
+    Simulates the driver being absent by making ``create_engine`` raise the
+    same ``ModuleNotFoundError`` SQLAlchemy raises when it lazily imports the
+    DBAPI. ``_create_engine`` must catch it and re-raise a message that names
+    the install command and the ``omnigent[postgres]`` extra.
+    """
+
+    def _raise_missing_driver(uri: str, **_kwargs: Any) -> MagicMock:
+        raise ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+
+    monkeypatch.setattr("omnigent.db.utils.create_engine", _raise_missing_driver)
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", lambda engine, db_uri: None)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        get_or_create_engine("postgresql+psycopg://user:pass@host:5432/db")
+
+    message = str(excinfo.value)
+    # Names the extra and at least one concrete install command.
+    assert "omnigent[postgres]" in message
+    assert "psycopg[binary]" in message
+    # ``name`` is preserved so callers keying on the missing module still work.
+    assert excinfo.value.name == "psycopg"
+    # The original SQLAlchemy-raised error stays chained for diagnostics.
+    assert excinfo.value.__cause__ is not None
+    # The credentials in the URI must never leak into the surfaced message.
+    assert "user:pass" not in message
+    assert "host:5432" not in message
+
+
+@pytest.mark.parametrize(
+    "db_uri",
+    [
+        # A bare ``postgresql://`` makes SQLAlchemy select the legacy
+        # psycopg2 DBAPI — installing psycopg 3 would not fix it.
+        "postgresql://user:pass@host:5432/db",
+        "postgresql+psycopg2://user:pass@host:5432/db",
+    ],
+)
+def test_missing_psycopg2_guidance_is_dialect_correct(db_uri: str) -> None:
+    """
+    The psycopg2 dialects must NOT be told "install psycopg 3 and retry" —
+    that provably reproduces the same error. The guidance must lead with
+    switching the URI scheme to ``postgresql+psycopg://`` and offer the
+    explicit psycopg2 install as the alternative.
+    """
+    exc = ModuleNotFoundError("No module named 'psycopg2'", name="psycopg2")
+    translated = _translate_missing_driver_error(db_uri, exc)
+
+    assert translated is not exc
+    message = str(translated)
+    assert "postgresql+psycopg://" in message  # the preferred fix: switch dialect
+    assert "psycopg2-binary" in message  # the keep-the-dialect alternative
+    assert translated.name == "psycopg2"
+    assert "user:pass" not in message
+    assert "host:5432" not in message
+
+
+def test_translate_missing_driver_passes_through_unrelated_errors() -> None:
+    """
+    ``_translate_missing_driver_error`` only rewrites a *Postgres driver*
+    import failure. A non-Postgres backend, or a ModuleNotFoundError for some
+    other module, is returned unchanged so real bugs are not masked.
+    """
+    # Non-Postgres backend: return the original untouched.
+    other_backend = ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+    assert _translate_missing_driver_error("sqlite:///x.db", other_backend) is other_backend
+
+    # Postgres backend, but the missing module is something unrelated (e.g. a
+    # transitive import failure) — not the driver, so leave it alone.
+    unrelated = ModuleNotFoundError("No module named 'greenlet'", name="greenlet")
+    assert _translate_missing_driver_error("postgresql+psycopg://u@h/db", unrelated) is unrelated
+
+    # A URI make_url cannot parse must fall back to the scheme split, not
+    # blow up inside error handling.
+    garbage = ModuleNotFoundError("No module named 'psycopg'", name="psycopg")
+    assert _translate_missing_driver_error("not a uri at all", garbage) is garbage
+
+
+def test_paas_postgres_scheme_is_normalized_by_the_engine_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``postgres://`` is not a SQLAlchemy dialect at all, but it never reaches
+    SQLAlchemy: the central engine factory normalizes it to
+    ``postgresql+psycopg://`` (spawn-path parity), so a direct
+    ``--database-uri`` in the PaaS form simply works.
+    """
+    from omnigent.db import utils
+
+    captured: dict[str, Any] = {}
+
+    def capture(uri: str, **kwargs: Any) -> MagicMock:
+        captured["uri"] = uri
+        return MagicMock()
+
+    monkeypatch.setattr(utils, "create_engine", capture)
+    utils._create_engine("postgres://user:secret@host:5432/db")
+
+    assert captured["uri"] == "postgresql+psycopg://user:secret@host:5432/db"
+
+
+def test_unnormalizable_postgres_scheme_gets_conversion_guidance() -> None:
+    """
+    A Postgres-family scheme the factory cannot normalize still fails with an
+    opaque ``NoSuchModuleError`` *before* any driver import. The engine
+    factory must append conversion guidance pointing at
+    ``postgresql+psycopg://``. Credentials must not leak.
+    """
+    from sqlalchemy.exc import NoSuchModuleError
+
+    from omnigent.db import utils
+
+    with pytest.raises(NoSuchModuleError) as excinfo:
+        utils._create_engine("postgres+asyncpg://user:secret@host:5432/db")
+
+    message = str(excinfo.value)
+    assert "postgresql+psycopg://" in message
+    assert "omnigent[postgres]" in message
+    assert "secret" not in message
+    assert excinfo.value.__cause__ is not None  # original plugin error chained
+
+
+def test_non_postgres_dialect_error_passes_through() -> None:
+    """
+    A bogus non-Postgres scheme must re-raise SQLAlchemy's original
+    ``NoSuchModuleError`` untouched — the Postgres guidance would only
+    mislead there.
+    """
+    from sqlalchemy.exc import NoSuchModuleError
+
+    from omnigent.db import utils
+
+    with pytest.raises(NoSuchModuleError) as excinfo:
+        utils._create_engine("bogusdb://user@host/db")
+
+    assert "postgresql+psycopg" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is None  # bare re-raise, nothing stamped
+
+
+def test_unrelated_import_error_reraises_without_self_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The pass-through path must use a bare ``raise``: the surfaced exception is
+    the original object with ``__cause__`` untouched. A ``raise exc from exc``
+    would stamp a self-referential ``__cause__`` and confuse diagnostics
+    integrations even though traceback rendering survives via cycle detection.
+    """
+    original = ModuleNotFoundError("No module named 'greenlet'", name="greenlet")
+
+    def _raise_unrelated(uri: str, **_kwargs: Any) -> MagicMock:
+        raise original
+
+    monkeypatch.setattr("omnigent.db.utils.create_engine", _raise_unrelated)
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", lambda engine, db_uri: None)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        get_or_create_engine("postgresql+psycopg://u@h/db")
+
+    assert excinfo.value is original
+    assert excinfo.value.__cause__ is None
+
+
 def test_sqlite_engine_skips_server_pool_settings_and_enables_wal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -130,6 +445,193 @@ def test_sqlite_engine_skips_server_pool_settings_and_enables_wal(
         assert conn.exec_driver_sql("PRAGMA synchronous").scalar() == 1
 
 
+# ── Lakebase token-aware engine ─────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _clear_lakebase_override() -> Any:
+    """Ensure the process-wide token provider override never leaks across
+    tests (it is module-global state). Clears before and after each test."""
+    from omnigent.db.utils import set_lakebase_token_provider as _set
+
+    _set(None)
+    yield
+    _set(None)
+
+
+@pytest.mark.databricks
+def test_static_postgres_uri_path_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    (a) Backward compatibility: with no Lakebase config, a Postgres engine is
+    created exactly as before — no token provider resolves, the standard
+    30-minute recycle window is used, and no ``do_connect`` token listener is
+    attached. A regression here would mean the opt-in path leaked into the
+    default static-password Postgres deploy.
+    """
+    from omnigent.db import utils
+
+    # No override installed (autouse fixture) and no env var → no token path.
+    monkeypatch.delenv("OMNIGENT_LAKEBASE_INSTANCE", raising=False)
+    assert _resolve_lakebase_token_provider() is None
+
+    engine = utils._create_engine("postgresql+psycopg://user:pass@host:5432/db")
+    try:
+        # Standard (non-Lakebase) recycle window, unchanged from before.
+        assert engine.pool._recycle == _SERVER_POOL_RECYCLE_SECONDS == 1800
+
+        # Positively assert NO ``do_connect`` listener is registered at all on
+        # the static-password engine. The token-refresh path is the only thing
+        # in this module that attaches a ``do_connect`` listener (see
+        # :func:`_install_lakebase_token_refresh`), so an empty listener set
+        # proves it did not run. Enumerating the engine's actual registered
+        # listeners (rather than checking ``event.contains`` for some specific
+        # function we happen to know about) means a regression that *always*
+        # installs the listener — under any function name — fails this test.
+        registered = list(engine.dialect.dispatch.do_connect)
+        assert registered == [], (
+            "static-password Postgres engine must carry no do_connect "
+            f"token-refresh listener, found: {registered!r}"
+        )
+
+        # Cross-check with the real install helper: had it run on this engine,
+        # the listener it installs would be present. Confirm it is absent.
+        from sqlalchemy import event
+
+        installed = _install_lakebase_token_refresh(engine, lambda: "tok")
+        assert event.contains(engine, "do_connect", installed)
+        # And before that install, the count was zero (asserted above); after
+        # it, exactly one — proving the enumeration above is sensitive to a
+        # real listener rather than vacuously empty.
+        assert len(list(engine.dialect.dispatch.do_connect)) == 1
+    finally:
+        engine.dispose()
+
+
+def test_resolve_token_provider_env_and_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    The provider resolves from ``OMNIGENT_LAKEBASE_INSTANCE`` when set, and an
+    explicit override installed via :func:`set_lakebase_token_provider` takes
+    precedence over the env var.
+    """
+    # Env var unset → no provider.
+    monkeypatch.delenv("OMNIGENT_LAKEBASE_INSTANCE", raising=False)
+    assert _resolve_lakebase_token_provider() is None
+
+    # Env var set → a provider resolves (the SDK-backed lambda).
+    monkeypatch.setenv("OMNIGENT_LAKEBASE_INSTANCE", "omnigent-db")
+    assert callable(_resolve_lakebase_token_provider())
+
+    # Explicit override wins over the env var.
+    sentinel: LakebaseSentinel = LakebaseSentinel()
+    set_lakebase_token_provider(sentinel)
+    assert _resolve_lakebase_token_provider() is sentinel
+
+
+class LakebaseSentinel:
+    """A trivial provider used to assert override identity/precedence."""
+
+    def __call__(self) -> str:
+        return "sentinel-token"
+
+
+@pytest.mark.databricks
+def test_token_callback_invoked_per_connection() -> None:
+    """
+    (b) The ``do_connect`` listener calls the token provider once per new
+    connection and overwrites the password connection parameter with the fresh
+    token. ``do_connect`` fires once per *new* DBAPI connection, so calling the
+    registered listener N times models N new connections — each must re-mint.
+    """
+    calls: list[int] = []
+
+    def _provider() -> str:
+        calls.append(1)
+        return f"token-{len(calls)}"
+
+    engine = create_engine("postgresql+psycopg://user@host:5432/db")
+    try:
+        listener = _install_lakebase_token_refresh(engine, _provider)
+
+        # The listener is actually wired onto the engine's do_connect event.
+        from sqlalchemy import event
+
+        assert event.contains(engine, "do_connect", listener)
+
+        # Simulate two new connections: each re-mints a fresh token.
+        first: dict[str, object] = {}
+        second: dict[str, object] = {}
+        listener(None, None, [], first)
+        listener(None, None, [], second)
+
+        assert len(calls) == 2, "token must be re-minted per new connection"
+        assert first["password"] == "token-1"
+        assert second["password"] == "token-2"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.databricks
+def test_create_engine_wires_token_refresh_and_short_recycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    (b)+(c) With a token provider active, ``_create_engine`` lowers
+    ``pool_recycle`` to the Lakebase window and installs the token-refresh
+    listener (verified by spying on the install helper to confirm it receives
+    the resolved provider).
+    """
+    from omnigent.db import utils
+
+    def _override() -> str:
+        return "live-token"
+
+    set_lakebase_token_provider(_override)
+
+    installed: dict[str, object] = {}
+    real_install = utils._install_lakebase_token_refresh
+
+    def _spy_install(engine: object, provider: object) -> object:
+        installed["engine"] = engine
+        installed["provider"] = provider
+        return real_install(engine, provider)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(utils, "_install_lakebase_token_refresh", _spy_install)
+
+    engine = utils._create_engine("postgresql+psycopg://user@host:5432/db")
+    try:
+        # Shorter recycle so connections (and their tokens) refresh ahead of
+        # the ~1h OAuth expiry.
+        assert engine.pool._recycle == _LAKEBASE_POOL_RECYCLE_SECONDS == 600
+        # The refresh listener was installed with the resolved provider.
+        assert installed["provider"] is _override
+        assert installed["engine"] is engine
+    finally:
+        engine.dispose()
+
+
+def test_build_alembic_config_preserves_percent_encoded_database_url() -> None:
+    """Alembic accepts URL-encoded credentials without changing the URL."""
+    uri = "postgresql+psycopg://user:p%40ss%25word@db.example.com:5432/app"
+
+    config = _build_alembic_config(uri)
+
+    assert config.get_main_option("sqlalchemy.url") == uri
+
+
+def test_alembic_env_override_preserves_percent_encoded_database_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The environment override survives Alembic's ConfigParser boundary."""
+    uri = f"sqlite:///{tmp_path / 'override%25.db'}"
+    config = _build_alembic_config("sqlite:///:memory:")
+    monkeypatch.setenv("OMNIGENT_DB_URL", uri)
+
+    command.upgrade(config, "head")
+
+    assert config.get_main_option("sqlalchemy.url") == uri
+
+
 # ── _initialize_or_verify_schema ────────────────────────
 
 
@@ -152,6 +654,24 @@ def _make_db_at_revision(db_path: Path, revision: str) -> str:
         with engine.begin() as conn:
             config.attributes["connection"] = conn
             command.upgrade(config, revision)
+    finally:
+        engine.dispose()
+    return uri
+
+
+def _make_db_at_unknown_revision(db_path: Path, revision: str) -> str:
+    """Build a SQLite database stamped beyond this build's migration map."""
+    uri = f"sqlite:///{db_path}"
+    engine = create_engine(uri)
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(
+                "CREATE TABLE alembic_version (version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+            )
+            conn.exec_driver_sql(
+                "INSERT INTO alembic_version (version_num) VALUES (?)",
+                (revision,),
+            )
     finally:
         engine.dispose()
     return uri
@@ -290,29 +810,86 @@ def test_initialize_or_verify_schema_reports_manual_retry_when_auto_migration_fa
     )
 
 
+def test_initialize_or_verify_schema_reports_database_from_newer_build(
+    tmp_path: Path,
+) -> None:
+    """An unknown DB revision means this build is too old, not that the DB is stale."""
+    future_revision = "deadbeef1234"
+    uri = _make_db_at_unknown_revision(tmp_path / "newer.db", future_revision)
+    head = _get_head_db_revision(uri)
+
+    engine = create_engine(uri)
+    try:
+        with pytest.raises(RuntimeError, match="newer") as exc_info:
+            _initialize_or_verify_schema(engine, uri)
+    finally:
+        engine.dispose()
+
+    msg = str(exc_info.value)
+    assert future_revision in msg
+    assert head in msg
+    assert "out of date" not in msg.lower()
+    assert "db-upgrade" not in msg
+
+
+def test_initialize_or_verify_schema_does_not_migrate_database_from_newer_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup must leave a database from a newer build untouched."""
+    uri = _make_db_at_unknown_revision(tmp_path / "newer.db", "deadbeef1234")
+    run_migrations = MagicMock()
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", run_migrations)
+
+    engine = create_engine(uri)
+    try:
+        with pytest.raises(RuntimeError, match="newer"):
+            _initialize_or_verify_schema(engine, uri)
+    finally:
+        engine.dispose()
+
+    run_migrations.assert_not_called()
+
+
+def test_run_migrations_reports_database_from_newer_build(tmp_path: Path) -> None:
+    """The manual db-upgrade path must replace Alembic's CommandError."""
+    future_revision = "deadbeef1234"
+    uri = _make_db_at_unknown_revision(tmp_path / "newer.db", future_revision)
+
+    engine = create_engine(uri)
+    try:
+        with pytest.raises(RuntimeError, match="newer") as exc_info:
+            _run_migrations(engine, uri)
+        assert _get_current_db_revision(engine) == future_revision
+    finally:
+        engine.dispose()
+
+    assert "Can't locate revision" not in str(exc_info.value)
+
+
 # ── slash_command persistence path ────────────────────
 
 
 def test_generate_item_id_supports_slash_command() -> None:
     """Append path raises ``ValueError`` here if the prefix is missing."""
     item_id = generate_item_id("slash_command")
-    assert item_id.startswith("sc_")
+    assert re.fullmatch(r"[0-9a-f]{32}", item_id)
 
 
 def test_generate_item_id_supports_error_item() -> None:
-    """Append path raises ``ValueError`` here if the error prefix is missing."""
+    """``generate_item_id`` raises ``ValueError`` here if ``error`` is unknown."""
     item_id = generate_item_id("error")
-    assert item_id.startswith("err_")
+    assert re.fullmatch(r"[0-9a-f]{32}", item_id)
 
 
 def test_generate_item_id_supports_resource_event() -> None:
     """Regression: ``resource_event`` (terminal launch/close lifecycle) was
     registered in the read-path map (``ITEM_TYPE_TO_DATA_CLS``) but missing
-    from ``_ITEM_TYPE_PREFIX``, so every such item failed ``generate_item_id``
+    from ``_ITEM_TYPES``, so every such item failed ``generate_item_id``
     with 'unknown item type' and never persisted (relay-persist traceback flood
     on every terminal launch/close)."""
     item_id = generate_item_id("resource_event")
-    assert item_id.startswith("rse_")
+    assert re.fullmatch(r"[0-9a-f]{32}", item_id)
 
 
 def test_item_type_id_and_data_registries_cover_the_same_types() -> None:
@@ -325,13 +902,13 @@ def test_item_type_id_and_data_registries_cover_the_same_types() -> None:
     loud unit-test failure instead of a per-item production traceback — exactly
     how ``resource_event`` slipped through (added to the data map, forgotten in
     the id map)."""
-    from omnigent.db.utils import _ITEM_TYPE_PREFIX
+    from omnigent.db.utils import _ITEM_TYPES
     from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
 
-    assert set(_ITEM_TYPE_PREFIX) == set(ITEM_TYPE_TO_DATA_CLS), (
+    assert set(_ITEM_TYPES) == set(ITEM_TYPE_TO_DATA_CLS), (
         "item-type registries diverged — "
-        f"only in id/write path: {set(_ITEM_TYPE_PREFIX) - set(ITEM_TYPE_TO_DATA_CLS)}; "
-        f"only in data/read path: {set(ITEM_TYPE_TO_DATA_CLS) - set(_ITEM_TYPE_PREFIX)}"
+        f"only in id/write path: {set(_ITEM_TYPES) - set(ITEM_TYPE_TO_DATA_CLS)}; "
+        f"only in data/read path: {set(ITEM_TYPE_TO_DATA_CLS) - set(_ITEM_TYPES)}"
     )
 
 
@@ -342,11 +919,11 @@ def test_builtin_agent_id_is_deterministic_and_name_specific() -> None:
 
 
 def test_builtin_agent_id_matches_generated_id_shape_and_length() -> None:
-    """Pins both to ``ag_`` + 32 hex (35 chars) so a built-in id stays
+    """Pins both to a bare 32-char hex id so a built-in id stays
     indistinguishable from a generated one and the two can't diverge in length."""
     built_in = builtin_agent_id("nessie")
-    assert re.fullmatch(r"ag_[0-9a-f]{32}", built_in)
-    assert len(built_in) == len(generate_agent_id()) == 35
+    assert re.fullmatch(r"[0-9a-f]{32}", built_in)
+    assert len(built_in) == len(generate_agent_id()) == 32
 
 
 def test_extract_search_text_for_slash_command_with_output() -> None:
@@ -402,7 +979,7 @@ def test_extract_search_text_for_resource_event_item() -> None:
     """Runner resource replay persists cleanly and indexes stable ids."""
     item = NewConversationItem(
         type="resource_event",
-        response_id="conv_1",
+        response_id="8e32600337d08f59ad381caf96a90659",
         data=ResourceEventData(
             event_type="session.resource.created",
             resource_id="resource_codex_conv_1",
@@ -480,3 +1057,389 @@ def test_strip_nul_bytes(value: str, expected: str) -> None:
     assert strip_nul_bytes(value) == expected
     # The result must never contain a raw NUL, regardless of input.
     assert "\x00" not in strip_nul_bytes(value)
+
+
+def test_extract_search_text_routing_decision() -> None:
+    """routing_decision items must index (model + rationale) — an
+    unregistered type raises in the store's append path, which silently
+    dropped every verdict chip on persistence (the relay swallows it)."""
+    item = NewConversationItem.model_validate(
+        {
+            "type": "routing_decision",
+            "response_id": "resp_x",
+            "data": {
+                "model": "databricks-claude-opus-4-8",
+                "applied": True,
+                "rationale": "Deep design work.",
+            },
+        }
+    )
+    assert extract_search_text(item) == "databricks-claude-opus-4-8 Deep design work."
+
+
+def test_build_search_snippet_short_text_returned_whole() -> None:
+    """A match within a short line yields the whole (collapsed) line, no ellipsis."""
+    assert (
+        build_search_snippet("Hello what model are you using?", "what")
+        == "Hello what model are you using?"
+    )
+
+
+def test_build_search_snippet_is_case_insensitive() -> None:
+    """Matching mirrors the store's case-insensitive LIKE filter."""
+    assert build_search_snippet("Deploy the SERVICE now", "service") is not None
+
+
+def test_build_search_snippet_windows_long_text_with_ellipses() -> None:
+    """A match buried in long text is windowed with … on both elided ends."""
+    text = "a" * 200 + " deploy error " + "b" * 200
+    snippet = build_search_snippet(text, "deploy error")
+    assert snippet is not None
+    assert "deploy error" in snippet
+    assert snippet.startswith("…") and snippet.endswith("…")
+    # Kept short enough for a single UI row.
+    assert len(snippet) <= 160 + 2
+
+
+def test_build_search_snippet_collapses_whitespace() -> None:
+    """Multi-line / repeated whitespace collapses so the snippet is one clean line."""
+    snippet = build_search_snippet("line one\n\n   line two matches here", "matches")
+    assert snippet == "line one line two matches here"
+
+
+def test_build_search_snippet_never_clamps_out_the_match() -> None:
+    """A query term longer than max_len still appears in the snippet.
+
+    The length cap must not truncate the window before the matched span
+    ends — otherwise the UI would have nothing to highlight.
+    """
+    term = "x" * 300
+    snippet = build_search_snippet(f"prefix {term} suffix", term)
+    assert snippet is not None
+    assert term in snippet
+
+
+def test_build_search_snippet_no_match_returns_none() -> None:
+    """No occurrence (or empty query) yields None so the caller shows no preview."""
+    assert build_search_snippet("no match here", "xyz") is None
+    assert build_search_snippet("anything", "") is None
+
+
+# ── shared_read_scope (collapse read checkouts) ─────────
+
+
+def _count_checkouts(engine: Any) -> tuple[list[int], Any]:
+    """Attach a pool-checkout counter to ``engine``.
+
+    :returns: ``(count_list, detach)`` — append-per-checkout list plus a
+        zero-arg callable that removes the listener.
+    """
+    count: list[int] = []
+
+    def _on_checkout(_dbapi: Any, _record: Any, _proxy: Any) -> None:
+        count.append(1)
+
+    event.listen(engine, "checkout", _on_checkout)
+    return count, lambda: event.remove(engine, "checkout", _on_checkout)
+
+
+def test_shared_read_scope_reuses_one_session_per_engine(db_uri: str) -> None:
+    """Inside the scope, every ``managed_session()`` on an engine is the same
+    Session; outside it, each call yields a fresh one."""
+    engine = get_or_create_engine(db_uri)
+    maker = make_managed_session_maker(engine)
+
+    with shared_read_scope():
+        with maker() as s1, maker() as s2:
+            assert s1 is s2, "reads in a scope must share one session"
+
+    with maker() as a:
+        pass
+    with maker() as b:
+        assert a is not b, "without a scope each call opens its own session"
+
+
+def test_shared_read_scope_collapses_checkouts(db_uri: str) -> None:
+    """N back-to-back reads cost one pool checkout in a scope, N without."""
+    engine = get_or_create_engine(db_uri)
+    maker = make_managed_session_maker(engine)
+    count, detach = _count_checkouts(engine)
+    try:
+        with shared_read_scope():
+            for _ in range(3):
+                with maker() as session:
+                    session.execute(text("SELECT 1"))
+        assert len(count) == 1, f"a scope must share one checkout, got {len(count)}"
+
+        count.clear()
+        for _ in range(3):
+            with maker() as session:
+                session.execute(text("SELECT 1"))
+        assert len(count) == 3, f"without a scope each read checks out, got {len(count)}"
+    finally:
+        detach()
+
+
+def test_shared_read_scope_is_noop_outside(db_uri: str) -> None:
+    """With no active scope the context var is unset and behaviour is unchanged."""
+    assert _shared_read_sessions.get() is None
+    engine = get_or_create_engine(db_uri)
+    maker = make_managed_session_maker(engine)
+    with maker() as session:
+        session.execute(text("SELECT 1"))
+    assert _shared_read_sessions.get() is None
+
+
+def test_shared_read_scope_write_maker_bypasses_reuse(db_uri: str) -> None:
+    """A write maker (``immediate=True``) keeps its own session even in a scope,
+    so it never loses its ``BEGIN IMMEDIATE`` write isolation."""
+    engine = get_or_create_engine(db_uri)
+    read_maker = make_managed_session_maker(engine)
+    write_maker = make_managed_session_maker(engine, immediate=True)
+
+    with shared_read_scope():
+        with read_maker() as r1:
+            pass
+        with write_maker() as w1:
+            assert w1 is not r1, "write makers must not join the read scope"
+        with read_maker() as r2:
+            assert r2 is r1, "read makers still reuse the scope's session"
+
+
+def test_shared_read_scope_distinct_engines_get_distinct_sessions(
+    db_uri: str, tmp_path: Path
+) -> None:
+    """Each engine gets its own reused session (split-DB stays correct)."""
+    engine_a = get_or_create_engine(db_uri)
+    engine_b = get_or_create_engine(f"sqlite:///{tmp_path / 'other.db'}")
+    maker_a = make_managed_session_maker(engine_a)
+    maker_b = make_managed_session_maker(engine_b)
+
+    with shared_read_scope():
+        with maker_a() as sa, maker_b() as sb:
+            assert sa is not sb, "distinct engines must not share a session"
+        with maker_a() as sa2:
+            assert sa2 is sa, "same engine reuses within the scope"
+
+
+def test_shared_read_scope_cleans_up_on_error(db_uri: str) -> None:
+    """An exception rolls the scope back and always resets the context var."""
+    engine = get_or_create_engine(db_uri)
+    maker = make_managed_session_maker(engine)
+
+    # An explicit try/except (rather than pytest.raises) keeps the post-scope
+    # assertions on a control-flow path static analysers can see as reachable.
+    raised = False
+    try:
+        with shared_read_scope():
+            with maker() as session:
+                session.execute(text("SELECT 1"))
+            raise RuntimeError("boom")
+    except RuntimeError:
+        raised = True
+
+    assert raised, "the scope must propagate the exception"
+    assert _shared_read_sessions.get() is None, "the scope must reset its context var"
+
+
+def test_shared_read_scope_nesting_reuses_outer(db_uri: str) -> None:
+    """A nested scope defers to the outer one rather than opening a second layer."""
+    engine = get_or_create_engine(db_uri)
+    maker = make_managed_session_maker(engine)
+    with shared_read_scope():
+        with maker() as outer:
+            pass
+        with shared_read_scope():
+            with maker() as inner:
+                assert inner is outer, "nested scope reuses the outer session"
+
+
+def test_shared_read_scope_closes_session_when_init_fails(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure while initializing the scope's session must not leak its
+    checked-out connection — the session is registered before the PRAGMAs run,
+    so the scope's cleanup closes it and the pool checkout is returned."""
+    from sqlalchemy.orm import Session as _Session
+
+    engine = get_or_create_engine(db_uri)
+    if engine.dialect.name != "sqlite":
+        # The init-time checkout this guards against is the SQLite PRAGMA path;
+        # other dialects run no execute between session creation and registration.
+        pytest.skip("exercises the SQLite-only PRAGMA-init checkout path")
+    maker = make_managed_session_maker(engine)
+
+    counts = {"out": 0, "in": 0}
+
+    def _out(*_a: Any) -> None:
+        counts["out"] += 1
+
+    def _in(*_a: Any) -> None:
+        counts["in"] += 1
+
+    event.listen(engine, "checkout", _out)
+    event.listen(engine, "checkin", _in)
+
+    real_execute = _Session.execute
+
+    def _boom(self: _Session, statement: Any, *args: Any, **kwargs: Any) -> Any:
+        # Fail the second PRAGMA — the first has already forced the checkout.
+        if "busy_timeout" in str(statement):
+            raise RuntimeError("simulated PRAGMA failure")
+        return real_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(_Session, "execute", _boom)
+
+    try:
+        with pytest.raises(RuntimeError, match="simulated PRAGMA failure"):
+            with shared_read_scope():
+                with maker():
+                    pass
+    finally:
+        event.remove(engine, "checkout", _out)
+        event.remove(engine, "checkin", _in)
+
+    assert counts["out"] >= 1, "the test must actually force a pool checkout"
+    assert counts["out"] == counts["in"], (
+        f"a session that failed mid-init leaked its checkout: {counts}"
+    )
+
+
+# ── run_migrations_with_retry (cold-start resilience) ──────────────
+
+
+def _operational_error(msg: str = "the database system is starting up") -> Any:
+    """Build an OperationalError shaped like a cold-managed-DB failure."""
+    from sqlalchemy.exc import OperationalError
+
+    return OperationalError(statement=None, params=None, orig=Exception(msg))
+
+
+def test_run_migrations_with_retry_succeeds_first_try(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A healthy DB migrates on the first attempt with no sleeping."""
+    engine = MagicMock()
+    calls: dict[str, int] = {"migrate": 0}
+
+    def _migrate(_engine: Any, _uri: str) -> None:
+        calls["migrate"] += 1
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _migrate)
+    slept: list[float] = []
+
+    run_migrations_with_retry(
+        "postgresql://x",
+        engine_factory=lambda _uri: engine,
+        sleep=slept.append,
+    )
+
+    assert calls["migrate"] == 1
+    assert slept == []
+    # The engine is always disposed, even on the happy path.
+    engine.dispose.assert_called_once()
+
+
+def test_run_migrations_with_retry_recovers_after_cold_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transient OperationalErrors are retried until one attempt succeeds.
+
+    Each attempt must use a FRESH engine (a poisoned pool from a failed
+    connect is never reused), and every engine created must be disposed.
+    """
+    engines: list[MagicMock] = []
+
+    def _factory(_uri: str) -> MagicMock:
+        e = MagicMock(name=f"engine{len(engines)}")
+        engines.append(e)
+        return e
+
+    attempts: dict[str, int] = {"n": 0}
+
+    def _migrate(_engine: Any, _uri: str) -> None:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise _operational_error()
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _migrate)
+    slept: list[float] = []
+
+    run_migrations_with_retry(
+        "postgresql://x",
+        backoff_seconds=2.0,
+        engine_factory=_factory,
+        sleep=slept.append,
+    )
+
+    assert attempts["n"] == 3
+    # A distinct engine per attempt, each disposed exactly once.
+    assert len(engines) == 3
+    for e in engines:
+        e.dispose.assert_called_once()
+    # Linear backoff between the two failed attempts: 2.0*1, 2.0*2.
+    assert slept == [2.0, 4.0]
+
+
+def test_run_migrations_with_retry_raises_after_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A DB that never comes up fails loudly after max_attempts."""
+    from sqlalchemy.exc import OperationalError
+
+    def _always_cold(_engine: Any, _uri: str) -> None:
+        raise _operational_error()
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _always_cold)
+    engines: list[MagicMock] = []
+    slept: list[float] = []
+
+    def _factory(_uri: str) -> MagicMock:
+        e = MagicMock()
+        engines.append(e)
+        return e
+
+    with pytest.raises(OperationalError):
+        run_migrations_with_retry(
+            "postgresql://x",
+            max_attempts=3,
+            backoff_seconds=1.0,
+            engine_factory=_factory,
+            sleep=slept.append,
+        )
+
+    assert len(engines) == 3
+    for e in engines:
+        e.dispose.assert_called_once()
+    # No sleep after the final (raising) attempt.
+    assert slept == [1.0, 2.0]
+
+
+def test_run_migrations_with_retry_propagates_non_operational_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real migration/schema error is NOT retried — it surfaces at once."""
+
+    def _bad_migration(_engine: Any, _uri: str) -> None:
+        raise ValueError("bad revision")
+
+    monkeypatch.setattr("omnigent.db.utils._run_migrations", _bad_migration)
+    engine = MagicMock()
+    slept: list[float] = []
+
+    with pytest.raises(ValueError, match="bad revision"):
+        run_migrations_with_retry(
+            "postgresql://x",
+            engine_factory=lambda _uri: engine,
+            sleep=slept.append,
+        )
+
+    # Failed on the first attempt without retrying, but still disposed.
+    assert slept == []
+    engine.dispose.assert_called_once()
+
+
+def test_run_migrations_with_retry_rejects_bad_max_attempts() -> None:
+    """max_attempts < 1 is a programming error, not a runtime retry."""
+    with pytest.raises(ValueError, match="max_attempts"):
+        run_migrations_with_retry("postgresql://x", max_attempts=0)

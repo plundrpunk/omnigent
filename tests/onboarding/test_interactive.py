@@ -1,15 +1,15 @@
 """Tests for the shared onboarding interactive selectors.
 
 :mod:`omnigent.onboarding.interactive` provides the theme-picker-styled
-``select`` arrow-key menu and the ``prompt_text`` text input. The
-raw-termios TTY path cannot be exercised in a headless test runner (no
-controlling terminal), so these tests cover the **non-TTY numbered
-fallback** — the path pipes, CI, and the CLI test suite actually hit.
-
-Each test forces a non-TTY by monkeypatching ``sys.stdin.isatty`` to
-``False`` and feeds input via ``click``'s isolated input stream, then
-asserts on the returned index / string so a regression in the fallback
+``select`` arrow-key menu and the ``prompt_text`` text input. Most tests
+here cover the **non-TTY numbered fallback** — the path pipes, CI, and the
+CLI test suite actually hit — by monkeypatching ``sys.stdin.isatty`` to
+``False`` and feeding input via ``click``'s isolated input stream, then
+asserting on the returned index / string so a regression in the fallback
 parsing surfaces here.
+
+The raw-termios TTY path has no controlling terminal in a headless runner,
+so the tests that need one stand up a pty (see :func:`_select_over_pty`).
 """
 
 from __future__ import annotations
@@ -91,6 +91,19 @@ def test_select_fallback_returns_chosen_index(
     out = capsys.readouterr().out
     assert "1. alpha" in out
     assert "2. beta" in out
+
+
+def test_select_uses_numbered_fallback_on_windows_tty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TTY selection still works on Windows, where raw-termios menus are unavailable."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(interactive, "IS_WINDOWS", True)
+    _feed(monkeypatch, ["2"])
+
+    result = interactive.select("Pick one", ["alpha", "beta"])
+
+    assert result == 1
 
 
 def test_select_fallback_reprompts_on_invalid_then_accepts(
@@ -358,3 +371,256 @@ def test_clear_screen_emits_clear_sequence_only_on_a_tty(monkeypatch: pytest.Mon
     monkeypatch.setattr(sys, "stdout", pipe)
     interactive.clear_screen()
     assert pipe.getvalue() == ""  # no escape sequences leak into non-TTY output
+
+
+def test_render_menu_windows_long_list_to_viewport() -> None:
+    """``max_visible`` renders only the window slice + scroll markers."""
+    options = [f"item-{i}" for i in range(20)]
+    out = interactive._render_menu(
+        "Pick",
+        options,
+        10,
+        descriptions=None,
+        width=80,
+        selectable=[True] * 20,
+        max_visible=5,
+        window_start=8,
+    )
+    # Visible window is options[8:13]; rows outside it are not rendered.
+    for shown in ("item-8", "item-10", "item-12"):
+        assert shown in out
+    assert "item-0" not in out
+    assert "item-19" not in out
+    assert "8 more" in out and "7 more" in out  # ↑/↓ scroll markers
+
+
+def test_render_menu_without_max_visible_renders_all_rows() -> None:
+    """Default (no ``max_visible``) renders every row — no regression."""
+    options = [f"item-{i}" for i in range(20)]
+    out = interactive._render_menu(
+        "Pick", options, 0, descriptions=None, width=80, selectable=[True] * 20
+    )
+    assert "item-0" in out and "item-19" in out
+    assert "more" not in out
+
+
+def test_render_menu_compact_uses_top_level_footer_and_no_title_gap() -> None:
+    """Compact menus hug the title to the list and say Esc exits.
+
+    ``omnigent setup`` uses this for the top-level harness overview: there is
+    no blank spacer below the title, and the footer must read as a compact
+    top-level action (``Esc exit``), not the nested-menu ``Esc back`` copy.
+    """
+    import re
+
+    out = interactive._render_menu(
+        "Configure harnesses",
+        ["Claude    ✓ Subscription", "Quit"],
+        0,
+        descriptions=["", ""],
+        width=80,
+        selectable=[True, True],
+        compact=True,
+    )
+
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    lines = plain.splitlines()
+    title_index = next(i for i, line in enumerate(lines) if "Configure harnesses" in line)
+    assert "❯  Claude" in lines[title_index + 1]
+    assert "↑/↓ nav" in plain
+    assert "Esc exit" in plain
+    assert "Esc back" not in plain
+
+
+def test_render_menu_default_keeps_nested_footer_and_title_gap() -> None:
+    """Non-compact menus keep the older nested-picker spacing and footer copy."""
+    import re
+
+    out = interactive._render_menu(
+        "Pick",
+        ["alpha", "beta"],
+        0,
+        descriptions=["", ""],
+        width=80,
+        selectable=[True, True],
+    )
+
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    lines = plain.splitlines()
+    title_index = next(i for i, line in enumerate(lines) if "Pick" in line)
+    assert lines[title_index + 1] == ""
+    assert "❯  alpha" in lines[title_index + 2]
+    assert "↑/↓ move" in plain
+    assert "Esc back" in plain
+    assert "Esc exit" not in plain
+
+
+def test_render_menu_compact_truncates_long_description_to_one_line() -> None:
+    """Compact selected-row hints stay one physical line on narrow terminals."""
+    import re
+
+    out = interactive._render_menu(
+        "Configure harnesses",
+        ["Hermes    ✗ Not installed", "Quit"],
+        0,
+        descriptions=[
+            "Install with `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`",
+            "",
+        ],
+        width=40,
+        selectable=[True, True],
+        compact=True,
+    )
+
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", out)
+    hint_lines = [line for line in plain.splitlines() if "Install with" in line]
+    assert len(hint_lines) == 1
+    assert "…" in hint_lines[0]
+    assert len(hint_lines[0]) <= 40
+
+
+# ---------------------------------------------------------------------------
+# _count_terminal_lines
+# ---------------------------------------------------------------------------
+
+
+def test_count_terminal_lines_no_wrap() -> None:
+    """Short lines count as one row each; no wrapping."""
+    rendered = "foo\nbar\nbaz\n"
+    assert interactive._count_terminal_lines(rendered, width=80) == 3
+
+
+def test_count_terminal_lines_wraps_long_line() -> None:
+    """A line longer than *width* cells counts as two rows."""
+    # 'a' * 100 is 100 cells wide; at width=80 it wraps to 2 rows.
+    rendered = "a" * 100 + "\n"
+    assert interactive._count_terminal_lines(rendered, width=80) == 2
+
+
+def test_count_terminal_lines_exactly_full_width() -> None:
+    """A line exactly *width* cells wide does not wrap."""
+    rendered = "a" * 80 + "\n"
+    assert interactive._count_terminal_lines(rendered, width=80) == 1
+
+
+def test_count_terminal_lines_ansi_stripped() -> None:
+    """ANSI escape sequences are not counted as display cells."""
+    # Bold red 'hello' — escape sequences add bytes but no display cells.
+    rendered = "\x1b[1;31mhello\x1b[0m\n"
+    assert interactive._count_terminal_lines(rendered, width=80) == 1
+
+
+def test_count_terminal_lines_matches_naive_for_short_content() -> None:
+    """For content that never wraps, result equals the newline count."""
+    rendered = "line one\nline two\nline three\n"
+    newline_count = rendered.count("\n")
+    assert interactive._count_terminal_lines(rendered, width=80) == newline_count
+
+
+def test_count_terminal_lines_empty_string() -> None:
+    assert interactive._count_terminal_lines("", width=80) == 0
+
+
+def _select_over_pty(monkeypatch: pytest.MonkeyPatch, keys: bytes) -> int:
+    """Run :func:`select` against a real pty, feeding it *keys*.
+
+    ``openpty`` gives the raw-termios path the controlling terminal a
+    headless runner otherwise lacks, so the ↑/↓ escape-sequence parsing
+    can be exercised directly. ``setcbreak`` flushes pending input, so the
+    keys are written from a helper thread only once the menu has switched
+    the pty into cbreak mode.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param keys: Raw bytes to deliver as keystrokes, e.g. ``b"\\x1b[B\\r"``.
+    :returns: The index :func:`select` returned.
+    """
+    import os
+    import pty
+    import threading
+    import tty
+
+    ready = threading.Event()
+    real_setcbreak = tty.setcbreak
+
+    def _setcbreak_then_signal(fd: int, when: int = tty.TCSAFLUSH) -> None:
+        real_setcbreak(fd, when)
+        ready.set()
+
+    monkeypatch.setattr(tty, "setcbreak", _setcbreak_then_signal)
+
+    controller, follower = pty.openpty()
+
+    def _send() -> None:
+        ready.wait(timeout=10)
+        os.write(controller, keys)
+
+    writer = threading.Thread(target=_send, daemon=True)
+    try:
+        stdin = os.fdopen(follower, "rb", buffering=0)
+        monkeypatch.setattr(sys, "stdin", stdin)
+        monkeypatch.setattr(sys, "stdout", io.StringIO())
+        writer.start()
+        return interactive.select("Pick", ["Claude", "Codex", "Quit"])
+    finally:
+        writer.join(timeout=10)
+        os.close(controller)
+
+
+@pytest.mark.parametrize(
+    ("introducer", "label"),
+    [(b"[", "normal cursor mode"), (b"O", "application cursor mode")],
+)
+def test_select_arrow_keys_work_in_both_cursor_modes(
+    monkeypatch: pytest.MonkeyPatch,
+    introducer: bytes,
+    label: str,
+) -> None:
+    """↑/↓ move the cursor whether the terminal sends ``ESC [ A`` or ``ESC O A``.
+
+    A terminal left in application cursor mode (DECCKM, what the ``smkx``
+    terminfo capability turns on) sends ``ESC O A``/``ESC O B`` for the
+    arrows. Dropping that form leaves the menu looking frozen — Esc and
+    Enter still respond, but the selection never moves.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param introducer: The escape-sequence introducer under test.
+    :param label: The cursor mode *introducer* corresponds to.
+    :returns: None.
+    """
+    # Down, down, up → lands on index 1; Enter confirms.
+    keys = b"\x1b" + introducer + b"B" + b"\x1b" + introducer + b"B"
+    keys += b"\x1b" + introducer + b"A" + b"\r"
+
+    assert _select_over_pty(monkeypatch, keys) == 1, label
+
+
+def _console_with_encoding(encoding: str | None):
+    """Build a Rich console whose file reports *encoding* (or lacks the attr)."""
+    from rich.console import Console
+
+    if encoding is None:
+        buffer = io.BytesIO()  # a raw binary stream has no ``encoding`` attribute
+        return Console(file=buffer, force_terminal=True)  # type: ignore[arg-type]
+    stream = io.TextIOWrapper(io.BytesIO(), encoding=encoding)
+    return Console(file=stream, force_terminal=True)
+
+
+@pytest.mark.parametrize(
+    "encoding,expected",
+    [
+        ("utf-8", True),
+        ("utf-16", True),
+        ("cp1252", False),
+        ("ascii", False),
+        (None, True),  # unknown encoding: nothing to check against, assume ok
+    ],
+)
+def test_encodable_probes_console_encoding(encoding: str | None, expected: bool) -> None:
+    """``encodable`` reports whether the emoji glyph survives the console's encoding."""
+    glyph = "\N{ADMISSION TICKETS}\N{VARIATION SELECTOR-16}"
+    assert interactive.encodable(glyph, _console_with_encoding(encoding)) is expected
+
+
+def test_encodable_ascii_text_always_true() -> None:
+    """Plain ASCII text is encodable even on a legacy codepage console."""
+    assert interactive.encodable("subscription", _console_with_encoding("cp1252")) is True

@@ -55,9 +55,12 @@ from omnigent.server.schemas import (
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
     ServerStreamEvent,
+    SessionChildSessionUpdatedEvent,
+    SessionCreatedEvent,
     SessionStatusEvent,
 )
 
+from ._child_status import TERMINAL_TASK_STATUSES, child_summary_busy
 from ._errors import OmnigentError
 from ._files import FilesNamespace
 from ._query import QueryResult, QueryStream
@@ -72,6 +75,9 @@ from ._tool_handler import (
     ResponseEndCtx,
     ResponseStartCtx,
     StreamHooks,
+    SubAgentCompletedCtx,
+    SubAgentInfo,
+    SubAgentSpawnedCtx,
     ToolCallEndCtx,
     ToolCallStartCtx,
 )
@@ -211,14 +217,14 @@ class _AgentToolsGetter(Protocol):
 # terminal set listed in ``omnigent/server/schemas.py`` (and
 # the ``_TERMINAL_STATUSES`` set in
 # :mod:`omnigent_client._session`).
-_TURN_TERMINAL_EVENT_TYPES: tuple[type[ServerStreamEvent], ...] = (
+_TURN_TERMINAL_EVENT_TYPES = (
     CompletedEvent,
     FailedEvent,
     IncompleteEvent,
     CancelledEvent,
 )
 
-_RESPONSE_START_EVENT_TYPES: tuple[type[ServerStreamEvent], ...] = (
+_RESPONSE_START_EVENT_TYPES = (
     CreatedEvent,
     QueuedEvent,
     InProgressEvent,
@@ -248,6 +254,13 @@ class _StreamHookState:
     reasoning_text: str = ""
     reasoning_summary_text: str = ""
     completed_tool_call_ids: set[str] = field(default_factory=set)
+    # Sub-agent lifecycle bookkeeping. Spawns are keyed on the discrete
+    # ``session.created`` event only — snapshot-on-connect child updates
+    # describe pre-existing children and must not re-fire the hook.
+    spawned_child_ids: set[str] = field(default_factory=set)
+    completed_child_ids: set[str] = field(default_factory=set)
+    child_agent_names: dict[str, str] = field(default_factory=dict)
+    child_previews: dict[str, str] = field(default_factory=dict)
 
 
 class SessionsChat:
@@ -467,6 +480,30 @@ class SessionsChat:
         self._session = await self._namespace.get(self._session.id)
         return self._session
 
+    async def tree_busy(self, *, max_depth: int = 3) -> bool:
+        """Whether any sub-agent anywhere in this session's subtree is working.
+
+        Unlike :attr:`status` (per-session — it reads ``"idle"`` once this
+        session has delegated and returned to its own prompt, even while its
+        sub-agents run), this rolls up the whole sub-agent tree. A driver that
+        feeds the agent a simulated "your turn" whenever it yields can gate that
+        on real subtree activity:
+
+        .. code-block:: python
+
+            if not await chat.tree_busy():
+                await chat.send("your turn")  # only when nothing is still working
+
+        Point-in-time and recursive (capped at *max_depth*); delegates to
+        :meth:`SessionsNamespace.subtree_busy`, which applies the same canonical
+        "busy" definition as the CLI badge and the web ``SubagentsPanel``.
+
+        :param max_depth: Levels of the sub-agent tree to descend.
+        :returns: ``True`` while any descendant sub-agent is busy.
+        :raises OmnigentError: On non-2xx status.
+        """
+        return await self._namespace.subtree_busy(self._session.id, max_depth=max_depth)
+
     async def send(
         self,
         input: str | list[dict[str, Any]],
@@ -536,7 +573,7 @@ class SessionsChat:
         # turns cannot publish all output before this subscriber exists.
         stream_aiter = self._namespace.stream(self._session.id)
         hook_state = _StreamHookState()
-        first_event_task = asyncio.create_task(stream_aiter.__anext__())
+        first_event_task = asyncio.ensure_future(stream_aiter.__anext__())
         try:
             first_event: ServerStreamEvent | None
             try:
@@ -544,11 +581,12 @@ class SessionsChat:
                     asyncio.shield(first_event_task),
                     timeout=_STREAM_READY_TIMEOUT_S,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 first_event = None
             except StopAsyncIteration:
                 return
             await self._namespace.post_event(self._session.id, event_payload)
+            event: ServerStreamEvent
             if first_event is None:
                 try:
                     event = await first_event_task
@@ -875,6 +913,14 @@ class SessionsChat:
             await self._handle_elicitation_request(event, state)
             return
 
+        if isinstance(event, SessionCreatedEvent):
+            await self._fire_sub_agent_spawned(event, state)
+            return
+
+        if isinstance(event, SessionChildSessionUpdatedEvent):
+            await self._fire_sub_agent_completed_if_terminal(event, state)
+            return
+
         if isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
             await self._end_reasoning_if_open(state)
             response = _response_from_server_object(event.response)
@@ -883,6 +929,91 @@ class SessionsChat:
                 self._hooks.on_response_end,
                 ResponseEndCtx(response=response, status=response.status),
             )
+
+    async def _fire_sub_agent_spawned(
+        self,
+        event: SessionCreatedEvent,
+        state: _StreamHookState,
+    ) -> None:
+        """
+        Fire ``on_sub_agent_spawned`` for a newly-created child session.
+
+        ``session.created`` is the discrete spawn signal on the parent's
+        stream (emitted once per child, live-only), so it fires the hook
+        exactly once per child; the id set guards against relays that
+        deliver the transient event more than once.
+        """
+        child_id = event.child_session_id
+        if not child_id or child_id in state.spawned_child_ids:
+            return
+        # Only announce children of THIS session: a relayed grandchild spawn
+        # would otherwise fire with the wrong parent_response_id.
+        parent_id = event.parent_session_id
+        if parent_id and parent_id != self._session.id:
+            return
+        state.spawned_child_ids.add(child_id)
+        agent_name = state.child_agent_names.get(child_id) or (event.agent_id or "")
+        await _call_hook(
+            self._hooks.on_sub_agent_spawned,
+            SubAgentSpawnedCtx(
+                parent_response_id=state.current_response_id,
+                sub_agents=[SubAgentInfo(response_id=child_id, agent_name=agent_name)],
+            ),
+        )
+
+    async def _fire_sub_agent_completed_if_terminal(
+        self,
+        event: SessionChildSessionUpdatedEvent,
+        state: _StreamHookState,
+    ) -> None:
+        """
+        Fire ``on_sub_agent_completed`` when a child reaches a terminal state.
+
+        ``session.child_session.updated`` carries partial child summaries
+        (status deltas, preview deltas, and snapshot-on-connect rows). The
+        hook fires only for children whose spawn this stream observed —
+        keeping spawn/complete callbacks paired and never re-announcing
+        pre-existing children from the connect snapshot — and only once,
+        on the first terminal (non-busy) status delta.
+
+        Spawn and completion must be observed by the same subscription:
+        ``stream()`` keeps one hook state for its whole lifetime, while each
+        ``send()`` turn starts fresh. A child that completes in a later
+        turn's continuation (e.g. an auto-wake) fires completion only for a
+        long-lived ``stream()`` consumer — the reliable path for adapters
+        that need paired spawn/complete spans.
+        """
+        child_id = event.child_session_id
+        if not child_id:
+            return
+        child = event.child if isinstance(event.child, dict) else {}
+        raw_name = child.get("tool") or child.get("agent_name")
+        if isinstance(raw_name, str) and raw_name:
+            state.child_agent_names[child_id] = raw_name
+        # Deltas are partial: a preview may arrive in a separate delta from
+        # the terminal status, so remember the last one seen per child.
+        raw_preview = child.get("last_message_preview")
+        if isinstance(raw_preview, str) and raw_preview:
+            state.child_previews[child_id] = raw_preview
+        if child_id not in state.spawned_child_ids or child_id in state.completed_child_ids:
+            return
+        status = child.get("current_task_status")
+        if not isinstance(status, str) or status not in TERMINAL_TASK_STATUSES:
+            return
+        # Shared busy predicate (web/CLI semantics): a terminal status with a
+        # still-set busy flag or pending elicitation has not settled yet.
+        if child_summary_busy(child):
+            return
+        state.completed_child_ids.add(child_id)
+        await _call_hook(
+            self._hooks.on_sub_agent_completed,
+            SubAgentCompletedCtx(
+                response_id=child_id,
+                agent_name=state.child_agent_names.get(child_id, ""),
+                status=status,
+                output_summary=state.child_previews.get(child_id),
+            ),
+        )
 
     async def _ensure_response_started(
         self,
@@ -1065,6 +1196,66 @@ class SessionsChat:
         if stream:
             return self._stream_query(input, files=files)
         return await self._collect_query(input, files=files)
+
+    async def await_turn(self, *, timeout: float | None = 1200.0) -> QueryResult:
+        """
+        Collect the next auto-triggered turn without posting a message.
+
+        Used by headless runners to follow async orchestrator sessions
+        across multiple turns. Unlike :meth:`query`, no user message is
+        posted — this helper subscribes to the live stream and waits for
+        the server to start a new turn (e.g. an inbox auto-wake when a
+        sub-agent completes), then collects its text output.
+
+        A ``timeout`` guards against the race window where the turn
+        already completed before the subscription opened. If no terminal
+        event arrives within ``timeout`` seconds, the coroutine returns
+        an empty :class:`QueryResult` so the caller can refresh session
+        status and decide how to proceed.
+
+        :param timeout: Seconds to wait for the turn to complete. ``None``
+            waits indefinitely. Defaults to 1200 (20 minutes).
+        :returns: :class:`QueryResult` with the turn's text (may be empty
+            if the turn completed before we subscribed).
+        :raises OmnigentError: Propagated from :meth:`stream` if the
+            session does not exist.
+        """
+        text_parts: list[str] = []
+        produced: list[File] = []
+
+        async def _collect() -> None:
+            async for event in self.stream():
+                if isinstance(event, OutputTextDeltaEvent):
+                    if event.delta:
+                        text_parts.append(event.delta)
+                elif isinstance(event, OutputItemDoneEvent) and not text_parts:
+                    text_parts.extend(_assistant_text_from_output_item(event.item))
+                elif isinstance(event, OutputFileDoneEvent):
+                    produced.append(await self._fetch_file(event))
+                elif isinstance(event, CompletedEvent):
+                    if not text_parts:
+                        text_parts.extend(_assistant_text_from_response(event.response.output))
+                    break
+                elif isinstance(event, SessionStatusEvent) and event.status in (
+                    "waiting",
+                    "idle",
+                ):
+                    # Break on terminal status events so the async generator
+                    # closes cleanly (avoids "aclose(): already running" when
+                    # asyncio.timeout fires mid-stream).
+                    break
+                elif isinstance(event, _TURN_TERMINAL_EVENT_TYPES):
+                    break
+
+        try:
+            async with asyncio.timeout(timeout):
+                await _collect()
+        except TimeoutError:
+            # Timeout is expected when the session completes before the deadline
+            # or the race window is missed; return whatever text was collected so
+            # far per the method contract (empty QueryResult is valid).
+            pass
+        return QueryResult(text="".join(text_parts), files=produced)
 
     async def _collect_query(
         self,

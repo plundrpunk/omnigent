@@ -47,31 +47,35 @@ _VALID_JSON_BODY = {"hello": "world"}
 # exists. ``term_x`` / ``env_x`` are likewise never resolved.
 _JSON_ONLY_ENDPOINTS = [
     pytest.param(
-        "/v1/sessions/conv_missing/hooks/permission-request",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/hooks/permission-request",
         id="claude_permission_request_hook",
     ),
     pytest.param(
-        "/v1/sessions/conv_missing/hooks/codex-elicitation-request",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/hooks/codex-elicitation-request",
         id="codex_elicitation_request_hook",
     ),
     pytest.param(
-        "/v1/sessions/conv_missing/policies/evaluate",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/hooks/antigravity-elicitation-request",
+        id="antigravity_elicitation_request_hook",
+    ),
+    pytest.param(
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/policies/evaluate",
         id="evaluate_policy",
     ),
     pytest.param(
-        "/v1/sessions/conv_missing/resources/terminals",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/resources/terminals",
         id="create_session_terminal",
     ),
     pytest.param(
-        "/v1/sessions/conv_missing/resources/terminals/term_x/transfer",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/resources/terminals/term_x/transfer",
         id="transfer_session_terminal",
     ),
     pytest.param(
-        "/v1/sessions/conv_missing/resources/environments/env_x/shell",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/resources/environments/env_x/shell",
         id="run_environment_shell",
     ),
     pytest.param(
-        "/v1/sessions/conv_missing/mcp",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/mcp",
         id="mcp_proxy",
     ),
 ]
@@ -172,11 +176,11 @@ async def test_json_only_endpoint_rejects_missing_content_type(
     "url",
     [
         pytest.param(
-            "/v1/sessions/conv_missing/hooks/permission-request",
+            "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/hooks/permission-request",
             id="claude_permission_request_hook",
         ),
         pytest.param(
-            "/v1/sessions/conv_missing/hooks/codex-elicitation-request",
+            "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/hooks/codex-elicitation-request",
             id="codex_elicitation_request_hook",
         ),
     ],
@@ -245,7 +249,7 @@ async def test_create_terminal_reached_with_application_json(
     415 would mean the guard wrongly blocked a correct JSON request.
     """
     resp = await client.post(
-        "/v1/sessions/conv_missing/resources/terminals",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/resources/terminals",
         json={"terminal": "shell", "session_key": "main"},
     )
     assert resp.status_code == 404, (
@@ -265,7 +269,7 @@ async def test_mcp_proxy_reached_with_application_json(
     here would mean the guard blocked a valid MCP request.
     """
     resp = await client.post(
-        "/v1/sessions/conv_missing/mcp",
+        "/v1/sessions/5eca720dc2bc6cdc3a99028d7bd0f917/mcp",
         json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
     )
     assert resp.status_code == 200, resp.text
@@ -320,10 +324,10 @@ async def test_create_session_accepts_application_json(
     resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
     assert resp.status_code == 201, resp.text
     # Real session id returned → JSON create reached the handler and succeeded.
-    assert resp.json()["id"].startswith("conv_")
+    assert len(resp.json()["id"]) == 32
 
 
-@pytest.mark.parametrize("origin", [None, "http://test"])
+@pytest.mark.parametrize("origin", [None, "http://localhost:5173"])
 async def test_create_session_accepts_multipart_bundled_create(
     client: httpx.AsyncClient,
     origin: str | None,
@@ -359,3 +363,47 @@ async def test_cross_site_multipart_cannot_create_session(client: httpx.AsyncCli
         headers={"Origin": "https://evil.example", "Sec-Fetch-Site": "cross-site"},
     )
     assert response.status_code == 403
+
+
+async def test_multipart_managed_create_reaches_managed_launch(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Multipart ``host_type: "managed"`` routes to the managed-launch path.
+
+    The default test app has no ``sandbox_config``, so a managed multipart
+    create must fail with the "managed hosts are not configured" error —
+    which proves the handler took the new managed branch (and reached
+    ``_schedule_managed_launch``) rather than silently creating an external
+    session. On a server WITH a ``sandbox:`` config this same request would
+    provision a sandbox for the uploaded session-scoped agent.
+    """
+    bundle = build_agent_bundle(name="managed-multipart-agent")
+    resp = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"host_type": "managed", "sandbox_provider": "lakebox"})},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    # Reached the managed branch → the not-configured guard fires.
+    assert resp.status_code >= 400, resp.text
+    assert "managed hosts are not configured" in resp.text
+
+
+async def test_multipart_managed_rejects_path_workspace(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Multipart ``host_type: "managed"`` + a filesystem-path workspace is
+    rejected at metadata validation (a managed workspace is a git repository
+    URL), before any bundle/session work — mirrors the JSON path's contract.
+    The multipart metadata parser surfaces the schema ValueError as a 400
+    invalid_input (the JSON path returns 422; both name the URL requirement).
+    """
+    bundle = build_agent_bundle(name="managed-badws-agent")
+    resp = await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps({"host_type": "managed", "workspace": "/tmp/w"})},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+    assert resp.status_code >= 400, resp.text
+    assert "git repository URL" in resp.text

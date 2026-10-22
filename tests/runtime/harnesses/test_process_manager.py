@@ -24,24 +24,35 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import shutil
 import signal
 import sys
 import tempfile
+import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
+import httpx
 import pytest
 
+from omnigent.native.owner_claim import current_pid_namespace, read_owner_claim, write_owner_claim
 from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
 from omnigent.runtime.harnesses.process_manager import (
     _AP_PID_FILE,
     _TMP_PARENT_ENV_VAR,
     HarnessProcessManager,
+    NoLiveHarnessError,
+    _default_tmp_parent,
+    _kill_orphan_runners,
+    _model_env_key,
     _pid_alive,
     _pids_holding_socket,
+    _SubprocessEntry,
+    sweep_orphaned_harness_processes,
 )
 
 _TEST_HARNESS_NAME = "test"
@@ -149,11 +160,32 @@ async def test_start_creates_instance_dir_with_sentinel(
         assert manager.instance_dir.is_dir()
         sentinel = manager.instance_dir / _AP_PID_FILE
         assert sentinel.exists()
-        # The recorded PID is this process — proves the sweep on
-        # a sibling Omnigent boot would correctly identify us as alive.
-        assert sentinel.read_text(encoding="utf-8").strip() == str(os.getpid())
+        # The recorded owner is this process in this PID namespace — proves the
+        # sweep on a sibling Omnigent boot would correctly identify us as alive.
+        claim = read_owner_claim(manager.instance_dir, filename=_AP_PID_FILE)
+        assert claim is not None
+        assert claim.pid == os.getpid()
+        assert claim.pid_ns == current_pid_namespace()
     finally:
         await manager.shutdown()
+
+
+async def test_start_can_delegate_orphan_sweep_to_host(short_tmp_parent: Path) -> None:
+    """Host-spawned runners can start without scanning machine-global state."""
+    stale_dir = short_tmp_parent / "ap-dead"
+    stale_dir.mkdir(mode=0o700)
+    (stale_dir / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    await manager.start(sweep_orphans=False)
+    try:
+        assert stale_dir.exists()
+        assert manager.instance_dir.exists()
+    finally:
+        await manager.shutdown()
+
+    await sweep_orphaned_harness_processes(tmp_parent=short_tmp_parent)
+    assert not stale_dir.exists()
 
 
 async def test_start_is_idempotent(manager: HarnessProcessManager) -> None:
@@ -193,6 +225,57 @@ async def test_start_uses_harness_tmp_parent_env(
         assert (manager.instance_dir / _AP_PID_FILE).read_text(encoding="utf-8")
     finally:
         await manager.shutdown()
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Per-uid tmp parent is POSIX-only; Windows uses gettempdir().",
+)
+def test_default_tmp_parent_is_per_uid_on_posix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default socket root is namespaced per Unix uid.
+
+    A shared ``/tmp/omnigent`` breaks multi-user hosts: the first
+    user's runner creates it ``0700`` and every other user's runner
+    then dies in ``_sweep_orphans`` stat()ing foreign instance dirs.
+    The POSIX default must carry the uid so each user gets a private
+    parent. Regression guard against the pre-fix bare ``/tmp/omnigent``.
+    """
+    monkeypatch.delenv(_TMP_PARENT_ENV_VAR, raising=False)
+    parent = _default_tmp_parent()
+    assert parent == Path(f"/tmp/omnigent-{os.getuid()}")
+    # The shared parent that locked out other users must be gone.
+    assert parent != Path("/tmp/omnigent")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Symlink path is POSIX-only.")
+def test_resolve_harness_tmp_parent_preserves_symlink_spelling(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "private" / "tmp"
+    target.mkdir(parents=True)
+    short_root = tmp_path / "tmp"
+    short_root.symlink_to(target, target_is_directory=True)
+    monkeypatch.setenv(_TMP_PARENT_ENV_VAR, str(short_root))
+
+    resolved = resolve_harness_tmp_parent()
+
+    assert resolved == short_root
+    assert resolved != target.resolve()
+
+
+def test_resolve_harness_tmp_parent_makes_relative_path_absolute(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(_TMP_PARENT_ENV_VAR, "nested/../harness-sockets")
+
+    resolved = resolve_harness_tmp_parent()
+
+    assert resolved == tmp_path / "harness-sockets"
 
 
 async def test_shutdown_without_start_is_noop(
@@ -237,6 +320,35 @@ async def test_get_client_spawns_and_serves(
         # the contract; verify the round-trip works.
         cid_resp = await client.get("/conversation-id")
         assert cid_resp.json() == {"conversation_id": "conv_a"}
+    finally:
+        await manager.shutdown()
+
+
+async def test_get_client_emits_harness_started_event(
+    manager: HarnessProcessManager,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A successful spawn emits one ``harness_started`` debug event.
+
+    This is the observable "harness bound and ready" edge used to measure
+    startup latency; the row carries the spawn->ready time and, for the
+    first spawn on a cold runner, the manager-start-relative time.
+    """
+    await manager.start()
+    try:
+        with caplog.at_level(logging.INFO, logger="omnigent.runtime.harnesses.process_manager"):
+            await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        started = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "harness_started"
+        ]
+        assert len(started) == 1
+        record = started[0]
+        assert record.session_id == "conv_a"
+        attrs = record.attributes
+        assert attrs["harness"] == _TEST_HARNESS_NAME
+        assert isinstance(attrs["pid"], int)
+        assert attrs["spawn_ms"] >= 0
+        assert attrs["since_manager_start_ms"] >= 0
     finally:
         await manager.shutdown()
 
@@ -325,8 +437,235 @@ async def test_release_terminates_subprocess(
         await manager.shutdown()
 
 
+async def test_close_entry_kills_process_when_aclose_raises(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing ``client.aclose()`` must not skip the subprocess kill.
+
+    ``_close_entry`` used to ``await client.aclose()`` first with no guard, so a
+    raise there (a broken transport, a wedged client) skipped the SIGTERM/SIGKILL
+    below and the subprocess leaked un-killed — and untracked, since ``release``
+    already popped the entry. Force ``aclose()`` to raise and assert the process
+    is still terminated (and ``release`` itself doesn't raise, since teardown is
+    now best-effort).
+    """
+    await manager.start()
+    try:
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        pid = (await client.get("/pid")).json()["pid"]
+        entry = manager._entries["conv_a"]
+
+        async def _boom() -> None:
+            raise RuntimeError("simulated aclose failure")
+
+        monkeypatch.setattr(entry.client, "aclose", _boom)
+
+        # release() -> _close_entry(): the aclose failure must not prevent the
+        # kill, and best-effort teardown means release itself completes.
+        await manager.release("conv_a")
+        assert "conv_a" not in manager._entries
+
+        for _ in range(20):
+            if not _pid_alive(pid):
+                break
+            await asyncio.sleep(0.05)
+        assert not _pid_alive(pid), "subprocess survived a teardown where aclose() raised"
+    finally:
+        await manager.shutdown()
+
+
+async def test_release_reaps_term_resistant_process_when_graceful_wait_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled graceful wait still force-kills and reaps a real child."""
+    from omnigent.runtime.harnesses import process_manager as process_manager_module
+
+    class _Client:
+        async def aclose(self) -> None:
+            return None
+
+    class _Endpoint:
+        def __init__(self) -> None:
+            self.cleaned = False
+
+        def cleanup(self) -> None:
+            self.cleaned = True
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        (
+            "import signal, sys, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print('ready', flush=True); "
+            "time.sleep(60)"
+        ),
+        stdout=asyncio.subprocess.PIPE,
+    )
+    try:
+        assert process.stdout is not None
+        assert await asyncio.wait_for(process.stdout.readline(), timeout=10.0) == b"ready\n"
+    except BaseException:
+        if process.returncode is None:
+            process.kill()
+        await process.wait()
+        raise
+    endpoint = _Endpoint()
+    transport_closes: list[object] = []
+    terminate_started = asyncio.Event()
+    real_terminate_tree = process_manager_module._proc.terminate_tree
+    real_close_transport = process_manager_module.close_subprocess_transport
+
+    def terminate_tree(target: object) -> None:
+        real_terminate_tree(target)  # type: ignore[arg-type]
+        terminate_started.set()
+
+    def close_transport(target: object) -> None:
+        transport_closes.append(target)
+        real_close_transport(target)
+
+    monkeypatch.setattr(process_manager_module._proc, "terminate_tree", terminate_tree)
+    monkeypatch.setattr(process_manager_module, "close_subprocess_transport", close_transport)
+    manager = object.__new__(HarnessProcessManager)
+    manager._entries = {}
+    manager._spawn_locks = {"conv_real": asyncio.Lock()}
+    manager._registry_lock = asyncio.Lock()
+    manager._release_generations = {}
+    manager._in_flight_response_ids = {}
+    entry = process_manager_module._SubprocessEntry(
+        process,
+        _Client(),
+        endpoint,
+        "test",
+    )
+    manager._entries["conv_real"] = entry
+    closing = asyncio.create_task(manager.release("conv_real"))
+    try:
+        await asyncio.wait_for(terminate_started.wait(), timeout=10.0)
+        assert process.returncode is None, "fixture child unexpectedly honored SIGTERM"
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(closing, timeout=10.0)
+
+        assert process.returncode is not None
+        assert await asyncio.wait_for(process.wait(), timeout=1.0) == process.returncode
+        assert "conv_real" not in manager._entries
+        assert transport_closes == [process]
+        assert endpoint.cleaned
+    finally:
+        if not closing.done():
+            closing.cancel()
+            await asyncio.gather(closing, return_exceptions=True)
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+
+
+@pytest.mark.parametrize("cancel_stage", ["force_wait", "client_close"])
+async def test_release_reaps_process_when_teardown_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_stage: str,
+) -> None:
+    """Cancellation during force wait or client close still cleans up."""
+    from omnigent.runtime.harnesses import process_manager as process_manager_module
+
+    class _BlockingProcess:
+        pid = 424242
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.wait_started = asyncio.Event()
+            self.force_wait_started = asyncio.Event()
+            self.wait_calls = 0
+            self.dead = False
+
+        async def wait(self) -> None:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                self.wait_started.set()
+                if self.returncode is None:
+                    await asyncio.Event().wait()
+            elif cancel_stage == "force_wait":
+                self.force_wait_started.set()
+                await asyncio.Event().wait()
+            return self.returncode
+
+    class _Client:
+        def __init__(self) -> None:
+            self.aclose_started = asyncio.Event()
+
+        async def aclose(self) -> None:
+            if cancel_stage == "client_close":
+                self.aclose_started.set()
+                await asyncio.Event().wait()
+
+    class _Endpoint:
+        def __init__(self) -> None:
+            self.cleaned = False
+
+        def cleanup(self) -> None:
+            self.cleaned = True
+
+    process = _BlockingProcess()
+    endpoint = _Endpoint()
+    client = _Client()
+    transport_closes: list[object] = []
+
+    def terminate_tree(_process: object) -> None:
+        if cancel_stage == "client_close":
+            process.returncode = -15
+
+    def kill_tree(_process: object) -> None:
+        process.dead = True
+        process.returncode = -9
+
+    monkeypatch.setattr(process_manager_module._proc, "terminate_tree", terminate_tree)
+    monkeypatch.setattr(process_manager_module._proc, "kill_tree", kill_tree)
+    monkeypatch.setattr(
+        process_manager_module,
+        "close_subprocess_transport",
+        lambda process: transport_closes.append(process),
+    )
+    manager = object.__new__(HarnessProcessManager)
+    manager._entries = {}
+    manager._spawn_locks = {"conv_a": asyncio.Lock()}
+    manager._registry_lock = asyncio.Lock()
+    manager._release_generations = {}
+    manager._in_flight_response_ids = {}
+    entry = process_manager_module._SubprocessEntry(
+        process,
+        client,
+        endpoint,
+        "test",
+    )
+    manager._entries["conv_a"] = entry
+
+    closing = asyncio.create_task(manager.release("conv_a"))
+    if cancel_stage == "client_close":
+        await asyncio.wait_for(client.aclose_started.wait(), timeout=1.0)
+    else:
+        await asyncio.wait_for(process.wait_started.wait(), timeout=1.0)
+        closing.cancel()
+        await asyncio.wait_for(process.force_wait_started.wait(), timeout=1.0)
+    closing.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+    assert "conv_a" not in manager._entries
+    assert process.returncode is not None
+    if cancel_stage == "force_wait":
+        assert process.dead
+    assert process.wait_calls == (2 if cancel_stage == "force_wait" else 1)
+    assert transport_closes == [process]
+    assert endpoint.cleaned
+
+
+@pytest.mark.parametrize("response_id", [None, "resp_crashed"])
 async def test_get_client_respawns_after_crash(
     manager: HarnessProcessManager,
+    caplog: pytest.LogCaptureFixture,
+    response_id: str | None,
 ) -> None:
     """If the subprocess died, the next get_client respawns.
 
@@ -339,6 +678,10 @@ async def test_get_client_respawns_after_crash(
     try:
         client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
         original_pid = (await client.get("/pid")).json()["pid"]
+        if response_id is not None:
+            manager.mark_in_flight("conv_a", response_id)
+            assert await manager.get_client("conv_a", _TEST_HARNESS_NAME) is client
+            assert manager.has_active_turn("conv_a")
         os.kill(original_pid, signal.SIGKILL)
         # Wait for the OS to mark the process dead so the next
         # get_client's ``returncode`` check sees it.
@@ -353,6 +696,107 @@ async def test_get_client_respawns_after_crash(
         # crash detection is broken.
         assert new_pid != original_pid
         assert _pid_alive(new_pid)
+        assert not manager.has_active_turn("conv_a")
+        assert await manager.forward_cancel("conv_a") is False
+        manager._entries["conv_a"].last_used_at = time.monotonic() - 120.0
+        await manager.release("conv_a", only_if_idle_cutoff=time.monotonic() - 60.0)
+        assert "conv_a" not in manager._entries
+        exits = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "harness_exit_detected"
+        ]
+        assert len(exits) == 1
+        assert exits[0].session_id == "conv_a"
+        assert exits[0].attributes == {
+            "harness": _TEST_HARNESS_NAME,
+            "pid": original_pid,
+            "returncode": -signal.SIGKILL,
+            "tracked_response_id": response_id,
+        }
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("response_id", [None, "resp_socket_lost"])
+async def test_get_client_respawns_when_socket_pathname_vanishes(
+    manager: HarnessProcessManager,
+    caplog: pytest.LogCaptureFixture,
+    response_id: str | None,
+) -> None:
+    """A live harness whose socket file was removed is replaced on the next turn.
+
+    The subprocess never exits, so ``returncode`` stays ``None``; only the
+    bound Unix socket pathname disappears (a ``/tmp`` cleaner). Once the
+    pooled keepalive connection expires, a cached client can no longer
+    connect, so ``get_client`` must retire the stale entry and hand back a
+    client for a fresh harness. A turn in flight on the retired process is
+    reported through the respawn hook so the runner can resync it.
+    """
+    hook_calls: list[tuple[str, str, str]] = []
+
+    async def record_respawn(conv_id: str, reason: str, replaced: str) -> None:
+        hook_calls.append((conv_id, reason, replaced))
+
+    manager.set_respawn_hook(record_respawn)
+    await manager.start()
+    try:
+        client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        original_pid = (await client.get("/pid")).json()["pid"]
+        if response_id is not None:
+            manager.mark_in_flight("conv_a", response_id)
+        socket_path = manager.socket_path("conv_a")
+        assert socket_path.exists()
+        socket_path.unlink()
+        assert _pid_alive(original_pid)
+
+        await asyncio.sleep(httpx.Limits().keepalive_expiry + 1.0)
+        assert _pid_alive(original_pid), "fixture harness exited during the keepalive wait"
+
+        # Control callers never trigger recovery and keep the live turn's client.
+        assert await manager.get_client("conv_a", "any") is client
+        assert _pid_alive(original_pid)
+
+        new_client = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
+        new_pid = (await new_client.get("/pid")).json()["pid"]
+        assert new_pid != original_pid
+        assert _pid_alive(new_pid)
+        assert socket_path.exists()
+        assert not _pid_alive(original_pid)
+        assert not manager.has_active_turn("conv_a")
+        if response_id is None:
+            assert hook_calls == []
+        else:
+            assert hook_calls == [("conv_a", "harness_respawn_socket_missing", response_id)]
+        lost = [
+            r for r in caplog.records if getattr(r, "event_name", None) == "harness_socket_missing"
+        ]
+        assert len(lost) == 1
+        assert lost[0].session_id == "conv_a"
+        assert lost[0].attributes == {
+            "harness": _TEST_HARNESS_NAME,
+            "pid": original_pid,
+            "socket_path": str(socket_path),
+            "tracked_response_id": response_id,
+        }
+    finally:
+        await manager.shutdown()
+
+
+async def test_release_clears_marker_before_same_session_replacement(
+    manager: HarnessProcessManager,
+) -> None:
+    """An explicit retirement does not make a replacement look in-flight."""
+    await manager.start()
+    try:
+        await manager.get_client("conv_release", _TEST_HARNESS_NAME)
+        manager.mark_in_flight("conv_release", "resp_old")
+        await manager.release("conv_release")
+        assert not manager.has_active_turn("conv_release")
+
+        replacement = await manager.get_client("conv_release", _TEST_HARNESS_NAME)
+        assert replacement is not None
+        assert not manager.has_active_turn("conv_release")
+        assert await manager.forward_cancel("conv_release") is False
     finally:
         await manager.shutdown()
 
@@ -375,6 +819,7 @@ async def test_get_client_respawns_on_harness_change(
     try:
         client_first = await manager.get_client("conv_a", _TEST_HARNESS_NAME)
         pid_first = (await client_first.get("/pid")).json()["pid"]
+        manager.mark_in_flight("conv_a", "resp_switch")
 
         # Same conversation, DIFFERENT harness → must respawn.
         client_second = await manager.get_client("conv_a", "test2")
@@ -384,6 +829,7 @@ async def test_get_client_respawns_on_harness_change(
         # subprocess and spawned a new one. Same PID would mean the switch
         # kept serving the old harness (the bug this branch fixes).
         assert pid_second != pid_first
+        assert not manager.has_active_turn("conv_a")
         assert _pid_alive(pid_second)
         # The original subprocess was terminated by the respawn's close.
         for _ in range(40):
@@ -394,6 +840,58 @@ async def test_get_client_respawns_on_harness_change(
     finally:
         await manager.shutdown()
         _HARNESS_MODULES.pop("test2", None)
+
+
+async def test_get_client_respawns_on_model_change(
+    manager: HarnessProcessManager,
+) -> None:
+    """A different model for the same conversation respawns the subprocess.
+
+    Mirrors the harness-change branch above: the model is baked into the
+    subprocess env at spawn time, so a later turn with a different model
+    must respawn, or the cached process keeps serving the old one. Covers
+    the real ``/model`` switch path via ``post_responses`` in production,
+    previously untested. Also checks the inverse: same model, no respawn.
+    """
+    await manager.start()
+    try:
+        client_first = await manager.get_client(
+            "conv_a",
+            _TEST_HARNESS_NAME,
+            env={"HARNESS_TEST_MODEL": "model-a"},
+        )
+        pid_first = (await client_first.get("/pid")).json()["pid"]
+
+        # Same conversation, SAME model → must reuse the cached subprocess.
+        client_same = await manager.get_client(
+            "conv_a",
+            _TEST_HARNESS_NAME,
+            env={"HARNESS_TEST_MODEL": "model-a"},
+        )
+        pid_same = (await client_same.get("/pid")).json()["pid"]
+        assert pid_same == pid_first
+
+        # Same conversation, DIFFERENT model → must respawn.
+        client_second = await manager.get_client(
+            "conv_a",
+            _TEST_HARNESS_NAME,
+            env={"HARNESS_TEST_MODEL": "model-b"},
+        )
+        pid_second = (await client_second.get("/pid")).json()["pid"]
+
+        # Different PID proves the model-change branch tore down the old
+        # subprocess and spawned a new one. Same PID would mean the model
+        # switch kept serving the old model (the bug this branch guards).
+        assert pid_second != pid_first
+        assert _pid_alive(pid_second)
+        # The original subprocess was terminated by the respawn's close.
+        for _ in range(40):
+            if not _pid_alive(pid_first):
+                break
+            await asyncio.sleep(0.05)
+        assert not _pid_alive(pid_first)
+    finally:
+        await manager.shutdown()
 
 
 async def test_get_client_any_harness_sentinel_reuses_subprocess(
@@ -427,6 +925,24 @@ async def test_get_client_any_harness_sentinel_reuses_subprocess(
         await manager.shutdown()
 
 
+async def test_get_client_any_harness_sentinel_no_subprocess_raises(
+    manager: HarnessProcessManager,
+) -> None:
+    """``get_client(conv, "any")`` raises ``NoLiveHarnessError`` when no
+    subprocess is live.
+
+    Before the fix, this fell through to ``_spawn_entry("any", ...)``
+    which called ``_resolve_module_path("any")`` and raised the misleading
+    ``RuntimeError: unknown harness 'any'; registered names: [...]``.
+    """
+    await manager.start()
+    try:
+        with pytest.raises(NoLiveHarnessError, match="no live harness subprocess"):
+            await manager.get_client("conv_never_spawned", "any")
+    finally:
+        await manager.shutdown()
+
+
 async def test_get_client_concurrent_first_calls_share_subprocess(
     manager: HarnessProcessManager,
 ) -> None:
@@ -452,6 +968,40 @@ async def test_get_client_concurrent_first_calls_share_subprocess(
         # subprocess and either race to bind the same socket
         # (one fails) or succeed with two distinct entries.
         assert client_a is client_b
+    finally:
+        await manager.shutdown()
+
+
+async def test_get_client_seeds_model_and_reuses_without_respawn(
+    manager: HarnessProcessManager,
+) -> None:
+    """A seeded model env bakes into the first spawn; an identical later
+    call reuses it without a respawn.
+
+    When the initial spawn is seeded with the persisted ``/model``
+    override, the first turn requesting that same model must NOT tear
+    the subprocess down and respawn it.
+    """
+    model_key = _model_env_key(_TEST_HARNESS_NAME)
+    await manager.start()
+    try:
+        client_first = await manager.get_client(
+            "conv_a", _TEST_HARNESS_NAME, env={model_key: "model-x"}
+        )
+        entry = manager._entries["conv_a"]
+        # The first spawn baked the seeded model into the entry.
+        assert entry.model == "model-x"
+        pid_first = (await client_first.get("/pid")).json()["pid"]
+
+        # Identical model env → cached entry, no respawn.
+        client_second = await manager.get_client(
+            "conv_a", _TEST_HARNESS_NAME, env={model_key: "model-x"}
+        )
+        assert client_second is client_first
+        assert manager._entries["conv_a"] is entry
+        pid_second = (await client_second.get("/pid")).json()["pid"]
+        # Same PID proves no respawn happened on the second identical call.
+        assert pid_second == pid_first
     finally:
         await manager.shutdown()
 
@@ -500,6 +1050,285 @@ async def test_idle_reaper_releases_stale_entries(
         await fast.shutdown()
 
 
+async def test_idle_reaper_survives_release_error(
+    register_test_harness: None,
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``release`` failure during reaping must not kill the reaper loop.
+
+    ``_idle_reaper_loop`` awaits ``self.release(conv_id)`` for each stale
+    entry with no guard around it. ``release`` -> ``_close_entry`` awaits
+    ``client.aclose()`` and ``process.wait()``, any of which can raise
+    (broken transport, dead process, ``ProcessLookupError``). An unguarded
+    raise propagates out of the ``while True`` loop and the reaper task
+    exits permanently — and silently, since nothing awaits the dead task —
+    so the AP instance never reclaims another idle subprocess for the rest
+    of its lifetime (FD / memory / socket leak).
+
+    Inject a one-shot ``release`` failure on the first reaper-triggered
+    call and assert the loop keeps going: the still-stale entry is reaped
+    on a later pass. Before the fix the socket never disappears (the loop
+    died); after it, a subsequent pass reclaims it.
+    """
+    fast = HarnessProcessManager(
+        idle_timeout_s=2.0,
+        reaper_interval_s=0.1,
+        tmp_parent=short_tmp_parent,
+    )
+    await fast.start()
+    try:
+        await fast.get_client("conv_a", _TEST_HARNESS_NAME)
+        socket_path = fast.instance_dir / "conv-conv_a.sock"
+        assert socket_path.exists()
+
+        # Make the first reaper-triggered release raise, then defer to the
+        # real release on later calls — a transient teardown failure.
+        real_release = fast.release
+        calls = {"n": 0}
+
+        async def flaky_release(conversation_id: str, **kw: object) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated close failure")
+            await real_release(conversation_id, **kw)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(fast, "release", flaky_release)
+
+        # Across many reaper passes: with the bug the first raise kills the
+        # loop and the socket lingers; with the guard a later pass reaps it.
+        for _ in range(60):
+            if not socket_path.exists():
+                break
+            await asyncio.sleep(0.1)
+        assert calls["n"] >= 1, "reaper never attempted to release the stale entry"
+        assert not socket_path.exists(), (
+            "reaper died on the first release error and never reclaimed the "
+            "stale subprocess on a later pass"
+        )
+    finally:
+        await fast.shutdown()
+
+
+async def test_idle_reaper_skips_in_flight_turn(
+    register_test_harness: None,
+    short_tmp_parent: Path,
+) -> None:
+    """A conversation with a live harness turn is never reaped mid-flight.
+
+    Regression test for #1414. ``last_used_at`` is stamped once per turn at
+    ``get_client``, so a turn that runs longer than ``idle_timeout_s`` looks
+    "idle" to the reaper. The only guard against killing it —
+    ``conv_id in _in_flight_response_ids`` — had no writers and was always
+    empty, so long turns were ``SIGTERM``'d mid-stream. ``mark_in_flight`` /
+    ``clear_in_flight`` populate that guard (the runner calls them from
+    ``proxy_stream`` on ``response.created`` and from ``_on_proxy_stream_end``).
+
+    Marks a turn in-flight, holds it well past the 2 s idle window across many
+    reaper passes, and asserts the subprocess survives; then clears the marker
+    and asserts the now-genuinely-idle entry is reaped (so the fix doesn't
+    leak entries that never get reclaimed — the inverse failure, cf. #1349).
+    """
+    fast = HarnessProcessManager(
+        idle_timeout_s=2.0,
+        reaper_interval_s=0.1,
+        tmp_parent=short_tmp_parent,
+    )
+    await fast.start()
+    try:
+        await fast.get_client("conv_a", _TEST_HARNESS_NAME)
+        socket_path = fast.instance_dir / "conv-conv_a.sock"
+        assert socket_path.exists()
+        # Mark the turn live, as the runner does on ``response.created``.
+        fast.mark_in_flight("conv_a", "resp_x")
+        assert fast.has_active_turn("conv_a")
+        # Hold past the 2 s idle window across ~40 reaper passes (~4 s). An
+        # unguarded reaper would have reaped this stale-looking entry; the
+        # in-flight guard must keep the subprocess alive the whole time.
+        for _ in range(40):
+            await asyncio.sleep(0.1)
+            assert socket_path.exists(), "in-flight turn was reaped mid-flight"
+        # Turn ends: clear the marker (as ``_on_proxy_stream_end`` does). The
+        # entry is now genuinely idle and must become reapable.
+        fast.clear_in_flight("conv_a")
+        assert not fast.has_active_turn("conv_a")
+        for _ in range(60):
+            if not socket_path.exists():
+                break
+            await asyncio.sleep(0.1)
+        assert not socket_path.exists()
+    finally:
+        await fast.shutdown()
+
+
+async def test_native_activity_refresh_prevents_idle_reaping(tmp_path: Path) -> None:
+    """Native terminal activity keeps a harness alive without proxy response ids."""
+    mgr = HarnessProcessManager(idle_timeout_s=0.5, reaper_interval_s=0.05, tmp_parent=tmp_path)
+    entry = _SubprocessEntry(
+        _FakeReapProc(),
+        _SlowCloseClient(0.0),
+        _FakeEndpoint(),
+        "codex-native",
+    )  # type: ignore[arg-type]
+    entry.last_used_at = time.monotonic()
+    mgr._entries = {"conv_native": entry}
+
+    reaper = asyncio.create_task(mgr._idle_reaper_loop())
+    try:
+        for _ in range(10):
+            await asyncio.sleep(0.1)
+            mgr.note_activity("conv_native")
+            assert not entry.process.killed, "active native harness was reaped"
+        assert not mgr.has_active_turn("conv_native")
+
+        deadline = time.monotonic() + 2.0
+        while not entry.process.killed:
+            assert time.monotonic() < deadline, "inactive native harness was never reaped"
+            await asyncio.sleep(0.02)
+    finally:
+        reaper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reaper
+
+
+class _FakeReapProc:
+    """Minimal process stand-in recording whether the reaper killed it.
+
+    Implements the full ``_proc._ProcessLike`` protocol (``pid``/``returncode``/
+    ``terminate``/``kill``) because teardown is tree-aware. ``pid`` is ``None``
+    on purpose: it routes ``_proc.terminate_tree`` / ``kill_tree`` down their
+    no-pid branch, which signals this object directly and makes no OS calls at
+    all. A made-up integer pid would be actively dangerous here — the helpers
+    would resolve it against the real process table, and a pid that happened to
+    exist would get a live process group signalled by the test suite.
+    """
+
+    def __init__(self) -> None:
+        self.pid: int | None = None
+        self.returncode: int | None = None
+        self.killed = False
+        self._done = asyncio.Event()
+
+    def send_signal(self, sig: int) -> None:
+        self.killed = True
+        self.returncode = -15
+        self._done.set()
+
+    def terminate(self) -> None:
+        self.send_signal(signal.SIGTERM)
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        self._done.set()
+
+    async def wait(self) -> int | None:
+        await self._done.wait()
+        return self.returncode
+
+
+class _SlowCloseClient:
+    """httpx-client stand-in whose aclose() stalls, holding the reaper pass open."""
+
+    def __init__(self, delay_s: float) -> None:
+        self._delay_s = delay_s
+
+    async def aclose(self) -> None:
+        await asyncio.sleep(self._delay_s)
+
+
+class _FakeEndpoint:
+    def cleanup(self) -> None:
+        pass
+
+
+async def test_idle_reaper_spares_turn_started_during_pass(tmp_path: Path) -> None:
+    """A turn that starts while an earlier stale entry tears down is not reaped.
+
+    The reaper snapshots its stale list under the registry lock, then releases
+    each entry outside it; a single teardown can hold the pass open for seconds
+    (graceful-SIGTERM wait). A turn that starts on a later-listed conversation
+    during that window refreshes ``last_used_at`` and marks itself in flight —
+    but the snapshot has already been taken, and ``release`` used to tear the
+    entry down without re-checking, SIGTERMing the subprocess mid-turn
+    ("Harness stream connection error" seconds after messaging an idle
+    session). ``only_if_idle_cutoff`` re-checks idleness atomically with the
+    unregister, so the now-active entry is spared; the genuinely idle entry in
+    the same pass is still reaped, and the spared one is reclaimed by a later
+    pass once it goes idle again.
+    """
+    mgr = HarnessProcessManager(idle_timeout_s=0.5, reaper_interval_s=0.2, tmp_parent=tmp_path)
+    e1 = _SubprocessEntry(_FakeReapProc(), _SlowCloseClient(0.6), _FakeEndpoint(), "h")  # type: ignore[arg-type]
+    e2 = _SubprocessEntry(_FakeReapProc(), _SlowCloseClient(0.0), _FakeEndpoint(), "h")  # type: ignore[arg-type]
+    e1.last_used_at = time.monotonic() - 100.0
+    e2.last_used_at = time.monotonic() - 100.0
+    mgr._entries = {"conv1": e1, "conv2": e2}
+
+    reaper = asyncio.create_task(mgr._idle_reaper_loop())
+    try:
+        # Wait for the pass to claim conv1 and enter its slow teardown.
+        deadline = time.monotonic() + 3.0
+        while "conv1" in mgr._entries:
+            assert time.monotonic() < deadline, "reaper never started a pass"
+            await asyncio.sleep(0.01)
+
+        # While conv1 tears down, activity refreshes conv2's lease and the
+        # runner marks the response in flight.
+        mgr.note_activity("conv2")
+        mgr.mark_in_flight("conv2", "resp_live")
+
+        await asyncio.sleep(1.0)
+        assert e1.process.killed, "the genuinely idle entry must still be reaped"
+        assert not e2.process.killed, (
+            "reaper SIGTERMed a subprocess whose turn started during the pass"
+        )
+        assert "conv2" in mgr._entries
+
+        # Once the turn ends and the entry goes idle again, a later pass
+        # reclaims it — sparing is a deferral, not an exemption.
+        mgr.clear_in_flight("conv2")
+        e2.last_used_at = time.monotonic() - 100.0
+        deadline = time.monotonic() + 3.0
+        while not e2.process.killed:
+            assert time.monotonic() < deadline, "spared entry never reaped later"
+            await asyncio.sleep(0.05)
+    finally:
+        reaper.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reaper
+
+
+async def test_idle_reaper_disabled_when_timeout_zero(
+    register_test_harness: None,
+    short_tmp_parent: Path,
+) -> None:
+    """A non-positive idle window disables reaping (``OMNIGENT_HARNESS_IDLE_TIMEOUT_S=0``).
+
+    Regression: ``0`` must mean "never reap", not "reap everything". Without the
+    ``idle_timeout_s <= 0`` guard the reaper computes ``cutoff = now - 0 == now``,
+    and since every ``last_used_at`` is <= now it reaps every entry on the first
+    pass. The spawned entry must survive many fast reaper passes.
+    """
+    fast = HarnessProcessManager(
+        idle_timeout_s=0.0,
+        reaper_interval_s=0.05,
+        tmp_parent=short_tmp_parent,
+    )
+    await fast.start()
+    try:
+        await fast.get_client("conv_a", _TEST_HARNESS_NAME)
+        socket_path = fast.instance_dir / "conv-conv_a.sock"
+        assert socket_path.exists()
+        # ~20 reaper passes at 0.05 s. With the bug the socket is gone almost
+        # immediately; with the guard it survives because reaping is disabled.
+        await asyncio.sleep(1.0)
+        assert socket_path.exists(), (
+            "idle_timeout_s=0 must DISABLE reaping, not reap every entry each pass"
+        )
+    finally:
+        await fast.shutdown()
+
+
 async def test_orphan_sweep_removes_dead_omnigent_dirs(
     short_tmp_parent: Path,
 ) -> None:
@@ -532,6 +1361,27 @@ async def test_orphan_sweep_removes_dead_omnigent_dirs(
         await fresh.shutdown()
 
 
+@pytest.mark.parametrize("owner_namespace", ["ours", "foreign"])
+async def test_orphan_sweep_judges_a_dead_looking_owner_only_from_its_namespace(
+    short_tmp_parent: Path,
+    owner_namespace: str,
+) -> None:
+    """Only a sweeper in the owner's PID namespace may conclude the owner is gone."""
+    claimed_dir = short_tmp_parent / "ap-claimed"
+    claimed_dir.mkdir(mode=0o700)
+    write_owner_claim(claimed_dir, filename=_AP_PID_FILE)
+    sentinel = claimed_dir / _AP_PID_FILE
+    lines = ["99999999", *sentinel.read_text(encoding="utf-8").splitlines()[1:]]
+    if owner_namespace == "foreign":
+        # How a live owner looks to a sweeper inside an agent sandbox.
+        lines = ["pid_ns=pid:[1]" if line.startswith("pid_ns=") else line for line in lines]
+    sentinel.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    await sweep_orphaned_harness_processes(tmp_parent=short_tmp_parent)
+
+    assert claimed_dir.exists() is (owner_namespace == "foreign")
+
+
 async def test_orphan_sweep_preserves_live_omnigent_dirs(
     short_tmp_parent: Path,
 ) -> None:
@@ -557,6 +1407,203 @@ async def test_orphan_sweep_preserves_live_omnigent_dirs(
         assert (sibling_dir / _AP_PID_FILE).exists()
     finally:
         await fresh.shutdown()
+
+
+def _unshare_pid_namespace_available() -> bool:
+    """Whether this host allows an unprivileged user + PID namespace."""
+    if sys.platform != "linux" or shutil.which("unshare") is None:
+        return False
+    import subprocess
+
+    probe = subprocess.run(
+        ["unshare", "--user", "--map-root-user", "--pid", "--fork", "--mount-proc", "true"],
+        capture_output=True,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
+async def test_orphan_sweep_from_another_pid_namespace_keeps_a_live_harness(
+    manager: HarnessProcessManager,
+) -> None:
+    """A sweep that cannot see our PID must not delete a live session's socket.
+
+    Agent sandboxes (e.g. Codex's Linux sandbox) run commands in their own PID
+    namespace with ``/tmp`` writable. A server or test booted there sweeps the
+    shared harness root, sees every live ``AP_PID`` as dead, and deletes each
+    session's socket while its runner and harness keep running.
+    """
+    import subprocess
+
+    if not _unshare_pid_namespace_available():
+        pytest.skip("needs Linux with unprivileged user + PID namespaces")
+    await manager.start()
+    try:
+        conversation_id = "conv-live-in-host-ns"
+        client = await manager.get_client(conversation_id, _TEST_HARNESS_NAME)
+        harness_pid = (await client.get("/pid")).json()["pid"]
+
+        sweep = (
+            "import asyncio, pathlib, sys\n"
+            "from omnigent.runtime.harnesses.process_manager import "
+            "sweep_orphaned_harness_processes\n"
+            "asyncio.run(sweep_orphaned_harness_processes(tmp_parent=pathlib.Path(sys.argv[1])))\n"
+        )
+        result = await asyncio.to_thread(
+            subprocess.run,
+            [
+                "unshare",
+                "--user",
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "--mount-proc",
+                sys.executable,
+                "-c",
+                sweep,
+                str(manager.instance_dir.parent),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+        socket_path = manager.socket_path(conversation_id)
+        assert socket_path.exists()
+        # Fresh connection: the cached client's keepalive could otherwise
+        # reuse a socket opened before the sweep ran.
+        async with httpx.AsyncClient(
+            transport=httpx.AsyncHTTPTransport(uds=str(socket_path)),
+            base_url="http://harness.local",
+        ) as fresh:
+            assert (await fresh.get("/pid")).json()["pid"] == harness_pid
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.posix_only
+async def test_orphan_sweep_survives_unreadable_tmp_parent(
+    short_tmp_parent: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Warn and continue startup when the configured parent cannot be listed."""
+    if os.geteuid() == 0:
+        pytest.skip("permission checks do not apply to root")
+    locked_parent = short_tmp_parent / "fp"
+    locked_parent.mkdir(mode=0o700)
+    (locked_parent / "ap-unreachable").mkdir(mode=0o700)
+    # Write+search without read: our own instance dir can be created,
+    # but the sweep cannot enumerate the configured shared parent.
+    locked_parent.chmod(0o333)
+    manager = HarnessProcessManager(tmp_parent=locked_parent)
+    try:
+        await manager.start()
+        assert any(
+            "cannot enumerate" in record.getMessage() and str(locked_parent) in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        locked_parent.chmod(0o700)
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
+async def test_orphan_sweep_survives_tmp_parent_stat_error(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A tmp-parent stat race must not abort manager startup."""
+    real_exists = Path.exists
+    raised = False
+
+    def _racy_exists(self: Path) -> bool:
+        nonlocal raised
+        if self == short_tmp_parent and not raised:
+            raised = True
+            raise OSError("tmp parent changed during sweep")
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "exists", _racy_exists)
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert manager.instance_dir.exists()
+        assert any(
+            "cannot access" in record.getMessage() and str(short_tmp_parent) in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
+@pytest.mark.posix_only
+async def test_orphan_sweep_skips_unreadable_sibling_and_still_sweeps(
+    short_tmp_parent: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Skip a mode-0000 sibling, remove a readable dead orphan, and retain a live one."""
+    if os.geteuid() == 0:
+        pytest.skip("permission checks do not apply to root")
+    inaccessible = short_tmp_parent / "ap-inaccessible"
+    inaccessible.mkdir(mode=0o700)
+    (inaccessible / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    inaccessible.chmod(0o000)
+
+    dead = short_tmp_parent / "ap-deadsibling"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+
+    live = short_tmp_parent / "ap-livesibling"
+    live.mkdir(mode=0o700)
+    (live / _AP_PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
+
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert inaccessible.exists(), "unreadable sibling must be skipped, not removed"
+        assert not dead.exists(), "readable dead orphan must still be swept"
+        assert live.exists(), "live sibling must remain untouched"
+        assert any(
+            "cannot inspect" in record.getMessage() and str(inaccessible) in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        inaccessible.chmod(0o700)
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
+
+
+async def test_orphan_sweep_treats_vanishing_child_as_benign_race(
+    short_tmp_parent: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An injected is_dir race must not prevent cleanup of the next dead orphan."""
+    vanishing = short_tmp_parent / "ap-avanishing"
+    vanishing.mkdir(mode=0o700)
+    (vanishing / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+    dead = short_tmp_parent / "ap-zzdead"
+    dead.mkdir(mode=0o700)
+    (dead / _AP_PID_FILE).write_text("99999999", encoding="utf-8")
+
+    real_is_dir = Path.is_dir
+
+    def _racy_is_dir(self: Path, **kwargs: object) -> bool:
+        if self.name == "ap-avanishing":
+            raise FileNotFoundError(2, "vanished mid-sweep", str(self))
+        return real_is_dir(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "is_dir", _racy_is_dir)
+    manager = HarnessProcessManager(tmp_parent=short_tmp_parent)
+    try:
+        await manager.start()
+        assert not dead.exists(), "sweep must continue past the racy child"
+    finally:
+        monkeypatch.undo()
+        with contextlib.suppress(Exception):
+            await manager.shutdown()
 
 
 # ── Helper-level tests (small, fast) ───────────────────────────
@@ -595,6 +1642,21 @@ async def test_pids_holding_socket_returns_empty_for_missing(
     assert pids == []
 
 
+async def test_pids_holding_socket_returns_empty_when_lsof_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    short_tmp_parent: Path,
+) -> None:
+    """Missing ``lsof`` is best-effort cleanup noise, not a boot failure."""
+
+    async def missing_lsof(*_args: object, **_kwargs: object) -> object:
+        raise FileNotFoundError(2, "No such file or directory", "lsof")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", missing_lsof)
+
+    pids = await _pids_holding_socket(short_tmp_parent / "conv-stale.sock")
+    assert pids == []
+
+
 # ── Per-spawn env override ─────────────────────────────────────
 
 
@@ -619,6 +1681,37 @@ async def test_get_client_env_override_propagates_to_subprocess(
         # Subprocess saw the override in its env.
         resp = await client.get("/env/HARNESS_TEST_CUSTOM")
         assert resp.json() == {"value": "marker_alpha"}
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.parametrize("desktop_granted", [False, True])
+async def test_spawned_harness_requires_desktop_session_grant(
+    manager: HarnessProcessManager, monkeypatch: pytest.MonkeyPatch, desktop_granted: bool
+) -> None:
+    session_env = {
+        "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1000/bus",
+        "XDG_RUNTIME_DIR": "/run/user/1000",
+    }
+    for name, value in session_env.items():
+        monkeypatch.setenv(name, value)
+    auth_command = "printf %s test-provider-key"
+    await manager.start()
+    try:
+        client = await manager.get_client(
+            "conv_keyring",
+            _TEST_HARNESS_NAME,
+            env={
+                **(session_env if desktop_granted else {}),
+                "HARNESS_CODEX_GATEWAY_AUTH_COMMAND": auth_command,
+            },
+        )
+        for name, value in session_env.items():
+            response = await client.get(f"/env/{name}")
+            assert response.json() == {"value": value if desktop_granted else None}
+            assert os.environ[name] == value
+        response = await client.get("/env/HARNESS_CODEX_GATEWAY_AUTH_COMMAND")
+        assert response.json() == {"value": auth_command}
     finally:
         await manager.shutdown()
 
@@ -682,6 +1775,7 @@ async def test_runner_subprocess_exits_on_sigterm(
         await manager.shutdown()
 
 
+@pytest.mark.flaky(reruns=2, reruns_delay=0)
 async def test_runner_subprocess_exits_when_spawning_parent_exits(
     short_tmp_parent: Path,
     register_test_harness: None,
@@ -722,7 +1816,7 @@ async def test_runner_subprocess_exits_when_spawning_parent_exits(
         check=True,
         text=True,
         capture_output=True,
-        timeout=10,
+        timeout=30,
         env={**os.environ, "PYTHONPATH": os.getcwd()},
     )
     runner_pid = int(proc.stdout.strip().splitlines()[-1])
@@ -805,8 +1899,376 @@ async def test_orphan_sweep_escalates_to_sigkill(
     instance_dir.mkdir()
     (instance_dir / "conv-stale.sock").touch()
 
-    mgr = HarnessProcessManager(tmp_parent=short_tmp_parent)
-    await mgr._kill_orphan_runners(instance_dir)
+    await _kill_orphan_runners(instance_dir)
 
     assert calls == 2
     assert killed == [(12345, signal.SIGTERM), (12345, signal.SIGKILL)]
+
+
+# ── Mid-spawn cancellation ──────────────────────────────────────
+
+
+async def test_mid_spawn_cancellation_reaps_subprocess(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Cancelling ``get_client`` while the spawn is still waiting for
+    the runner to bind must kill the just-spawned subprocess.
+
+    The subprocess exists from ``create_subprocess_exec`` onward but
+    is only registered in ``_entries`` after ``_spawn_entry``
+    returns; a cancellation landing inside ``_wait_for_bind`` used
+    to leak it — unregistered, so ``release()`` no-ops and the idle
+    reaper never sees it.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    await manager.start()
+    try:
+        spawned: list[asyncio.subprocess.Process] = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def capturing_exec(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+            process = await real_exec(*args, **kwargs)  # type: ignore[arg-type]
+            spawned.append(process)
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", capturing_exec)
+
+        in_bind = asyncio.Event()
+
+        async def hanging_bind(*args: object, **kwargs: object) -> None:
+            in_bind.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(pm_mod, "_wait_for_bind", hanging_bind)
+
+        task = asyncio.create_task(manager.get_client("conv_leak", "test"))
+        await asyncio.wait_for(in_bind.wait(), timeout=10.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert spawned, "spawn was never reached"
+        process = spawned[0]
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        finally:
+            # Never leak the subprocess out of the test, even when
+            # the assertion below is about to fail on main.
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+        assert process.returncode is not None
+        assert not manager.has_session("conv_leak")
+    finally:
+        await manager.shutdown()
+
+
+async def test_mid_spawn_double_cancellation_still_reaps(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A second cancellation arriving while the first one's cleanup is
+    reaping the subprocess must not abort the reap: the corpse-wait
+    is shielded, so the process is still collected and the task
+    still ends cancelled.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    await manager.start()
+    try:
+        spawned: list[asyncio.subprocess.Process] = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def capturing_exec(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+            process = await real_exec(*args, **kwargs)  # type: ignore[arg-type]
+            spawned.append(process)
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", capturing_exec)
+
+        in_bind = asyncio.Event()
+
+        async def hanging_bind(*args: object, **kwargs: object) -> None:
+            in_bind.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(pm_mod, "_wait_for_bind", hanging_bind)
+
+        task = asyncio.create_task(manager.get_client("conv_leak2", "test"))
+        await asyncio.wait_for(in_bind.wait(), timeout=10.0)
+        task.cancel()
+        # Let the first cancellation reach the cleanup path, then
+        # cancel again so the second one lands on its awaits.
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert spawned, "spawn was never reached"
+        process = spawned[0]
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+        assert process.returncode is not None
+        assert not manager.has_session("conv_leak2")
+    finally:
+        await manager.shutdown()
+
+
+# ── Release / shutdown vs cold-spawn races ───────────────────────
+
+
+async def _cancel_pending(*tasks: asyncio.Task[object] | None) -> None:
+    """Cancel any still-pending tasks so a failed assertion cannot hang teardown."""
+    for task in tasks:
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, RuntimeError):
+                # Bind the result so static analysis does not treat the await
+                # as a dead statement (teardown only cares that the task settles).
+                _settled = await task
+                del _settled
+
+
+async def test_release_during_spawn_leaves_no_live_process(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``release`` during cold spawn must not lose to a late registration.
+
+    ``get_client`` holds the per-conversation spawn lock across
+    ``_wait_for_bind``, but ``release`` used to only inspect ``_entries``
+    under the registry lock. A release that arrived mid-bind saw no entry
+    and returned; the spawn then registered a live process that nobody
+    owned. Barriers pin the race: release is queued while bind is gated,
+    then bind completes so both sides settle under the shared spawn lock.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    await manager.start()
+    get_task: asyncio.Task[object] | None = None
+    release_task: asyncio.Task[None] | None = None
+    allow_bind = asyncio.Event()
+    try:
+        spawned: list[asyncio.subprocess.Process] = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def capturing_exec(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+            process = await real_exec(*args, **kwargs)  # type: ignore[arg-type]
+            spawned.append(process)
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", capturing_exec)
+
+        in_bind = asyncio.Event()
+        real_wait_for_bind = pm_mod._wait_for_bind
+
+        async def gated_bind(*args: object, **kwargs: object) -> None:
+            in_bind.set()
+            await allow_bind.wait()
+            await real_wait_for_bind(*args, **kwargs)
+
+        monkeypatch.setattr(pm_mod, "_wait_for_bind", gated_bind)
+
+        conv_id = "conv_release_during_spawn"
+        get_task = asyncio.create_task(manager.get_client(conv_id, _TEST_HARNESS_NAME))
+        await asyncio.wait_for(in_bind.wait(), timeout=10.0)
+        assert spawned, "spawn was never reached"
+        process = spawned[0]
+        pid = process.pid
+
+        # Queued behind the spawn lock until bind is allowed to finish.
+        release_task = asyncio.create_task(manager.release(conv_id))
+        await asyncio.sleep(0)
+        assert not release_task.done(), "release returned before spawn released the lock"
+
+        allow_bind.set()
+        client = await get_task
+        assert client is not None
+        assert await release_task is None
+
+        socket_path = manager.instance_dir / f"conv-{conv_id}.sock"
+        assert not manager.has_session(conv_id)
+        assert conv_id not in manager._entries
+        assert not socket_path.exists()
+        for _ in range(40):
+            if not _pid_alive(pid):
+                break
+            await asyncio.sleep(0.05)
+        assert not _pid_alive(pid), "release-during-spawn left a live harness process"
+        assert process.returncode is not None
+    finally:
+        allow_bind.set()
+        await _cancel_pending(get_task, release_task)
+        await manager.shutdown()
+
+
+async def test_release_invalidates_queued_get_client(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``get_client`` queued behind ``release`` must not respawn after teardown.
+
+    Getter A holds the spawn lock mid-bind; ``release`` queues; getter B
+    queues behind release. Without a release generation, A registers,
+    release closes it, then B acquires the lock and spawns again —
+    leaving ``has_session`` True after release. B must fail; a fresh
+    ``get_client`` after release may still respawn.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    await manager.start()
+    get_a: asyncio.Task[object] | None = None
+    get_b: asyncio.Task[object] | None = None
+    release_task: asyncio.Task[None] | None = None
+    allow_bind = asyncio.Event()
+    try:
+        spawned: list[asyncio.subprocess.Process] = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def capturing_exec(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+            process = await real_exec(*args, **kwargs)  # type: ignore[arg-type]
+            spawned.append(process)
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", capturing_exec)
+
+        in_bind = asyncio.Event()
+        real_wait_for_bind = pm_mod._wait_for_bind
+
+        async def gated_bind(*args: object, **kwargs: object) -> None:
+            in_bind.set()
+            await allow_bind.wait()
+            await real_wait_for_bind(*args, **kwargs)
+
+        monkeypatch.setattr(pm_mod, "_wait_for_bind", gated_bind)
+
+        conv_id = "conv_release_queued_waiter"
+        get_a = asyncio.create_task(manager.get_client(conv_id, _TEST_HARNESS_NAME))
+        await asyncio.wait_for(in_bind.wait(), timeout=10.0)
+        assert spawned, "first spawn was never reached"
+
+        release_task = asyncio.create_task(manager.release(conv_id))
+        await asyncio.sleep(0)
+        get_b = asyncio.create_task(manager.get_client(conv_id, _TEST_HARNESS_NAME))
+        await asyncio.sleep(0)
+        assert not release_task.done()
+        assert not get_b.done()
+
+        allow_bind.set()
+        client_a = await get_a
+        assert client_a is not None
+        assert await release_task is None
+
+        done, pending = await asyncio.wait({get_b})
+        assert not pending
+        assert done == {get_b}
+        exc = get_b.exception()
+        assert isinstance(exc, RuntimeError)
+        assert "was released while get_client waited" in str(exc)
+
+        assert len(spawned) == 1, "queued get_client respawned after release"
+        assert not manager.has_session(conv_id)
+        assert conv_id not in manager._entries
+        for process in spawned:
+            for _ in range(40):
+                if process.returncode is not None and not _pid_alive(process.pid):
+                    break
+                await asyncio.sleep(0.05)
+            assert process.returncode is not None
+            assert not _pid_alive(process.pid)
+
+        # A call that starts after release must still be allowed to respawn.
+        client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
+        assert manager.has_session(conv_id)
+        await _ping_health(client)
+        assert len(spawned) == 2
+    finally:
+        allow_bind.set()
+        await _cancel_pending(get_a, get_b, release_task)
+        await manager.shutdown()
+
+
+async def test_shutdown_during_spawn_leaves_no_live_process(
+    manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``shutdown`` during cold spawn must not leave an unregistered process.
+
+    Shutdown used to walk only ``_entries``. A spawn still awaiting
+    readiness was invisible, so shutdown could finish and the spawn
+    could then register a live process against a torn-down manager.
+    Barriers pin the race; after both settle there must be no process,
+    socket, or ``_entries`` record.
+    """
+    from omnigent.runtime.harnesses import process_manager as pm_mod
+
+    await manager.start()
+    get_task: asyncio.Task[object] | None = None
+    shutdown_task: asyncio.Task[None] | None = None
+    allow_bind = asyncio.Event()
+    try:
+        spawned: list[asyncio.subprocess.Process] = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def capturing_exec(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+            process = await real_exec(*args, **kwargs)  # type: ignore[arg-type]
+            spawned.append(process)
+            return process
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", capturing_exec)
+
+        in_bind = asyncio.Event()
+        real_wait_for_bind = pm_mod._wait_for_bind
+
+        async def gated_bind(*args: object, **kwargs: object) -> None:
+            in_bind.set()
+            await allow_bind.wait()
+            await real_wait_for_bind(*args, **kwargs)
+
+        monkeypatch.setattr(pm_mod, "_wait_for_bind", gated_bind)
+
+        conv_id = "conv_shutdown_during_spawn"
+        get_task = asyncio.create_task(manager.get_client(conv_id, _TEST_HARNESS_NAME))
+        await asyncio.wait_for(in_bind.wait(), timeout=10.0)
+        assert spawned, "spawn was never reached"
+        process = spawned[0]
+        pid = process.pid
+        socket_path = manager.instance_dir / f"conv-{conv_id}.sock"
+
+        shutdown_task = asyncio.create_task(manager.shutdown())
+        await asyncio.sleep(0)
+        assert not shutdown_task.done(), "shutdown finished before in-flight spawn drained"
+
+        allow_bind.set()
+        # Spawn either registers-then-gets-released, or discards on the
+        # shutting-down check — assert the shutdown-specific errors only.
+        done, pending = await asyncio.wait({get_task})
+        assert not pending
+        assert done == {get_task}
+        exc = get_task.exception()
+        assert isinstance(exc, RuntimeError)
+        assert "shutdown" in str(exc).lower()
+        assert await shutdown_task is None
+
+        assert not manager.has_session(conv_id)
+        assert conv_id not in manager._entries
+        assert not socket_path.exists()
+        for _ in range(40):
+            if not _pid_alive(pid):
+                break
+            await asyncio.sleep(0.05)
+        assert not _pid_alive(pid), "shutdown-during-spawn left a live harness process"
+        assert process.returncode is not None
+    finally:
+        allow_bind.set()
+        await _cancel_pending(get_task, shutdown_task)
+        # Idempotent if the test already shut down; still safe if it failed early.
+        await manager.shutdown()

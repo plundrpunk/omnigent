@@ -6,12 +6,10 @@ so the full request → store → response pipeline is exercised.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
 import pytest
-import pytest_asyncio
 from fastapi import FastAPI
 
 from omnigent.runtime.agent_cache import AgentCache
@@ -23,7 +21,6 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
-from tests.server.conftest import ControllableMockClient
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -37,7 +34,7 @@ def _seed_session_with_grants(
     :param db_uri: SQLite URI for the per-test database.
     :param grants: Mapping of ``{user_email: level}`` to grant on the new
         session, e.g. ``{"alice@example.com": LEVEL_EDIT}``.
-    :returns: The newly created conversation ID, e.g. ``"conv_abc123"``.
+    :returns: The newly created conversation ID, e.g. ``"d1f9214d74c38b9f9a9db17ed8352dc4"``.
     """
     conv_store = SqlAlchemyConversationStore(db_uri)
     conversation = conv_store.create_conversation()
@@ -85,35 +82,6 @@ def auth_app(
     )
 
 
-@pytest_asyncio.fixture()
-async def auth_client(
-    auth_app: FastAPI,
-    mock_llm: ControllableMockClient,
-    tmp_path: Path,
-) -> AsyncIterator[httpx.AsyncClient]:
-    """Async HTTP client wired to the auth-enabled app.
-
-    :param auth_app: FastAPI app with permission and policy stores.
-    :param mock_llm: Controllable mock LLM — released on teardown.
-    :param tmp_path: Pytest temp dir for the harness process manager.
-    :yields: A ready-to-use :class:`httpx.AsyncClient`.
-    """
-    from omnigent.runtime import set_harness_process_manager
-    from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-
-    pm = HarnessProcessManager(tmp_parent=tmp_path / "harness_pm")
-    await pm.start()
-    set_harness_process_manager(pm)
-
-    transport = httpx.ASGITransport(app=auth_app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
-        yield c
-
-    mock_llm.release_all()
-    set_harness_process_manager(None)
-    await pm.shutdown()
-
-
 # ── CRUD happy path ──────────────────────────────────────────────────────────
 
 
@@ -149,7 +117,7 @@ async def test_create_policy(
     assert body["enabled"] is True
     assert body["source"] == "session"
     assert body["object"] == "session.policy"
-    assert body["id"].startswith("pol_")
+    assert len(body["id"]) == 32
     assert body["created_at"] > 0
     assert body["updated_at"] is None
 
@@ -372,7 +340,7 @@ async def test_get_nonexistent_returns_404(
     """
     session_id = _seed_session_with_grants(db_uri, {"alice@example.com": LEVEL_READ})
     resp = await auth_client.get(
-        f"/v1/sessions/{session_id}/policies/spol_nonexistent",
+        f"/v1/sessions/{session_id}/policies/1849035e76954fbd652b51dff31a4a96",
         headers={"X-Forwarded-Email": "alice@example.com"},
     )
     assert resp.status_code == 404

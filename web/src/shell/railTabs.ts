@@ -1,0 +1,20 @@
+/**
+ * Shared geometry + types for the right "Workspace" rail tabs. Its own module
+ * so `WorkspacePanel` and the mobile FAB (`ChatHeader`) share one source of
+ * truth without importing back through `AppShell` (a cycle).
+ */
+
+/** The selectable tabs in the right workspace rail, in display order.
+ *  "run" is the fleet Work Loop tab, shown first when the host passes Work Loop data.
+ *  "browser" and "sidechat" are dynamic-tab modes (a browser tab / a side-chat
+ *  tab is selected), not fixed nav tabs — the nav strip renders the first four.
+ *  "github" is a stable stored id for the Pull Requests tab; renaming it drops saved choices. */
+export type RightRailTab =
+  "run" | "files" | "changes" | "github" | "subagents" | "browser" | "sidechat" | "content-search";
+
+/**
+ * Count/status badge geometry. Fixed height with min-width == height keeps a
+ * single digit a circle while "1/2" / double digits grow into a pill.
+ */
+export const TAB_BADGE_BASE =
+  "inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[9px] leading-none tabular-nums";

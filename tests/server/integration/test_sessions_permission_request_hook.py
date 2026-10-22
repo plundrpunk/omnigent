@@ -28,34 +28,26 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import threading
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
+from fastapi import FastAPI
+from fastapi.routing import APIRoute
 
-from omnigent.codex_native_elicitation import codex_elicitation_id
+from omnigent.harnesses.codex_native.elicitation import codex_elicitation_id
 from omnigent.runtime import session_stream
 from omnigent.server._elicitation_registry import (
     _harness_pre_resolved_elicitations,
     _PreResolvedHarnessElicitation,
 )
 from omnigent.server.routes import sessions as sessions_route
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import create_session_for_agent as _create_session
+from tests.server.helpers import create_test_agent, start_session_stream_collector
 
 pytestmark = pytest.mark.asyncio
-
-
-async def _create_session(client: httpx.AsyncClient, agent_id: str) -> str:
-    """
-    Create a minimal session and return its id.
-
-    :param client: Test HTTP client.
-    :param agent_id: Agent to bind.
-    :returns: New session id.
-    """
-    resp = await client.post("/v1/sessions", json={"agent_id": agent_id})
-    assert resp.status_code == 201, f"create failed: {resp.status_code} {resp.text}"
-    return resp.json()["id"]
 
 
 async def _drain_until_elicitation(
@@ -72,7 +64,7 @@ async def _drain_until_elicitation(
     elicitation future, so subscribing here is the simplest way to
     learn the id without monkey-patching ``uuid``. Returning the
     whole event lets callers also inspect the params block for the
-    Claude-native extras (``tool_use_id``, ``cwd``, ``permission_mode``).
+    Claude-native extras (``cwd``, ``permission_mode``).
 
     :param session_id: Session to subscribe to.
     :param timeout_s: Maximum seconds to wait for the elicitation
@@ -96,6 +88,7 @@ async def _post_approval(
     elicitation_id: str,
     action: str,
     content: dict[str, Any] | None = None,
+    meta: dict[str, Any] | None = None,
 ) -> httpx.Response:
     """
     Resolve a published elicitation through the session event API.
@@ -107,11 +100,15 @@ async def _post_approval(
     :param action: MCP ``ElicitResult.action`` literal,
         e.g. ``"accept"`` or ``"decline"``.
     :param content: Optional MCP ``ElicitResult.content`` payload.
+    :param meta: Optional MCP ``_meta`` payload, e.g. a persistence
+        choice ``{"persist": "always"}``.
     :returns: The HTTP response from the session event route.
     """
     data: dict[str, Any] = {"elicitation_id": elicitation_id, "action": action}
     if content is not None:
         data["content"] = content
+    if meta is not None:
+        data["_meta"] = meta
     return await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
@@ -128,6 +125,9 @@ async def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
     :param tool_name: Tool Claude wants to call.
     :returns: JSON-serializable payload mirroring Claude Code's
         published wire shape for the ``PermissionRequest`` event.
+        Deliberately carries no ``tool_use_id``: the real
+        PermissionRequest payload has no per-call id (it is minted only
+        when the tool call is emitted, after this permission check).
     """
     return {
         "session_id": "claude_sess_abc",
@@ -137,12 +137,13 @@ async def _claude_permission_payload(tool_name: str = "Bash") -> dict[str, Any]:
         "hook_event_name": "PermissionRequest",
         "tool_name": tool_name,
         "tool_input": {"command": "ls -la"},
-        "tool_use_id": "tool_use_xyz",
     }
 
 
+@pytest.mark.parametrize("harness", [None, "claude-native"])
 async def test_permission_request_hook_allow_round_trip(
     client: httpx.AsyncClient,
+    harness: str | None,
 ) -> None:
     """
     UI approves Claude's permission request → endpoint returns
@@ -154,7 +155,11 @@ async def test_permission_request_hook_allow_round_trip(
     doesn't park the future (verdict comes in but the endpoint never
     wakes); the verdict→decision mapping returns the wrong literal.
     """
-    agent = await create_test_agent(client, "test-permission-allow")
+    agent = await create_test_agent(
+        client,
+        "test-permission-allow",
+        executor={"type": "omnigent", "config": {"harness": harness}} if harness else None,
+    )
     session_id = await _create_session(client, agent["id"])
     payload = await _claude_permission_payload()
 
@@ -174,6 +179,8 @@ async def test_permission_request_hook_allow_round_trip(
     )
 
     event = await drain_task
+    assert event["params"]["message"] == "Claude wants to call **Bash**"
+    assert event["params"]["policy_name"] == "claude_native_permission"
     verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
     assert verdict.status_code == 202, verdict.text
 
@@ -188,7 +195,355 @@ async def test_permission_request_hook_allow_round_trip(
     }
 
 
+@pytest.mark.parametrize("tool_name", ["Bash", "Write", "AskUserQuestion", "ExitPlanMode"])
+@pytest.mark.parametrize("action", ["accept", "decline"])
+@pytest.mark.parametrize(
+    ("vendor", "supplies_id"), [("kimi", True), ("devin", True), ("devin", False)]
+)
+async def test_permission_request_hook_preserves_native_verdict(
+    client: httpx.AsyncClient,
+    tool_name: str,
+    action: str,
+    vendor: str,
+    supplies_id: bool,
+) -> None:
+    """Kimi and Devin keep their cards and supported verdicts, including older Devin hooks."""
+    agent = await create_test_agent(
+        client,
+        "test-permission-native-id",
+        executor={"type": "omnigent", "config": {"harness": f"{vendor}-native"}},
+    )
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_{vendor}_" + "0" * 32
+    payload = await _claude_permission_payload(tool_name)
+    if supplies_id:
+        payload["_omnigent_elicitation_id"] = elicitation_id
+    if tool_name == "AskUserQuestion":
+        payload["tool_input"] = {
+            "questions": [{"question": "Continue?", "header": "Next", "options": []}]
+        }
+    elif tool_name == "ExitPlanMode":
+        payload["tool_input"] = {"plan": "Run the tests."}
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # The published card uses the client-supplied id verbatim (not 400, not a
+    # server-minted replacement).
+    if supplies_id:
+        assert event["elicitation_id"] == elicitation_id
+    else:
+        elicitation_id = event["elicitation_id"]
+    params = event["params"]
+    assert params["message"] == f"{vendor.capitalize()} wants to call **{tool_name}**"
+    assert params["policy_name"] == f"{vendor}_native_permission"
+    for extra in (
+        "allow_auto_mode",
+        "allow_all_edits",
+        "remember_scope",
+        "ask_user_question",
+        "exit_plan_mode",
+    ):
+        assert extra not in params
+    verdict = await _post_approval(
+        client,
+        session_id,
+        elicitation_id,
+        action,
+        {"allow_auto_mode": True, "allow_all_edits": True, "remember": True, "feedback": "Wait"},
+    )
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["hookSpecificOutput"]["decision"] == {
+        "behavior": "allow" if action == "accept" else "deny",
+        **({"message": "Wait"} if action == "decline" else {}),
+    }
+
+
+@pytest.mark.parametrize(
+    ("harness", "labels", "override", "hook_vendor"),
+    [
+        ("codex-native", {}, None, "claude"),
+        ("codex-native", {}, None, None),
+        (None, {"omnigent.wrapper": "codex-native-ui"}, None, "claude"),
+        ("claude-native", {"omnigent.wrapper": "claude-code-native-ui"}, "codex-native", "claude"),
+        ("pi-native", {}, None, "claude"),
+        ("claude-native", {}, None, "kimi"),
+        ("kimi-native", {}, None, "claude"),
+        ("devin-native", {}, None, "claude"),
+        ("devin-native", {}, None, "kimi"),
+        ("claude-native", {}, None, "devin"),
+        ("codex-native", {}, None, "devin"),
+    ],
+)
+async def test_permission_request_hook_rejects_mismatched_native_harness(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    harness: str | None,
+    labels: dict[str, str],
+    override: str | None,
+    hook_vendor: str | None,
+) -> None:
+    """A stale callback must not publish an approval into another native harness's session."""
+    monkeypatch.setattr(sessions_route, "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S", 0.01)
+    agent = await create_test_agent(
+        client,
+        "test-permission-mismatch",
+        executor={"type": "omnigent", "config": {"harness": harness}} if harness else None,
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "labels": labels, "harness_override": override},
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    payload = await _claude_permission_payload()
+    if hook_vendor is not None:
+        payload["_omnigent_elicitation_id"] = f"elicit_{hook_vendor}_" + "0" * 32
+    collector = await start_session_stream_collector(session_id)
+    try:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request", json=payload
+        )
+        assert response.status_code == 409, response.text
+        assert "permission hook does not match" in response.text
+        await collector.assert_no_event(within=0.01)
+    finally:
+        await collector.stop()
+
+
+async def test_permission_hook_concurrent_sessions_cannot_claim_same_id(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent metadata reads must not let two sessions claim the same approval id."""
+    from omnigent.server.routes.sessions import routes_hooks
+
+    agent = await create_test_agent(client, "test-permission-concurrent-owner")
+    session_ids = [await _create_session(client, agent["id"]) for _ in range(2)]
+    collectors = [await start_session_stream_collector(sid) for sid in session_ids]
+    barrier = threading.Barrier(2)
+    original = routes_hooks._resolve_harness
+
+    def resolve_together(*args: Any, **kwargs: Any) -> str | None:
+        harness = original(*args, **kwargs)
+        barrier.wait(timeout=5)
+        return harness
+
+    monkeypatch.setattr(routes_hooks, "_resolve_harness", resolve_together)
+    monkeypatch.setattr(sessions_route, "_CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S", 1.0)
+    elicitation_id = "elicit_claude_" + "1" * 32
+    payload = {**(await _claude_permission_payload()), "_omnigent_elicitation_id": elicitation_id}
+    tasks = [
+        asyncio.create_task(
+            client.post(f"/v1/sessions/{sid}/hooks/permission-request", json=payload)
+        )
+        for sid in session_ids
+    ]
+    try:
+        done, pending = await asyncio.wait(tasks, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+        assert len(done) == len(pending) == 1
+        rejected = done.pop()
+        assert rejected.result().status_code == 400, rejected.result().text
+        rejected_index = tasks.index(rejected)
+        await collectors[rejected_index].assert_no_event(within=0.01)
+        accepted = pending.pop()
+        accepted_index = tasks.index(accepted)
+        event = await collectors[accepted_index].next_event()
+        assert event["elicitation_id"] == elicitation_id
+        verdict = await _post_approval(
+            client, session_ids[accepted_index], elicitation_id, "accept"
+        )
+        assert verdict.status_code == 202, verdict.text
+        response = await accepted
+        assert response.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for collector in collectors:
+            await collector.stop()
+
+
+async def test_cursor_permission_request_hook_allow_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    cursor-native TUI prompt → web ApprovalCard → accept → verdict.
+
+    The runner-side mirror (``omnigent.harnesses.cursor_native.permissions``) POSTs a
+    detected cursor TUI approval prompt to
+    ``/hooks/cursor-permission-request``; the route publishes a
+    ``response.elicitation_request`` (phase ``pre_tool_use``, policy
+    ``cursor_native_permission``, carrying the runner-minted elicitation id and
+    the rendered command preview) and parks on the same harness-elicitation
+    registry the Claude hook uses, then returns the MCP ``ElicitationResult``
+    once the UI answers. This is the cursor-native analog of
+    ``test_permission_request_hook_allow_round_trip``.
+
+    Catches: the SSE event never emitted (the card never renders); the
+    runner-minted id not preserved (the runner can't correlate its verdict); the
+    park/resolve plumbing not wired (the POST never wakes on the UI verdict).
+    """
+    agent = await create_test_agent(client, "test-cursor-permission-allow")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_cursor_{session_id}_deadbeef"
+    payload = {
+        "elicitation_id": elicitation_id,
+        "operation_type": "shell",
+        "message": "Run this command?",
+        "content_preview": "echo hi > out.txt",
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/cursor-permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # The runner-minted id is preserved end-to-end, and the card carries the
+    # cursor-native rendering extras.
+    assert event["elicitation_id"] == elicitation_id
+    params = event["params"]
+    assert params["message"] == "Run this command?"
+    assert params["phase"] == "pre_tool_use"
+    assert params["policy_name"] == "cursor_native_permission"
+    assert params["content_preview"] == "echo hi > out.txt"
+
+    verdict = await _post_approval(client, session_id, elicitation_id, "accept")
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"action": "accept"}
+
+
+async def test_qwen_permission_request_hook_allow_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    qwen-native TUI ``can_use_tool`` → web ApprovalCard → accept → verdict.
+
+    The runner-side mirror (``omnigent.harnesses.qwen_native.permissions``) reads a
+    ``can_use_tool`` control request off qwen's ``--json-file`` and POSTs it to
+    the generic ``/hooks/native-permission-request`` (shared with hermes-/goose-
+    native) with ``agent="qwen"`` + ``policy_name="qwen_native_permission"``; the
+    route publishes a ``response.elicitation_request`` (phase ``pre_tool_use``,
+    the qwen policy name, carrying the runner-minted elicitation id and the
+    rendered tool preview) and parks on the same harness-elicitation registry the
+    Claude/Cursor hooks use, then returns the MCP ``ElicitationResult`` once the
+    UI answers. The qwen-native analog of
+    ``test_cursor_permission_request_hook_allow_round_trip``.
+    """
+    agent = await create_test_agent(client, "test-qwen-permission-allow")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_qwen_{session_id}_r1"
+    payload = {
+        "elicitation_id": elicitation_id,
+        "agent": "qwen",
+        "policy_name": "qwen_native_permission",
+        "operation_type": "run_shell_command",
+        "message": "qwen wants to run run_shell_command",
+        "content_preview": "echo hi > out.txt",
+        "ask_user_question": {"questions": [{"id": "0", "question": "Continue?", "options": []}]},
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/native-permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    assert event["elicitation_id"] == elicitation_id
+    params = event["params"]
+    assert params["message"] == "qwen wants to run run_shell_command"
+    assert params["phase"] == "pre_tool_use"
+    assert params["policy_name"] == "qwen_native_permission"
+    assert params["content_preview"] == "echo hi > out.txt"
+    assert params["ask_user_question"] == payload["ask_user_question"]
+
+    verdict = await _post_approval(client, session_id, elicitation_id, "accept")
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"action": "accept"}
+
+
+async def test_cursor_permission_request_hook_stamps_ask_user_question_extra(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    cursor ``AskQuestion`` → the structured ``ask_user_question`` extra is
+    published on the elicitation params (uncapped), so the web UI renders the
+    interactive form from it rather than parsing the ≤1024-char content_preview.
+
+    Catches: a multi-question payload silently dropped (web falls back to the
+    raw approve/reject card); the extra not surviving the params round-trip.
+    """
+    agent = await create_test_agent(client, "test-cursor-askquestion")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = f"elicit_cursor_{session_id}_q1"
+    ask_user_question = {
+        "questions": [
+            {
+                "id": "demo_topic",
+                "question": "What kind of example would you like to see?",
+                "options": [
+                    {"label": "A coding-related question"},
+                    {"label": "A workflow question"},
+                ],
+                "multiSelect": False,
+            }
+        ]
+    }
+    payload = {
+        "elicitation_id": elicitation_id,
+        "operation_type": "question",
+        "message": "AskQuestion Demo",
+        "content_preview": "AskUserQuestion({...})",
+        "ask_user_question": ask_user_question,
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/cursor-permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    params = event["params"]
+    assert params["policy_name"] == "cursor_native_permission"
+    # The structured payload rode through verbatim as the params extra.
+    assert params["ask_user_question"] == ask_user_question
+
+    verdict = await _post_approval(client, session_id, elicitation_id, "accept")
+    assert verdict.status_code == 202, verdict.text
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+
+
 async def test_top_level_elicitations_route_is_not_mounted(
+    app: FastAPI,
     client: httpx.AsyncClient,
 ) -> None:
     """
@@ -197,12 +552,38 @@ async def test_top_level_elicitations_route_is_not_mounted(
     Approval verdicts must travel through the session event route so
     they share normal session scoping and authorization. If the AP
     router gets mounted again, this test turns red immediately.
+
+    Checked two ways so the guard holds regardless of the environment:
+
+    - Route table (``app`` fixture): no ``APIRoute`` declares the
+      legacy ``POST /v1/elicitations/{elicitation_id}`` path. This
+      catches an exact re-mount even if its handler would 404 at
+      runtime, and is independent of which static assets are present.
+    - HTTP (``client`` fixture, same app): the live response is
+      ``404`` *or* ``405``. The status varies by environment because
+      ``create_app`` mounts a catch-all SPA at ``/`` only when a local
+      web-ui build exists at ``omnigent/server/static/web-ui/index.html``
+      (a gitignored dev artifact, absent on main/CI/fresh clones).
+      With no build the unmatched POST is a plain ``404``; with the
+      build present Starlette's ``StaticFiles`` matches the path but
+      rejects the non-GET method with ``405``. Either way no handler
+      ran. A re-mounted legacy route would instead run its handler and
+      return ``400`` (missing ``response_id`` for this body), ``501``,
+      or ``2xx`` — never ``404``/``405`` — so both assertions still
+      bite.
     """
+    assert not any(
+        isinstance(route, APIRoute)
+        and route.path == "/v1/elicitations/{elicitation_id}"
+        and "POST" in route.methods
+        for route in app.routes
+    ), "legacy POST /v1/elicitations/{elicitation_id} route is mounted again"
+
     resp = await client.post(
         "/v1/elicitations/elicit_removed",
         json={"action": "accept"},
     )
-    assert resp.status_code == 404, resp.text
+    assert resp.status_code in (404, 405), resp.text
 
 
 async def test_permission_request_hook_deny_round_trip(
@@ -237,6 +618,151 @@ async def test_permission_request_hook_deny_round_trip(
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "permission_mode"),
+    [
+        ("Bash", "default"),
+        ("Edit", "default"),
+        ("Write", "default"),
+        ("MultiEdit", "default"),
+        ("NotebookEdit", "default"),
+        ("WebFetch", "default"),
+        ("mcp__example__tool", "default"),
+        ("Bash", "acceptEdits"),
+        ("Bash", None),
+    ],
+)
+async def test_permission_request_hook_auto_mode_round_trip(
+    client: httpx.AsyncClient, tool_name: str, permission_mode: str | None
+) -> None:
+    agent = await create_test_agent(client, "test-permission-auto-mode")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload(tool_name=tool_name)
+    if permission_mode is None:
+        payload.pop("permission_mode")
+    else:
+        payload["permission_mode"] = permission_mode
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+
+    event = await drain_task
+    assert event["params"]["allow_auto_mode"] is True
+    verdict = await _post_approval(
+        client, session_id, event["elicitation_id"], "accept", {"allow_auto_mode": True}
+    )
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    assert response.json()["hookSpecificOutput"]["decision"] == {
+        "behavior": "allow",
+        "updatedPermissions": [{"type": "setMode", "mode": "auto", "destination": "session"}],
+    }
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "permission_mode"),
+    [
+        ("AskUserQuestion", "default"),
+        ("ExitPlanMode", "plan"),
+        ("Bash", "plan"),
+        ("Bash", "auto"),
+        ("Bash", "bypassPermissions"),
+        ("Bash", "dontAsk"),
+        ("Bash", "unknown"),
+    ],
+)
+async def test_permission_request_hook_ineligible_auto_mode_not_offered_or_honored(
+    client: httpx.AsyncClient, tool_name: str, permission_mode: str
+) -> None:
+    agent = await create_test_agent(client, "test-permission-auto-mode-ineligible")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload(tool_name=tool_name)
+    payload["permission_mode"] = permission_mode
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+
+    event = await drain_task
+    assert "allow_auto_mode" not in event["params"]
+    verdict = await _post_approval(
+        client, session_id, event["elicitation_id"], "accept", {"allow_auto_mode": True}
+    )
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    decision = response.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    if tool_name == "ExitPlanMode":
+        assert decision["updatedPermissions"] == [
+            {"type": "setMode", "mode": "default", "destination": "session"}
+        ]
+    else:
+        assert "updatedPermissions" not in decision
+
+
+@pytest.mark.parametrize(
+    ("action", "content"),
+    [
+        ("accept", None),
+        ("accept", {"allow_auto_mode": False}),
+        ("accept", {"allow_auto_mode": "true"}),
+        ("accept", {"allow_auto_mode": 1}),
+        ("decline", {"allow_auto_mode": True}),
+    ],
+)
+async def test_permission_request_hook_auto_mode_requires_explicit_accept(
+    client: httpx.AsyncClient, action: str, content: dict[str, Any] | None
+) -> None:
+    agent = await create_test_agent(client, "test-permission-auto-mode-explicit")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload()
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+
+    event = await drain_task
+    assert event["params"]["allow_auto_mode"] is True
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], action, content)
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    decision = response.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == ("allow" if action == "accept" else "deny")
+    assert "updatedPermissions" not in decision
+
+
+@pytest.mark.parametrize("tool_name", ["Bash", "Edit"])
+async def test_permission_request_hook_auto_mode_not_overwritten_by_other_approval_flags(
+    client: httpx.AsyncClient, tool_name: str
+) -> None:
+    agent = await create_test_agent(client, "test-permission-auto-mode-precedence")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload(tool_name=tool_name)
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+
+    event = await drain_task
+    verdict = await _post_approval(
+        client,
+        session_id,
+        event["elicitation_id"],
+        "accept",
+        {"allow_auto_mode": True, "allow_all_edits": True, "remember": True},
+    )
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    assert response.json()["hookSpecificOutput"]["decision"]["updatedPermissions"] == [
+        {"type": "setMode", "mode": "auto", "destination": "session"}
+    ]
 
 
 async def test_permission_request_hook_allow_all_edits_round_trip(
@@ -424,6 +950,280 @@ async def test_permission_request_hook_edit_plain_accept_has_no_mode_switch(
     assert "updatedPermissions" not in decision
 
 
+async def _claude_webfetch_payload(url: str = "https://github.com/cli/cli") -> dict[str, Any]:
+    """
+    Build a Claude PermissionRequest hook body for a WebFetch call.
+
+    :param url: The URL WebFetch wants to fetch — its host scopes the
+        persistent "don't ask again" rule.
+    :returns: JSON-serializable PermissionRequest payload for WebFetch.
+    """
+    return {
+        "session_id": "claude_sess_abc",
+        "transcript_path": "/tmp/transcript.jsonl",
+        "cwd": "/tmp/cwd",
+        "permission_mode": "default",
+        "hook_event_name": "PermissionRequest",
+        "tool_name": "WebFetch",
+        "tool_input": {"url": url, "prompt": "summarize"},
+    }
+
+
+async def test_permission_request_hook_remember_webfetch_domain_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    WebFetch prompt: the endpoint stamps a ``remember_scope`` carrying
+    the request host, and resolving with ``content.remember`` makes the
+    decision carry an ``addRules`` permission update that installs a
+    session-scoped ``WebFetch(domain:<host>)`` allow rule.
+
+    This restores native Claude Code parity: approving one github.com
+    URL stops the per-call re-prompting for the whole domain. Failure
+    modes this catches: the scope hint never gets stamped (no button);
+    the verdict drops ``updatedPermissions`` (rule never installed, so
+    same-domain calls keep prompting); the rule shape is wrong (Claude
+    Code ignores it).
+    """
+    agent = await create_test_agent(client, "test-permission-remember-webfetch")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_webfetch_payload("https://github.com/cli/cli/issues/42")
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # The scope hint drives the "don't ask again for github.com" button.
+    assert event["params"]["remember_scope"] == {"tool": "WebFetch", "host": "github.com"}
+
+    verdict = await _post_approval(
+        client,
+        session_id,
+        event["elicitation_id"],
+        "accept",
+        content={"remember": True},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    decision = resp.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    # Shape matches the Agent SDK's PermissionUpdate ``addRules`` variant;
+    # ``domain:`` scopes the rule to the host, "session" to this session.
+    assert decision["updatedPermissions"] == [
+        {
+            "type": "addRules",
+            "rules": [{"toolName": "WebFetch", "ruleContent": "domain:github.com"}],
+            "behavior": "allow",
+            "destination": "session",
+        }
+    ]
+
+
+async def test_permission_request_hook_remember_tool_wide_fallback(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Non-WebFetch tool (Bash): the ``remember_scope`` carries only the
+    tool (no host), and accepting with ``content.remember`` installs a
+    TOOL-WIDE allow rule — an ``addRules`` entry with ``toolName`` and
+    no ``ruleContent``.
+
+    Same fallback path a WebFetch with a missing/unparseable URL takes:
+    when there's no domain to scope to, the rule covers the whole tool.
+    """
+    agent = await create_test_agent(client, "test-permission-remember-bash")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload(tool_name="Bash")
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # Tool-wide scope: tool only, no host.
+    assert event["params"]["remember_scope"] == {"tool": "Bash"}
+
+    verdict = await _post_approval(
+        client,
+        session_id,
+        event["elicitation_id"],
+        "accept",
+        content={"remember": True},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    decision = resp.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    # No ``ruleContent`` → the rule matches the whole tool.
+    assert decision["updatedPermissions"] == [
+        {
+            "type": "addRules",
+            "rules": [{"toolName": "Bash"}],
+            "behavior": "allow",
+            "destination": "session",
+        }
+    ]
+
+
+async def test_permission_request_hook_remember_not_offered_for_edit_tool(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Edit tools take the ``acceptEdits``/``setMode`` path, NOT a
+    persistent allow rule, so the endpoint must not stamp
+    ``remember_scope`` for them — and a forged ``content.remember`` on
+    an edit-tool prompt must NOT produce an ``addRules`` decision.
+
+    Server-side eligibility guard (mirrors the ``allow_all_edits``
+    re-check): without it, a crafted approval payload could smuggle an
+    allow rule onto a tool the affordance was never offered for.
+    """
+    agent = await create_test_agent(client, "test-permission-remember-edit-guard")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload(tool_name="Edit")
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # No remember hint for edit tools (they get allow_all_edits instead).
+    assert "remember_scope" not in event["params"]
+
+    # Forge the flag the UI would never attach to an edit-tool prompt.
+    verdict = await _post_approval(
+        client,
+        session_id,
+        event["elicitation_id"],
+        "accept",
+        content={"remember": True},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    decision = resp.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    # Server ignores the spoofed flag — no allow rule for an edit tool.
+    # (No allow_all_edits flag was sent either, so no setMode update,
+    # leaving the decision a plain allow with no permission updates.)
+    assert "updatedPermissions" not in decision
+
+
+async def test_permission_request_hook_webfetch_plain_accept_has_no_rule(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    WebFetch accepted via plain Approve (no ``remember`` flag) → a plain
+    ``allow`` with no ``updatedPermissions``.
+
+    Regression guard: the allow rule must be opt-in per click. A plain
+    Approve must approve only THIS call, leaving future same-domain
+    calls still prompting.
+    """
+    agent = await create_test_agent(client, "test-permission-webfetch-plain")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_webfetch_payload()
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # The hint is present (WebFetch is remember-eligible)…
+    assert event["params"]["remember_scope"]["tool"] == "WebFetch"
+    # …but a plain accept (no content flag) must not carry it through.
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], "accept")
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    decision = resp.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    assert "updatedPermissions" not in decision
+
+
+async def test_permission_request_hook_remember_webfetch_no_host_tool_wide(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    WebFetch whose URL has NO derivable host (a non-HTTP scheme) falls
+    back to a TOOL-WIDE rule: the ``remember_scope`` carries the tool
+    only (no ``host`` key), and accepting with ``content.remember``
+    installs an ``addRules`` entry with ``toolName`` and no
+    ``ruleContent``.
+
+    Guards the WebFetch branch of the tool-wide fallback specifically:
+    domain rules are HTTP(S)-oriented, so an ``ftp://`` URL can't be
+    scoped to a domain — but the user can still stop the per-call
+    prompting for WebFetch as a whole.
+    """
+    agent = await create_test_agent(client, "test-permission-remember-webfetch-toolwide")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_webfetch_payload("ftp://files.example.com/x")
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/permission-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    # No host could be derived → tool-wide scope (tool only, no host).
+    assert event["params"]["remember_scope"] == {"tool": "WebFetch"}
+
+    verdict = await _post_approval(
+        client,
+        session_id,
+        event["elicitation_id"],
+        "accept",
+        content={"remember": True},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    decision = resp.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+    # No ``ruleContent`` → the rule matches every WebFetch call.
+    assert decision["updatedPermissions"] == [
+        {
+            "type": "addRules",
+            "rules": [{"toolName": "WebFetch"}],
+            "behavior": "allow",
+            "destination": "session",
+        }
+    ]
+
+
 async def test_permission_request_hook_forwards_cwd_and_permission_mode(
     client: httpx.AsyncClient,
 ) -> None:
@@ -436,12 +1236,16 @@ async def test_permission_request_hook_forwards_cwd_and_permission_mode(
     ``permission_mode`` lets the UI badge the card with the mode
     Claude is in (``"default"`` / ``"acceptEdits"`` / ``"plan"``).
 
-    Note: ``tool_use_id`` is intentionally not asserted here.
-    Claude Code's PermissionRequest payload doesn't carry one
+    Note: ``tool_use_id`` is intentionally absent — the fixtures omit
+    it because Claude Code's PermissionRequest payload doesn't carry one
     (the id is only minted when the tool call is emitted, AFTER
-    the permission check). The UI's auto-clear falls back to a
-    "first pending" heuristic instead — see
-    :file:`ap-web/src/store/chatStore.ts`'s ``tool_call`` case.
+    the permission check). With no id, the terminal-resolved fast path
+    correlates a mirrored tool result to a parked prompt by exact
+    ``(tool_name, tool_input)`` (see
+    :func:`omnigent.server.routes.sessions._signal_terminal_resolved_harness_elicitation`),
+    and the web UI clears a card strictly by ``elicitation_id`` on the
+    server's ``response.elicitation_resolved`` event — never by a
+    "first pending" heuristic.
     """
     agent = await create_test_agent(client, "test-permission-extras")
     session_id = await _create_session(client, agent["id"])
@@ -793,6 +1597,12 @@ async def test_permission_request_hook_surfaces_exit_plan_mode_input(
     # without the allow_all_edits flag.
     assert resp.json()["hookSpecificOutput"]["decision"] == {
         "behavior": "allow",
+        # ExitPlanMode is a requiresUserInteraction tool: Claude Code coerces a
+        # bare allow back to an interactive prompt unless the decision echoes
+        # ``updatedInput``. It mirrors the model's own tool_input (a no-op to
+        # the plan), and its presence is what lets a web-UI approval exit plan
+        # mode with no TUI keystroke.
+        "updatedInput": payload["tool_input"],
         "updatedPermissions": [{"type": "setMode", "mode": "default", "destination": "session"}],
     }
 
@@ -855,6 +1665,9 @@ async def test_permission_request_hook_exit_plan_mode_auto_accept_round_trip(
     assert decision["updatedPermissions"] == [
         {"type": "setMode", "mode": "auto", "destination": "session"}
     ]
+    # updatedInput rides along on the auto path too — the requiresUserInteraction
+    # escape hatch is mode-independent.
+    assert decision["updatedInput"] == payload["tool_input"]
 
 
 async def test_permission_request_hook_decline_forwards_feedback_message(
@@ -1016,6 +1829,8 @@ async def test_permission_request_hook_timeout_clears_pending_index(
     session_id = await _create_session(client, agent["id"])
     payload = await _claude_permission_payload()
 
+    resolved_events: list[dict[str, object]] = []
+
     async def _drain_until_resolved() -> None:
         """
         Wait for the deferred ``response.elicitation_resolved`` publish.
@@ -1025,6 +1840,7 @@ async def test_permission_request_hook_timeout_clears_pending_index(
         async with asyncio.timeout(3.0):
             async for event in session_stream.subscribe(session_id):
                 if event.get("type") == "response.elicitation_resolved":
+                    resolved_events.append(event)
                     return
 
     drain_task = asyncio.create_task(_drain_until_resolved())
@@ -1045,6 +1861,11 @@ async def test_permission_request_hook_timeout_clears_pending_index(
     # The deferred clear fires only after the re-park grace; waiting
     # for the resolved event (not sleeping) keeps this event-driven.
     await drain_task
+    # Nobody answered, so the clear must say why there is no verdict; a
+    # bare clear rendered as "Resolved elsewhere" and left the reporter's
+    # session looking ambiguously stuck.
+    assert resolved_events and resolved_events[0].get("reason") == "unanswered", resolved_events
+    assert "action" not in resolved_events[0]
     # 0 = the deferred clear decremented the index even though no UI
     # verdict arrived. If > 0, the sidebar would show a stuck badge
     # for every claude-native session whose owner answered in the
@@ -1056,6 +1877,50 @@ async def test_permission_request_hook_timeout_clears_pending_index(
         f"response.elicitation_resolved when no re-park arrives."
     )
     pending_elicitations.reset_for_tests()
+
+
+async def test_publish_elicitation_resolved_keeps_verdict_and_reason_exclusive(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A verdict wins over a no-verdict reason; only a verdict-less clear carries one.
+
+    The card reads ``reason`` only on the neutral pill, so a stray reason
+    beside a real verdict would be ignored anyway; dropping it at the
+    publisher keeps the wire contract self-enforcing for every consumer.
+    """
+    agent = await create_test_agent(client, "test-publish-resolved-exclusive")
+    session_id = await _create_session(client, agent["id"])
+    captured: list[dict[str, object]] = []
+
+    async def _drain_three() -> None:
+        """
+        Collect the three resolved events published below.
+
+        :returns: None.
+        """
+        async with asyncio.timeout(3.0):
+            async for event in session_stream.subscribe(session_id):
+                if event.get("type") == "response.elicitation_resolved":
+                    captured.append(event)
+                    if len(captured) == 3:
+                        return
+
+    drain_task = asyncio.create_task(_drain_three())
+    await asyncio.sleep(0.05)
+    sessions_route._publish_elicitation_resolved(
+        session_id, "elicit_a", action="decline", reason="unanswered"
+    )
+    sessions_route._publish_elicitation_resolved(session_id, "elicit_b", reason="unanswered")
+    sessions_route._publish_elicitation_resolved(session_id, "elicit_c", reason="because")
+    await drain_task
+
+    assert captured[0]["action"] == "decline"
+    assert "reason" not in captured[0]
+    assert "action" not in captured[1]
+    assert captured[1]["reason"] == "unanswered"
+    assert "action" not in captured[2]
+    assert "reason" not in captured[2]
 
 
 async def test_pre_resolved_elicitation_tombstone_expires_before_hook_registration(
@@ -1086,7 +1951,7 @@ async def test_pre_resolved_elicitation_tombstone_expires_before_hook_registrati
             "conv_123",
             "elicit_expired",
         )
-        assert _harness_pre_resolved_elicitations == {}
+        assert _harness_pre_resolved_elicitations.all_values() == []
     finally:
         _harness_pre_resolved_elicitations.clear()
 
@@ -1573,6 +2438,55 @@ async def test_codex_mcp_elicitation_hook_accept_round_trip(
     }
 
 
+async def test_codex_mcp_elicitation_hook_persists_web_session_approval(
+    client: httpx.AsyncClient,
+) -> None:
+    """Web can return a Codex-advertised session persistence choice."""
+    agent = await create_test_agent(client, "test-codex-mcp-persist-session")
+    session_id = await _create_session(client, agent["id"])
+    payload = {
+        "id": 8,
+        "method": "mcpServer/elicitation/request",
+        "params": {
+            "threadId": "thread_123",
+            "turnId": "turn_123",
+            "serverName": "omnigent",
+            "mode": "form",
+            "message": 'Allow the omnigent MCP server to run tool "sys_read_inbox"?',
+            "requestedSchema": {"type": "object", "properties": {}},
+            "_meta": {
+                "codex_approval_kind": "mcp_tool_call",
+                "persist": ["session", "always"],
+            },
+        },
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=payload,
+        )
+    )
+
+    event = await drain_task
+    assert event["params"]["_meta"] == payload["params"]["_meta"]
+    verdict = await client.post(
+        f"/v1/sessions/{session_id}/elicitations/{event['elicitation_id']}/resolve",
+        json={"action": "accept", "_meta": {"persist": "session"}},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "action": "accept",
+        "content": None,
+        "_meta": {"persist": "session"},
+    }
+
+
 async def test_codex_pending_elicitation_survives_session_snapshot_refresh(
     client: httpx.AsyncClient,
 ) -> None:
@@ -1877,7 +2791,11 @@ async def test_codex_command_approval_hook_accept_round_trip(
     approvals and accepted web verdicts return Codex's command
     approval response shape.
     """
-    agent = await create_test_agent(client, "test-codex-command-approval")
+    agent = await create_test_agent(
+        client,
+        "test-codex-command-approval",
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
     session_id = await _create_session(client, agent["id"])
     payload = {
         "id": 13,
@@ -1946,7 +2864,7 @@ async def test_codex_command_approval_hook_accepts_execpolicy_amendment(
             "startedAtMs": 1,
             "approvalId": None,
             "reason": "test command approval",
-            "command": ".venv/bin/python -m pytest tests/test_codex_native.py -q",
+            "command": (".venv/bin/python -m pytest tests/harnesses/codex_native/session/ -q"),
             "cwd": "/tmp/workspace",
             "commandActions": [],
             "availableDecisions": [
@@ -2014,7 +2932,7 @@ async def test_codex_command_approval_hook_rejects_malformed_execpolicy_amendmen
             "startedAtMs": 1,
             "approvalId": None,
             "reason": "test command approval",
-            "command": ".venv/bin/python -m pytest tests/test_codex_native.py -q",
+            "command": (".venv/bin/python -m pytest tests/harnesses/codex_native/session/ -q"),
             "cwd": "/tmp/workspace",
             "commandActions": [],
             "availableDecisions": [
@@ -2411,7 +3329,7 @@ async def _subscribe_into(
         async with asyncio.timeout(timeout_s):
             async for event in session_stream.subscribe(session_id):
                 sink.append(event)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return
 
 
@@ -3108,62 +4026,330 @@ async def test_codex_hook_gap_verdict_returned_on_repost(
     later — the click dropped, the codex sub-agent still blocked.
     """
     from omnigent.runtime import pending_elicitations
+    from omnigent.server.routes._sessions import orchestration
+
+    grace_started = asyncio.Event()
+    release_grace = asyncio.Event()
+
+    async def _wait_for_grace(delay: float) -> None:
+        if delay == sessions_route._HARNESS_ELICITATION_REPARK_GRACE_S:
+            grace_started.set()
+            await release_grace.wait()
+        else:
+            await asyncio.sleep(delay)
 
     async def _disconnect_immediately(_request: Any) -> None:
-        """
-        Sever every hook long-poll straight away.
-
-        :param _request: Ignored FastAPI request.
-        :returns: None.
-        """
-        await asyncio.sleep(0.01)
+        """Sever each hook poll without a timing dependency."""
+        return
 
     monkeypatch.setattr(
         sessions_route,
         "_poll_request_disconnect",
         _disconnect_immediately,
     )
+    # Hold the real deferred cleanup until the gap verdict has been consumed.
+    # Replace only this module's asyncio binding, leaving other sleeps intact.
     monkeypatch.setattr(
-        sessions_route,
-        "_HARNESS_ELICITATION_REPARK_GRACE_S",
-        0.25,
+        orchestration,
+        "asyncio",
+        SimpleNamespace(**{**vars(asyncio), "sleep": _wait_for_grace}),
     )
     pending_elicitations.reset_for_tests()
     agent = await create_test_agent(client, "test-codex-gap-verdict")
     session_id = await _create_session(client, agent["id"])
 
+    collector = await start_session_stream_collector(session_id)
+    try:
+        first = await client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=_CODEX_REPARK_PAYLOAD,
+        )
+        assert first.status_code == 200, first.text
+        assert first.content == b""
+        event = await collector.next_event()
+        assert event["type"] == "response.elicitation_request"
+        await asyncio.wait_for(grace_started.wait(), timeout=5.0)
+        assert pending_elicitations.count_for(session_id) == 1
+        assert event["elicitation_id"] not in sessions_route._harness_elicitation_registry
+
+        # Verdict arrives while no poll is parked and cleanup is still waiting.
+        verdict = await _post_approval(
+            client,
+            session_id,
+            event["elicitation_id"],
+            "accept",
+            content={"ok": "go"},
+        )
+        assert verdict.status_code == 202, verdict.text
+        assert pending_elicitations.count_for(session_id) == 0
+
+        # The retry must consume the saved verdict instead of publishing again.
+        second = await client.post(
+            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
+            json=_CODEX_REPARK_PAYLOAD,
+        )
+        assert second.status_code == 200, second.text
+        assert second.json() == {"action": "accept", "content": {"ok": "go"}, "_meta": None}
+    finally:
+        release_grace.set()
+        for task in set(sessions_route._deferred_elicitation_clear_tasks):
+            await asyncio.wait_for(task, timeout=5.0)
+        await collector.stop()
+        pending_elicitations.reset_for_tests()
+
+
+# ── Antigravity elicitation hook tests ──────────────────────────────────────
+
+
+async def test_antigravity_elicitation_hook_accept_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Antigravity ``antigravity-elicitation-request`` hook: accept path.
+
+    The bridge POSTs ``{"elicitation_id": ..., "params": {...}}``; the
+    hook parks on the shared elicitation registry, the web ``approval``
+    event resolves it, and the hook returns the raw
+    ``ElicitationResult`` (action + content + _meta) so the bridge can
+    deliver the answer to agy.  This is simpler than the codex hook:
+    the endpoint does NOT build a JSON-RPC envelope — the bridge does
+    that with ``to_interaction_payload``.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    agent = await create_test_agent(client, "test-agy-elicit-accept")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = "elicit_agy_00000000000000000000000000000001"
+    params_body = {
+        "mode": "form",
+        "message": "Antigravity needs your input",
+        "phase": "agy_ask_question",
+        "policy_name": "agy_native_ask_question",
+    }
+
     drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
     await asyncio.sleep(0.05)
-    first = await client.post(
-        f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
-        json=_CODEX_REPARK_PAYLOAD,
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request",
+            json={"elicitation_id": elicitation_id, "params": params_body},
+        )
     )
-    assert first.status_code == 200, first.text
-    assert first.content == b""
-    event = await drain_task
 
-    # Verdict arrives while NO poll is parked (the gap).
+    event = await drain_task
+    assert event["elicitation_id"] == elicitation_id
+    assert event["params"]["message"] == "Antigravity needs your input"
+    assert event["params"]["phase"] == "agy_ask_question"
+
     verdict = await _post_approval(
         client,
         session_id,
-        event["elicitation_id"],
+        elicitation_id,
         "accept",
-        content={"ok": "go"},
+        content={"selectedOptionIds": ["1"]},
     )
     assert verdict.status_code == 202, verdict.text
-    assert pending_elicitations.count_for(session_id) == 0
 
-    # The retry consumes the tombstone and returns the verdict in the
-    # codex result shape without re-publishing the prompt; an empty
-    # body here means the tombstone was dropped and the click lost.
-    second = await client.post(
-        f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
-        json=_CODEX_REPARK_PAYLOAD,
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "action": "accept",
+        "content": {"selectedOptionIds": ["1"]},
+    }
+
+
+async def test_antigravity_elicitation_hook_accept_persist_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Antigravity elicitation hook: an always-allow accept keeps ``_meta.persist``.
+
+    When a web approver picks one of agy's always-allow entries, the verdict
+    carries ``_meta.persist``. The hook must return that metadata verbatim so
+    the bridge types agy's persist menu entry rather than a one-time approve.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    agent = await create_test_agent(client, "test-agy-elicit-persist")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = "elicit_agy_00000000000000000000000000000003"
+    params_body = {
+        "mode": "form",
+        "message": "Antigravity wants to run a command",
+        "phase": "agy_permission",
+        "policy_name": "agy_native_permission",
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request",
+            json={"elicitation_id": elicitation_id, "params": params_body},
+        )
     )
-    assert second.status_code == 200, second.text
-    assert second.json() == {"action": "accept", "content": {"ok": "go"}, "_meta": None}
-    # Drain the severed poll's deferred clear so it doesn't outlive the
-    # test's event loop (it no-ops the index either way).
-    for task in set(sessions_route._deferred_elicitation_clear_tasks):
-        await asyncio.wait_for(task, timeout=5.0)
+
+    event = await drain_task
+    assert event["elicitation_id"] == elicitation_id
+    assert event["params"]["phase"] == "agy_permission"
+
+    verdict = await _post_approval(
+        client,
+        session_id,
+        elicitation_id,
+        "accept",
+        meta={"persist": "always"},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "action": "accept",
+        "content": None,
+        "_meta": {"persist": "always"},
+    }
+
+
+async def test_antigravity_elicitation_hook_decline_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Antigravity elicitation hook: decline path returns the verdict.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    agent = await create_test_agent(client, "test-agy-elicit-decline")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = "elicit_agy_00000000000000000000000000000002"
+    params_body = {
+        "mode": "form",
+        "message": "Antigravity wants to run a command",
+        "phase": "agy_permission",
+        "policy_name": "agy_native_permission",
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request",
+            json={"elicitation_id": elicitation_id, "params": params_body},
+        )
+    )
+
+    event = await drain_task
+    assert event["elicitation_id"] == elicitation_id
+
+    verdict = await _post_approval(client, session_id, elicitation_id, "decline")
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"action": "decline", "content": None}
+
+
+async def test_antigravity_elicitation_hook_timeout_returns_empty_200(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Antigravity elicitation hook: timeout path returns empty 200.
+
+    When the user does not resolve the elicitation within the hook
+    timeout, the endpoint returns ``200`` with an empty body so the
+    bridge's ``request_elicitation`` callable gets ``None`` and can
+    leave agy's WAITING step to time out on its own.
+
+    :param client: Test HTTP client.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from omnigent.runtime import pending_elicitations, session_stream
+
+    monkeypatch.setattr(
+        sessions_route,
+        "_ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S",
+        0.1,
+    )
+    monkeypatch.setattr(
+        sessions_route,
+        "_HARNESS_ELICITATION_REPARK_GRACE_S",
+        0.05,
+    )
     pending_elicitations.reset_for_tests()
+    agent = await create_test_agent(client, "test-agy-elicit-timeout")
+    session_id = await _create_session(client, agent["id"])
+
+    async def _drain_until_resolved() -> None:
+        """
+        Wait for the deferred ``response.elicitation_resolved`` publish.
+
+        :returns: None.
+        """
+        async with asyncio.timeout(3.0):
+            async for event in session_stream.subscribe(session_id):
+                if event.get("type") == "response.elicitation_resolved":
+                    return
+
+    drain_task = asyncio.create_task(_drain_until_resolved())
+    await asyncio.sleep(0.05)
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request",
+        json={
+            "elicitation_id": "elicit_agy_00000000000000000000000000000099",
+            "params": {
+                "mode": "form",
+                "message": "Antigravity needs your input",
+            },
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.content == b""
+    await drain_task
+    assert pending_elicitations.count_for(session_id) == 0
+    pending_elicitations.reset_for_tests()
+
+
+async def test_antigravity_elicitation_hook_rejects_invalid_json(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Antigravity elicitation hook: malformed JSON body returns 400.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    agent = await create_test_agent(client, "test-agy-elicit-badjson")
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request",
+        content=b"not-json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400, resp.text
+
+
+async def test_antigravity_elicitation_hook_rejects_non_dict_body(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Antigravity elicitation hook: non-object JSON body returns 400.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    agent = await create_test_agent(client, "test-agy-elicit-nondict")
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request",
+        json=["not", "a", "dict"],
+    )
+    assert resp.status_code == 400, resp.text

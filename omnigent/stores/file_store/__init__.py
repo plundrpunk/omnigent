@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import builtins
 from abc import ABC, abstractmethod
+from typing import Any
 
 from omnigent.entities import PagedList, StoredFile
 
@@ -38,9 +40,12 @@ class FileStore(ABC):
         bytes: int,
         content_type: str | None = None,
         session_id: str | None = None,
+        file_id: str | None = None,
+        blob_key: str | None = None,
+        source_metadata: dict[str, Any] | None = None,
     ) -> StoredFile:
         """
-        Record a new file. Generates a unique file_id.
+        Record a new file. Generates a unique file_id unless given one.
 
         :param filename: Original filename,
             e.g. ``"report.pdf"``.
@@ -49,7 +54,35 @@ class FileStore(ABC):
             e.g. ``"application/pdf"``.
         :param session_id: Owning session/conversation id. When
             set, the file is session-scoped; ``None`` for global.
+        :param file_id: Caller-chosen id for the new row. A fork
+            pre-allocates ids so the copied conversation items can
+            reference the copies it creates afterwards. ``None``
+            (default) generates a fresh id.
+        :param blob_key: Artifact-store key for the row's bytes. A fork
+            copy passes the source row's blob so it shares the bytes
+            instead of duplicating them; ``None`` (default) points the
+            row at its own ``file_id`` (an independent blob).
+        :param source_metadata: Optional opaque JSON-able dict of
+            metadata about the original upload before any server-side
+            transform (e.g. ``{"width", "height"}`` for a downscaled
+            image), or ``None`` when there is nothing to record.
         :returns: The newly created :class:`StoredFile`.
+        """
+        ...
+
+    @abstractmethod
+    def is_blob_key_orphaned(self, blob_key: str) -> bool:
+        """
+        Whether no file row references *blob_key* any more.
+
+        A blob is shared when a fork copies a file row without copying its
+        bytes, so the artifact-store blob must only be deleted once the last
+        referencing row is gone. Callers delete the row first, then consult
+        this before removing the blob.
+
+        :param blob_key: The artifact-store key to test.
+        :returns: ``True`` when the blob has no remaining referrers and is
+            safe to delete.
         """
         ...
 
@@ -77,30 +110,26 @@ class FileStore(ABC):
     @abstractmethod
     def list(
         self,
+        session_id: str,
         limit: int = 20,
         after: str | None = None,
         before: str | None = None,
         order: str = "desc",
-        session_id: str | None = None,
         include_unscoped: bool = False,
     ) -> PagedList[StoredFile]:
         """
-        List files with cursor-based pagination.
+        List a session's files with cursor-based pagination.
 
-        When ``session_id`` is set, only files owned by that
-        session are returned. When ``None``, all files are listed
-        (legacy global behavior).
+        Always scoped to a session — there is no cross-session
+        listing (files are only ever surfaced per session).
 
+        :param session_id: Owning session whose files to list.
         :param limit: Maximum number of files to return.
         :param after: Cursor file ID for forward pagination.
         :param before: Cursor file ID for backward pagination.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param session_id: Filter to files owned by this session.
-            ``None`` lists all files.
-        :param include_unscoped: When ``True`` **and** ``session_id``
-            is set, also return files with ``session_id IS NULL``
-            (global/unscoped files). Ignored when ``session_id``
-            is ``None``.
+        :param include_unscoped: When ``True``, also return files
+            with ``session_id IS NULL`` (global/unscoped files).
         :returns: A :class:`PagedList` of :class:`StoredFile`.
         """
         ...
@@ -126,14 +155,16 @@ class FileStore(ABC):
         ...
 
     @abstractmethod
-    def delete_all_for_session(self, session_id: str) -> list[str]:
+    def delete_all_for_session(self, session_id: str) -> builtins.list[str]:
         """
         Delete all file metadata for a session.
 
-        Returns the list of deleted file ids so callers can
-        clean up artifact bytes.
+        Returns only the artifact-store keys that became **orphaned** by the
+        deletion (no surviving row references them), so the caller cleans up
+        exactly those bytes. A blob still shared by a fork in another session
+        is not returned and therefore survives.
 
         :param session_id: Owning session/conversation id.
-        :returns: List of deleted file ids.
+        :returns: The now-orphaned artifact-store keys to clean up.
         """
         ...

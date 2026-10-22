@@ -137,8 +137,9 @@ URL, not `localhost`. Sessions created with `host_type: "managed"`
 Daytona sandbox; the create returns immediately and provisioning
 happens in the background, exactly like the [Modal managed
 flow](../modal/README.md#server-managed-sandboxes) — including
-repository workspaces, the first-message rendezvous, and dead-sandbox
-relaunch.
+repository workspaces and the first-message rendezvous. Daytona resumes
+stopped or archived managed sandboxes in place. If a sandbox was deleted,
+Omnigent creates a replacement with a fresh workspace.
 
 Optional `daytona:` settings:
 
@@ -150,6 +151,18 @@ sandbox:
     image: docker.io/<you>/omnigent-host:latest  # default: official image
     env: [OPENAI_API_KEY, ANTHROPIC_API_KEY, GIT_TOKEN]
 ```
+
+A top-level `sandbox.host_config:` (provider-agnostic) holds verbatim
+in-sandbox `~/.omnigent/config.yaml` content — e.g. a `providers:`
+block routing a harness through a self-hosted gateway — installed into
+the sandbox before `omnigent host` starts. The block is server-managed:
+entries injected by a previous launch are replaced or removed on the
+next launch/resume, while config created inside the sandbox survives.
+Keep secrets out via
+`api_key_ref: env:VAR` (resolved in the sandbox against the injected
+env). See the [sandbox-runners config
+table](../kubernetes/overlays/sandbox-runners/README.md#configuration-sandbox-configyaml)
+for the shape.
 
 ## Credentials for the sandbox (LLM keys, git tokens)
 
@@ -287,9 +300,7 @@ it.
 - **No platform lifetime cap.** Unlike Modal's 24-hour limit, Daytona
   sandboxes run until deleted. Omnigent disables Daytona's 15-minute
   idle auto-stop at provision time (a session host must survive gaps
-  between turns); the sandbox is deleted when its session is deleted,
-  and the dead-sandbox relaunch path replaces one that crashed or was
-  deleted out-of-band.
+  between turns), and deletes the sandbox when its session is deleted.
 - **First launch per image is slow.** Daytona builds an internal
   snapshot from the image on first use (minutes for the ~1.4 GiB host
   image); subsequent launches reuse it (seconds).

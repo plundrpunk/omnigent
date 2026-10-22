@@ -18,6 +18,8 @@ from typing import Any
 
 from omnigent.llms.context_window import ModelPricing, compute_llm_cost
 from omnigent.policies.base import Policy
+from omnigent.policies.function import FunctionPolicy
+from omnigent.policies.schema import AUTOMATIC_RUNTIME_STATE_KEYS, is_reserved_state_key
 from omnigent.policies.types import EvaluationContext, PolicyResult
 from omnigent.spec.types import (
     DEFAULT_ASK_TIMEOUT,
@@ -27,7 +29,7 @@ from omnigent.spec.types import (
     StateUpdate,
     StateUpdateAction,
 )
-from omnigent.stores.conversation_store import ConversationStore
+from omnigent.stores.conversation_store import ConversationStore, DailyCostState
 
 # Number of recent conversation items the engine fetches from
 # the conversation store and threads onto :class:`EvaluationContext`
@@ -37,7 +39,6 @@ from omnigent.stores.conversation_store import ConversationStore
 # ``foo``) rather than generic. Tunable later if needed; pinned
 # here so it surfaces in grep across the engine + prompt layers.
 # See designs/LIVE_POLICIES.md §4.1.
-_TRAJECTORY_WINDOW = 10
 
 
 class PolicyEngine:
@@ -65,6 +66,8 @@ class PolicyEngine:
         :meth:`spec_for`.
     :param conversation_id: The conversation this engine owns
         label state for.
+    :param conversation_title: The conversation's human-readable
+        title. ``None`` when untitled.
     :param initial_labels: Labels already persisted for the
         conversation at workflow-start (the hot cache seed).
     :param initial_session_state: Seed state for the hot cache.
@@ -109,10 +112,14 @@ class PolicyEngine:
         label_defs: dict[str, LabelDef],
         ask_timeout: int,
         conversation_id: str,
+        conversation_title: str | None = None,
         initial_labels: dict[str, str],
         initial_session_state: dict[str, Any] | None = None,
         initial_usage: dict[str, float] | None = None,
-        initial_user_daily_cost: dict[str, float | str] | None = None,
+        initial_subtree_usage: dict[str, float] | None = None,
+        initial_user_daily_cost: list[dict[str, float | str | None]]
+        | list[DailyCostState]
+        | None = None,
         token_pricing: ModelPricing | None = None,
         initial_model: str | None = None,
         conversation_store: ConversationStore,
@@ -123,6 +130,7 @@ class PolicyEngine:
         self.label_defs = label_defs
         self.ask_timeout = ask_timeout
         self._conversation_id = conversation_id
+        self._conversation_title = conversation_title
         # Root of this conversation's spawn tree. The per-session cost-budget
         # approval is routed here (not the per-conversation session_state) so
         # approving once covers the whole tree — a sub-agent runs as its own
@@ -145,11 +153,19 @@ class PolicyEngine:
         # persisted usage that predates cache-token tracking.
         self._usage.setdefault("cache_read_input_tokens", 0)
         self._usage.setdefault("cache_creation_input_tokens", 0)
-        # The session owner's per-UTC-day cost rollup
-        # ({"cost_usd", "ask_approved_usd"}), seeded at build time ONLY
-        # when a policy needs it (per-user daily cost-budget configured).
-        # ``None`` → not needed → never injected, so no owner/daily lookup
-        # cost for sessions that don't use the daily policy.
+        # Subtree-scoped usage seed (this conversation + its descendants
+        # only, not the whole session tree). Seeded at build time ONLY when
+        # a ``subagent_cost_budget`` policy is configured — ``None``
+        # otherwise, so sessions without that policy pay no subtree lookup.
+        self._subtree_usage: dict[str, float] | None = (
+            dict(initial_subtree_usage) if initial_subtree_usage is not None else None
+        )
+        # The session owner's daily cost records (list of
+        # {cost_usd, ask_approved_usd, day_utc, harness, user_id}), seeded
+        # at build time ONLY when a policy needs it (per-user daily or
+        # period cost-budget configured). For daily budgets, contains only
+        # today's record; for period budgets, contains all days in the period.
+        # ``None`` → not needed → never injected.
         self._user_daily_cost = initial_user_daily_cost
         self._token_pricing = token_pricing
         self._model = initial_model
@@ -219,7 +235,71 @@ class PolicyEngine:
         """:returns: The conversation this engine owns."""
         return self._conversation_id
 
+    @property
+    def conversation_title(self) -> str | None:
+        """:returns: The conversation's readable title, ``None`` when untitled."""
+        return self._conversation_title
+
     async def evaluate(
+        self,
+        ctx: EvaluationContext,
+        *,
+        read_only: bool = False,
+    ) -> PolicyResult:
+        """
+        Evaluate the composed policy decision, recording a span.
+
+        Thin tracing wrapper over :meth:`_evaluate_composed`. Opens a
+        ``policy.evaluate`` span tagged with the phase, resolved tool
+        name, and read-only flag, then records the resulting decision
+        (and reason / deciding policies on a non-ALLOW). This is the one
+        in-process policy choke point — every enforcement site routes
+        through it — so the span makes policy decisions visible inline
+        in the request trace.
+
+        :param ctx: The current evaluation context
+            (phase + content + resolved tool_name).
+        :param read_only: When ``True``, skip persistent side effects;
+            see :meth:`_evaluate_composed`.
+        :returns: The composed :class:`PolicyResult`.
+        """
+        from omnigent.runtime import telemetry
+
+        with telemetry.span(
+            "policy.evaluate",
+            attributes={
+                "policy.phase": getattr(ctx.phase, "name", str(ctx.phase)),
+                "policy.tool_name": ctx.tool_name or "",
+                "policy.read_only": read_only,
+            },
+        ) as evaluate_span:
+            if self._conversation_id:
+                evaluate_span.set_attribute("session.id", self._conversation_id)
+            # The content under evaluation (tool args / prompt) is recorded
+            # only when content capture is on (redacted + capped).
+            telemetry.record_message_payload(
+                {"content": ctx.content},
+                span=evaluate_span,
+                key="policy.content",
+            )
+            result = await self._evaluate_composed(ctx, read_only=read_only)
+            evaluate_span.set_attribute(
+                "policy.decision",
+                getattr(result.action, "name", str(result.action)),
+            )
+            if result.reason:
+                evaluate_span.set_attribute("policy.reason", result.reason)
+            deciding = getattr(result, "deciding_policies", None)
+            if deciding:
+                evaluate_span.set_attribute("policy.deciding_policies", list(deciding))
+            # Attribute the decision to the deciding policy's owning workspace
+            # (only set for a workspace-scoped stored row; None on ALLOW or for
+            # YAML / agent-spec policies).
+            if result.deciding_policy_workspace_id is not None:
+                evaluate_span.set_attribute("workspace.id", result.deciding_policy_workspace_id)
+            return result
+
+    async def _evaluate_composed(
         self,
         ctx: EvaluationContext,
         *,
@@ -235,15 +315,19 @@ class PolicyEngine:
            b. Skip if the policy's ``condition`` label-gate
               does not match the current hot-cache snapshot.
            c. Dispatch to ``policy.evaluate``.
-           d. Action-list validation and the classifier-only
-              carve-out for FunctionPolicy and PromptPolicy.
+           d. Accumulate any policy result.
            e. Accumulate ``set_labels`` writes.
+           f. If the policy returned ``data``, feed it back
+              as ``ctx.content`` so the next policy transforms
+              the already-transformed payload (sequential
+              chaining across the pipeline).
         2. On DENY: short-circuit. Apply accumulated writes
            from any ALLOWing predecessors, then return the
            DENY result (with ``deciding_policy`` set).
         3. After the loop, if any policy ASKed: return an ASK
            result carrying accumulated (but unapplied)
-           writes — the caller applies them only on approve
+           writes and the full ``deciding_policies`` list —
+           the caller applies them only on approve
            (POLICIES.md §7.2).
         4. Otherwise: apply writes, return ALLOW.
 
@@ -267,24 +351,26 @@ class PolicyEngine:
         accumulated: dict[str, str] = {}
         accumulated_state: list[StateUpdate] = []
         ask_reasons: list[str] = []
-        deciding_ask_policy: str | None = None
-        # Last non-None data from any ALLOW-or-ASK policy. If multiple
-        # policies return data, the last one wins — callers that need
-        # chained transforms should compose them in a single callable.
+        deciding_ask_policies: list[str] = []
+        # Owning workspace of the first ASKing policy, mirroring
+        # ``deciding_ask_policies[0]`` (None for non-workspace-scoped specs).
+        first_ask_workspace_id: int | None = None
+        # Sequentially accumulated data: each policy that returns data
+        # has its output fed back into ctx.content so the next policy
+        # in the chain transforms the already-transformed payload rather
+        # than the original. The final value is the fully-composed result.
         composed_data: Any = None
         context = self._context()
 
-        # Populate trajectory and session_state once per evaluate so
-        # PromptPolicy classifiers see situational context and function
-        # policies can read accumulated state. Both queries are bounded
-        # to avoid scanning large conversations. See §4.1.
-        ctx = self._populate_trajectory(ctx)
         ctx = self._inject_session_state(ctx)
         ctx = self._inject_usage(ctx)
+        ctx = self._inject_subtree_usage(ctx)
         ctx = self._inject_user_daily_cost(ctx)
         ctx = self._inject_model(ctx)
         ctx = self._inject_labels(ctx)
         ctx = self._inject_llm_client(ctx)
+        ctx = self._inject_conversation_id(ctx)
+        ctx = self._inject_conversation_title(ctx)
 
         for policy in self.policies:
             if not self._should_fire(policy.spec, ctx):
@@ -295,7 +381,7 @@ class PolicyEngine:
             # silently dropped per POLICIES.md §9.
             filtered_labels = _filter_writable_labels(result.set_labels, policy.spec)
             if filtered_labels:
-                _merge_monotonic_writes(accumulated, filtered_labels, self.label_defs)
+                accumulated.update(filtered_labels)
             if result.state_updates:
                 accumulated_state.extend(result.state_updates)
             if result.action == PolicyAction.DENY:
@@ -304,16 +390,21 @@ class PolicyEngine:
                     result.reason,
                     accumulated,
                     accumulated_state,
+                    deciding_policy_workspace_id=getattr(policy.spec, "workspace_id", None),
                     read_only=read_only,
                 )
             if result.data is not None:
                 composed_data = result.data
+                # Feed the transformed payload forward so the next policy
+                # in the chain sees this policy's output, not the original.
+                ctx = replace(ctx, content=composed_data)
             if result.action == PolicyAction.ASK:
                 ask_reasons.append(
                     f"{policy.spec.name}: {result.reason or 'approval required'}",
                 )
-                if deciding_ask_policy is None:
-                    deciding_ask_policy = policy.spec.name
+                if not deciding_ask_policies:
+                    first_ask_workspace_id = getattr(policy.spec, "workspace_id", None)
+                deciding_ask_policies.append(policy.spec.name)
 
         if ask_reasons:
             # DO NOT apply label writes or state updates here — the ASK
@@ -326,7 +417,8 @@ class PolicyEngine:
                 reason="; ".join(ask_reasons),
                 set_labels=dict(accumulated) if accumulated else None,
                 state_updates=list(accumulated_state) if accumulated_state else None,
-                deciding_policy=deciding_ask_policy,
+                deciding_policies=deciding_ask_policies,
+                deciding_policy_workspace_id=first_ask_workspace_id,
                 data=composed_data,
             )
         if not read_only:
@@ -337,7 +429,6 @@ class PolicyEngine:
             reason=None,
             set_labels=dict(accumulated) if accumulated else None,
             state_updates=list(accumulated_state) if accumulated_state else None,
-            deciding_policy=None,
             data=composed_data,
         )
 
@@ -348,6 +439,7 @@ class PolicyEngine:
         accumulated: dict[str, str],
         accumulated_state: list[StateUpdate],
         *,
+        deciding_policy_workspace_id: int | None = None,
         read_only: bool = False,
     ) -> PolicyResult:
         """
@@ -367,12 +459,20 @@ class PolicyEngine:
         :param accumulated_state: :class:`StateUpdate` operations
             gathered across every policy up to and including
             the DENYing one.
+        :param deciding_policy_workspace_id: Owning workspace id
+            of the DENYing policy row, or ``None`` for a
+            non-workspace-scoped (YAML / agent-spec) policy.
         :param read_only: When ``True``, skip persistent side
             effects (label writes and state updates). The
             returned result still carries ``set_labels`` so the
             caller can see what *would* have been written.
         :returns: Composed DENY :class:`PolicyResult`.
         """
+        accumulated_state = [
+            op
+            for op in accumulated_state
+            if not is_reserved_state_key(op.key) or op.key in AUTOMATIC_RUNTIME_STATE_KEYS
+        ]
         if not read_only:
             self.apply_state_updates(accumulated_state)
             self.apply_label_writes(accumulated)
@@ -381,7 +481,8 @@ class PolicyEngine:
             reason=reason,
             set_labels=dict(accumulated) if accumulated else None,
             state_updates=list(accumulated_state) if accumulated_state else None,
-            deciding_policy=deciding_policy,
+            deciding_policies=[deciding_policy],
+            deciding_policy_workspace_id=deciding_policy_workspace_id,
         )
 
     def _should_fire(
@@ -425,9 +526,6 @@ class PolicyEngine:
 
         - The key has a declared ``LabelDef.values`` list and
           the new value is not in it.
-        - The key has a declared ``LabelDef.monotonic`` and
-          the new position (relative to the current cache
-          value) violates the direction.
 
         Keys with no ``LabelDef`` are set freely (omnigent
         parity — "unschema'd labels set freely"). The engine
@@ -448,7 +546,7 @@ class PolicyEngine:
         self._store.set_labels(self._conversation_id, filtered)
         self._labels.update(filtered)
 
-    def apply_state_updates(self, updates: list[StateUpdate]) -> None:
+    def apply_state_updates(self, updates: list[StateUpdate], *, approved: bool = False) -> None:
         """
         Apply structured :class:`StateUpdate` operations to the
         hot session-state cache and persist the result.
@@ -465,21 +563,35 @@ class PolicyEngine:
         persisted to the conversation store so session state
         survives across turns.
 
+        :param approved: True only after an ASK has received human approval.
         :param updates: Ordered list of :class:`StateUpdate`
             operations, e.g.
             ``[StateUpdate(key="call_count", action=StateUpdateAction.INCREMENT, value=1)]``.
             Empty list returns immediately.
         """
+        # Validate the entire batch before writing any state or approval store.
+        for op in updates:
+            if not isinstance(op.key, str):
+                raise TypeError("Policy state keys must be strings")
+            if (
+                is_reserved_state_key(op.key)
+                and op.key not in AUTOMATIC_RUNTIME_STATE_KEYS
+                and not approved
+            ):
+                raise ValueError("Reserved policy state requires an approved ASK")
         if not updates:
             return
         from omnigent.policies.schema import (
             SESSION_COST_ASK_APPROVED_STATE_KEY,
+            SESSION_COST_UNPRICED_APPROVED_KEY,
             USER_DAILY_ASK_APPROVED_STATE_KEY,
+            USER_PERIOD_ASK_APPROVED_STATE_KEY,
         )
 
-        # Two reserved keys are routed off this conversation's session_state:
+        # Three reserved keys are routed off this conversation's session_state:
         # the per-user daily approval goes to the user+day store column (so it
-        # persists across the user's sessions), and the per-SESSION cost
+        # persists across the user's sessions), the per-user monthly approval
+        # goes to the user+month+harness store column, and the per-SESSION cost
         # approval goes to the ROOT conversation (so approving once covers the
         # whole spawn tree — a sub-agent runs as its own conversation, and
         # build_policy_engine seeds the approval from the root). Every other
@@ -488,8 +600,10 @@ class PolicyEngine:
         for op in updates:
             if op.key == USER_DAILY_ASK_APPROVED_STATE_KEY:
                 self._record_user_daily_ask_approved(op.value)
+            elif op.key == USER_PERIOD_ASK_APPROVED_STATE_KEY:
+                self._record_user_period_ask_approved(op.value)
             elif (
-                op.key == SESSION_COST_ASK_APPROVED_STATE_KEY
+                op.key in (SESSION_COST_ASK_APPROVED_STATE_KEY, SESSION_COST_UNPRICED_APPROVED_KEY)
                 and self._root_conversation_id != self._conversation_id
             ):
                 self._record_root_cost_ask_approved(op)
@@ -544,18 +658,63 @@ class PolicyEngine:
             approved = float(value)
         except (TypeError, ValueError):
             return
-        owner = self._store.get_session_owner(self._conversation_id)
+        owner = self._store.get_session_owner_authority(self._conversation_id)
         if owner is None:
             return
+        from omnigent.db.account_authority import target_account_scope
         from omnigent.db.utils import now_epoch, utc_day
 
-        self._store.set_daily_ask_approved(owner, utc_day(now_epoch()), approved)
+        with target_account_scope(owner.user_id, owner.generation):
+            self._store.set_daily_ask_approved(owner.user_id, utc_day(now_epoch()), approved)
         # Keep the in-memory snapshot current so any later evaluate() on
         # this engine sees the approval and doesn't re-ASK the checkpoint
         # the user just approved — mirroring how the session policy's
         # approval stays current via _apply_one(self._session_state, ...).
-        if self._user_daily_cost is not None:
-            self._user_daily_cost["ask_approved_usd"] = approved
+        if self._user_daily_cost and len(self._user_daily_cost) > 0:
+            self._user_daily_cost[0]["ask_approved_usd"] = approved
+
+    def _record_user_period_ask_approved(self, value: Any) -> None:
+        """
+        Persist a per-user period cost-budget ASK approval.
+
+        Writes the approved soft-checkpoint value to today's daily cost
+        record for the session owner, so the same checkpoint won't re-prompt
+        that user again this period (including from other sessions). A no-op
+        when the session has no owner grant (single-user mode) or *value* is
+        not numeric.
+
+        Note: Period approval state is stored in today's daily record and
+        reused across the entire period (day/week/month/quarter/year). This
+        avoids creating separate period-specific approval tracking.
+
+        :param value: The crossed checkpoint value (USD) the user
+            approved, e.g. ``50.0``.
+        """
+        if value is None:
+            return
+        try:
+            approved = float(value)
+        except (TypeError, ValueError):
+            return
+        owner = self._store.get_session_owner(self._conversation_id)
+        if owner is None:
+            return
+        if self._user_daily_cost is None:
+            return
+
+        # Write approval to today's daily record
+        from omnigent.db.utils import now_epoch
+        from omnigent.runtime.policies.builder import _utc_day
+
+        today = _utc_day(now_epoch())
+        self._store.set_daily_ask_approved(owner, today, approved)
+        # Keep the in-memory snapshot current so any later evaluate() on
+        # this engine sees the approval and doesn't re-ASK the checkpoint
+        # the user just approved. Find today's record in the list.
+        for record in self._user_daily_cost:
+            if record.get("day_utc") == today:
+                record["ask_approved_usd"] = approved
+                break
 
     def record_usage(
         self,
@@ -608,7 +767,17 @@ class PolicyEngine:
                 "cache_read_input_tokens": cache_read_input_tokens,
                 "cache_creation_input_tokens": cache_creation_input_tokens,
             }
-            self._usage["total_cost_usd"] += compute_llm_cost(delta_usage, self._token_pricing)
+            delta_cost = compute_llm_cost(delta_usage, self._token_pricing)
+            self._usage["total_cost_usd"] += delta_cost
+        else:
+            delta_cost = 0.0
+        if self._subtree_usage is not None:
+            self._subtree_usage["input_tokens"] += input_tokens
+            self._subtree_usage["output_tokens"] += output_tokens
+            self._subtree_usage["total_tokens"] += total_tokens
+            self._subtree_usage["cache_read_input_tokens"] += cache_read_input_tokens
+            self._subtree_usage["cache_creation_input_tokens"] += cache_creation_input_tokens
+            self._subtree_usage["total_cost_usd"] += delta_cost
         self._store.set_session_usage(self._conversation_id, dict(self._usage))
 
     def _inject_usage(self, ctx: EvaluationContext) -> EvaluationContext:
@@ -627,16 +796,38 @@ class PolicyEngine:
         """
         return replace(ctx, usage=dict(self._usage))
 
+    def _inject_subtree_usage(self, ctx: EvaluationContext) -> EvaluationContext:
+        """
+        Return a copy of *ctx* with ``subtree_usage`` populated, when seeded.
+
+        Injects the engine's subtree-scoped cumulative cost so the
+        ``subagent_cost_budget`` policy can gate on the child's own
+        subtree spend rather than the whole session total. When the
+        engine was built without it (``None`` — no policy needs it),
+        *ctx* is returned unchanged.
+
+        :param ctx: Original :class:`EvaluationContext` from the
+            caller.
+        :returns: *ctx* unchanged when no subtree usage was seeded,
+            else a copy with ``subtree_usage`` set to a defensive copy.
+        """
+        if self._subtree_usage is None:
+            return ctx
+        return replace(ctx, subtree_usage=dict(self._subtree_usage))
+
     def _inject_user_daily_cost(self, ctx: EvaluationContext) -> EvaluationContext:
         """
         Return a copy of *ctx* with ``user_daily_cost`` populated, when seeded.
 
-        Injects the session owner's per-UTC-day cost rollup (read once at
-        engine-build time) so the per-user daily cost-budget policy can
+        Injects the session owner's daily cost records (read once at
+        engine-build time) so daily and period cost-budget policies can
         read it via ``event["context"]["user_daily_cost"]`` without
-        re-querying the store. When the engine was built without it
-        (``None`` — no policy needs it), *ctx* is returned unchanged so
-        sessions that don't use the daily policy never carry it.
+        re-querying the store. For daily budgets, contains only today's
+        record; for period budgets, contains all days in the period.
+
+        When the engine was built without it (``None`` — no policy needs it),
+        *ctx* is returned unchanged so sessions that don't use cost policies
+        never carry it.
 
         :param ctx: Original :class:`EvaluationContext` from the caller.
         :returns: *ctx* unchanged when no daily-cost was seeded, else a
@@ -644,7 +835,17 @@ class PolicyEngine:
         """
         if self._user_daily_cost is None:
             return ctx
-        return replace(ctx, user_daily_cost=dict(self._user_daily_cost))
+        # Cast needed: dict(d) produces dict[str, object] but the runtime value
+        # is actually dict[str, float | str | None] from DailyCostState
+        from typing import cast
+
+        return replace(
+            ctx,
+            user_daily_cost=cast(
+                "list[dict[str, float | str | None]]",
+                [dict(d) for d in self._user_daily_cost],
+            ),
+        )
 
     def _inject_model(self, ctx: EvaluationContext) -> EvaluationContext:
         """
@@ -717,6 +918,41 @@ class PolicyEngine:
         """
         return replace(ctx, session_state=dict(self._session_state))
 
+    def _inject_conversation_id(self, ctx: EvaluationContext) -> EvaluationContext:
+        """
+        Return a copy of *ctx* with ``conversation_id`` populated.
+
+        Injects the engine's own conversation_id so function policy
+        callables can correlate an event with its session via
+        ``event["context"]["conversation_id"]`` without the caller
+        having to thread it through every :class:`EvaluationContext`
+        it builds.
+
+        :param ctx: Original :class:`EvaluationContext` from the
+            caller.
+        :returns: A new :class:`EvaluationContext` with
+            ``conversation_id`` set to this engine's conversation_id.
+        """
+        return replace(ctx, conversation_id=self._conversation_id)
+
+    def _inject_conversation_title(self, ctx: EvaluationContext) -> EvaluationContext:
+        """
+        Return a copy of *ctx* with ``conversation_title`` populated.
+
+        Injects the engine's own conversation title so function policy
+        callables can build human-readable, session-scoped identifiers
+        via ``event["context"]["conversation_title"]`` without the caller
+        having to thread it through every :class:``EvaluationContext`
+        it builds.
+
+        :param ctx: Original :class:``EvaluationContext`` from the
+            caller.
+        :returns: A new :class:``EvaluationContext`` with
+            ``conversation_title`` set to this engine's conversation
+            title.
+        """
+        return replace(ctx, conversation_title=self._conversation_title)
+
     def _filter_schema_valid(
         self,
         set_labels: dict[str, str],
@@ -740,12 +976,6 @@ class PolicyEngine:
                 result[key] = value
                 continue
             if ldef.values is not None and value not in ldef.values:
-                continue
-            if ldef.monotonic is not None and not _monotonic_ok(
-                ldef,
-                self._labels.get(key),
-                value,
-            ):
                 continue
             result[key] = value
         return result
@@ -784,7 +1014,7 @@ class PolicyEngine:
         Stateless policies — the default — no-op.
 
         Mirrors the omnigent-native semantics in
-        :meth:`omnigent.inner.policies.PolicyEngine.reset_turn`.
+        :meth:`omnigent.runtime.policies.engine.PolicyEngine.reset_turn`.
         Without this hook, legacy ``max_tool_calls_per_turn``
         callables silently degrade to per-session limits under
         Omnigent mode.
@@ -811,35 +1041,6 @@ class PolicyEngine:
             "conversation_id": self._conversation_id,
             "session_state": dict(self._session_state),
         }
-
-    def _populate_trajectory(self, ctx: EvaluationContext) -> EvaluationContext:
-        """
-        Return a copy of ``ctx`` with ``trajectory`` populated.
-
-        Queries the conversation store for the last
-        ``_TRAJECTORY_WINDOW`` items in chronological order. If
-        the conversation has fewer than the window size, returns
-        whatever exists (down to an empty list for brand-new
-        conversations). The store lookup is order=``"desc"`` +
-        slice + reverse so the engine asks for the *tail* without
-        first scanning the entire conversation.
-
-        :param ctx: Original :class:`EvaluationContext` from the
-            caller. ``ctx.trajectory`` is overwritten.
-        :returns: A new :class:`EvaluationContext` with
-            ``trajectory`` set to the recent items list (oldest
-            first).
-        """
-        page = self._store.list_items(
-            self._conversation_id,
-            limit=_TRAJECTORY_WINDOW,
-            order="desc",
-        )
-        # ``order="desc"`` returns most-recent first; reverse so the
-        # classifier sees items chronologically (oldest first), which
-        # matches how a human reads a conversation top-down.
-        trajectory = list(reversed(page.data))
-        return replace(ctx, trajectory=trajectory)
 
 
 def _apply_one(state: dict[str, Any], op: StateUpdate) -> None:
@@ -881,16 +1082,10 @@ async def _dispatch_policy(
     """
     Run a single policy's ``evaluate`` with full safety net.
 
-    Applies the POLICIES.md §4 / §13 contract:
+    Applies the POLICIES.md §4 contract:
 
     - Any exception raised by the policy is converted to a
-      result via :func:`_fail_closed`: DENY by default,
-      ALLOW for classifier-only specs (``action: [allow]``),
-      ASK for approval-gate specs (``action`` list includes
-      ASK but not DENY, e.g. ``[ask]``, ``[allow, ask]``).
-    - Returned actions are validated against the spec's
-      declared ``action`` list (when present). Mismatch →
-      same fail-closed path.
+      fail-closed DENY result.
     - ``set_labels`` from a failing evaluation are dropped;
       a partial/broken policy does not get to write labels.
 
@@ -902,91 +1097,24 @@ async def _dispatch_policy(
     """
     try:
         result = await policy.evaluate(ctx, context)
+        for op in result.state_updates or []:
+            if not isinstance(op.key, str):
+                raise TypeError("Policy state keys must be strings")
+            if op.key in AUTOMATIC_RUNTIME_STATE_KEYS:
+                if (
+                    not isinstance(policy, FunctionPolicy)
+                    or op.key not in policy.runtime_state_keys
+                ):
+                    raise ValueError("Runtime counters require their builtin policy")
+            elif is_reserved_state_key(op.key) and result.action != PolicyAction.ASK:
+                raise ValueError("Reserved policy state requires an ASK")
     except Exception as exc:
-        return _fail_closed(policy.spec, reason=f"policy {policy.spec.name!r} failed: {exc}")
-    if _action_permitted(policy.spec, result.action):
-        return result
-    return _fail_closed(
-        policy.spec,
-        reason=(
-            f"policy {policy.spec.name!r} returned {result.action.value!r} "
-            f"which is not in its declared action list"
-        ),
-    )
-
-
-def _action_permitted(spec: PolicySpec, action: PolicyAction) -> bool:
-    """
-    Check whether *action* is allowed by *spec*'s declared
-    action whitelist.
-
-    Specs with no declared whitelist (FunctionPolicySpec.action
-    may be ``None``) accept any action. Specs that declare a
-    list restrict to that list.
-
-    :param spec: The policy's spec.
-    :param action: The action the policy returned.
-    :returns: ``True`` if the action is permitted.
-    """
-    declared = getattr(spec, "action", None)
-    if not isinstance(declared, list):
-        # FunctionPolicySpec may be None = accept any.
-        return True
-    return action in declared
-
-
-def _fail_closed(spec: PolicySpec, *, reason: str) -> PolicyResult:
-    """
-    Build the fail-closed result for a broken policy.
-
-    Three branches:
-
-    1. **Classifier-only** (``action: [allow]``): substitute ALLOW.
-       Inventing a DENY violates the author's declared "this policy
-       never blocks" intent (POLICIES.md §13).
-    2. **Approval-gate** (``action`` list includes ASK but not DENY,
-       e.g. ``[ask]``, ``[allow, ask]``): substitute ASK so the
-       engine parks for user approval.  Substituting ALLOW would
-       bypass the gate; substituting DENY invents an action the
-       author never declared.
-    3. **All other policies** (no declared list, or list includes
-       DENY): fail-closed DENY.
-
-    :param spec: The policy's spec — used to inspect the declared
-        action whitelist.
-    :param reason: Human-readable explanation attached to the
-        result; discarded on the ALLOW substitution path since
-        ALLOW results carry no reason.
-    :returns: A :class:`PolicyResult` safe for composition.
-    """
-    declared = getattr(spec, "action", None)
-    if isinstance(declared, list):
-        # Classifier-only = advisory policies that never block (e.g. [allow]).
-        # Approval-gate policies ([ask], [allow, ask]) must NOT fail open —
-        # an evaluator exception must park-for-approval or deny, never
-        # substitute ALLOW.  See POLICIES.md §4.
-        has_deny = PolicyAction.DENY in declared
-        has_ask = PolicyAction.ASK in declared
-        if not has_deny and not has_ask:
-            # Classifier-only: honour the "never blocks" intent.
-            return PolicyResult(
-                action=PolicyAction.ALLOW,
-                reason=None,
-                set_labels=None,
-            )
-        if has_ask and not has_deny:
-            # Approval-gate: park for user confirmation.
-            return PolicyResult(
-                action=PolicyAction.ASK,
-                reason=reason,
-                set_labels=None,
-            )
-    # Default: fail-closed DENY.
-    return PolicyResult(
-        action=PolicyAction.DENY,
-        reason=reason,
-        set_labels=None,
-    )
+        return PolicyResult(
+            action=PolicyAction.DENY,
+            reason=f"policy {policy.spec.name!r} failed: {exc}",
+            set_labels=None,
+        )
+    return result
 
 
 def _filter_writable_labels(
@@ -1012,126 +1140,6 @@ def _filter_writable_labels(
     if not isinstance(whitelist, list):
         return dict(set_labels)
     return {k: v for k, v in set_labels.items() if k in whitelist}
-
-
-def _merge_monotonic_writes(
-    accumulated: dict[str, str],
-    new_writes: dict[str, str],
-    label_defs: dict[str, LabelDef],
-) -> None:
-    """
-    Merge a per-policy ``set_labels`` batch into the in-flight
-    accumulator, preserving each label's monotonic direction.
-
-    The composed semantics for one ``evaluate()`` call: when
-    multiple policies fire and write the SAME key, the
-    accumulator must end up holding the most-restrictive value
-    in the direction the label declares — not whichever write
-    happened to come last in YAML order. Without this, a
-    ``monotonic: increasing`` label (e.g. taint level) can be
-    silently lowered by a later policy in the same evaluation
-    that writes a smaller value, even though the LabelDef
-    says "labels only move upwards." Symmetric for
-    ``decreasing``: a later write of a higher value cannot
-    raise a label that a prior policy already lowered.
-
-    Behaviour:
-
-    - Key not yet in *accumulated*: insert *new_value*.
-    - Key has no :class:`LabelDef` (schemaless), or the
-      ``LabelDef`` has no monotonic direction, or
-      ``LabelDef.values`` is unset: last-write-wins (matches
-      the historical behaviour for the unconstrained case).
-    - Key is monotonic ``increasing``: keep the higher-index
-      value among ``existing`` and *new_value*.
-    - Key is monotonic ``decreasing``: keep the lower-index
-      value among ``existing`` and *new_value*.
-    - Either side outside ``LabelDef.values``: last-write-wins.
-      ``_filter_schema_valid`` will drop the out-of-enum value
-      at apply time, so the merge result doesn't change the
-      end persistence.
-
-    Mutates *accumulated* in place; symmetric in argument
-    order — running the policy chain in reverse YAML order
-    yields the same final dict.
-
-    :param accumulated: The in-flight accumulator dict.
-        Mutated in place.
-    :param new_writes: One policy's filtered ``set_labels``.
-    :param label_defs: The engine's per-key schema map.
-    """
-    for key, new_value in new_writes.items():
-        existing = accumulated.get(key)
-        if existing is None:
-            accumulated[key] = new_value
-            continue
-        ldef = label_defs.get(key)
-        if ldef is None or ldef.monotonic is None or ldef.values is None:
-            # Schemaless or unconstrained — preserve historical
-            # last-write-wins behaviour.
-            accumulated[key] = new_value
-            continue
-        if existing not in ldef.values or new_value not in ldef.values:
-            # Out-of-enum on either side — defer to the schema
-            # filter at apply time. Keep the latest write so the
-            # filter has something to reject.
-            accumulated[key] = new_value
-            continue
-        existing_idx = ldef.values.index(existing)
-        new_idx = ldef.values.index(new_value)
-        if ldef.monotonic == "increasing":
-            accumulated[key] = new_value if new_idx > existing_idx else existing
-        elif ldef.monotonic == "decreasing":
-            accumulated[key] = new_value if new_idx < existing_idx else existing
-        # No else: any other monotonic value is rejected at
-        # spec parse, so this branch is unreachable.
-
-
-def _monotonic_ok(
-    ldef: LabelDef,
-    current: str | None,
-    new_value: str,
-) -> bool:
-    """
-    Check whether a monotonic label write is permitted.
-
-    Direction semantics (POLICIES.md §10):
-
-    - ``"increasing"``: new_value's index in
-      ``ldef.values`` must be ``>=`` current's index.
-    - ``"decreasing"``: new_value's index must be ``<=``
-      current's index.
-    - Seeding an unset label (``current is None``) is
-      always permitted — nothing to compare against yet.
-
-    Values outside ``ldef.values`` never reach this helper
-    (the values-check runs first in
-    :meth:`PolicyEngine._filter_schema_valid`).
-
-    :param ldef: The label's schema declaration.
-    :param current: Current value in the hot cache, or
-        ``None`` when the label is unset.
-    :param new_value: The value the caller wants to write.
-    :returns: ``True`` when the write is permitted.
-    """
-    if current is None:
-        return True
-    # ldef.values is guaranteed non-None here because the
-    # caller only invokes this helper when monotonic is set,
-    # and the parser rejects monotonic-without-values at
-    # spec load (POLICIES.md §13). Assert rather than branch
-    # so any regression fails loud.
-    assert ldef.values is not None, "monotonic without values reached runtime — parser regression?"
-    current_idx = ldef.values.index(current) if current in ldef.values else -1
-    new_idx = ldef.values.index(new_value)
-    if ldef.monotonic == "increasing":
-        return new_idx >= current_idx
-    if ldef.monotonic == "decreasing":
-        return new_idx <= current_idx
-    # Unknown direction — fall through to reject. Parser
-    # rejects unknown values at spec load so this is
-    # defensive.
-    return False
 
 
 def _condition_matches(

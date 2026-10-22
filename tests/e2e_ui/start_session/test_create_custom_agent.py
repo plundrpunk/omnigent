@@ -1,0 +1,277 @@
+"""E2E: "Create custom agent" dialog on the new-session landing page.
+
+Covers the user journey of creating a custom agent from the agent picker
+dropdown, configuring it (name, description, MCP tools), and submitting the
+form to create a session with the bundled agent. Form and target-state variants
+are covered in ``web/src/shell/NewChatDialog.test.tsx``.
+
+Uses the same route-stubbing approach as ``test_start_session.py``: the
+server's ``/v1/hosts``, ``/v1/agents``, and ``POST /v1/sessions`` are faked
+so the tests don't need a real host. The create POST is intercepted to
+capture the multipart request body for assertion.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+from playwright.async_api import Route, async_playwright, expect
+
+from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
+from tests._helpers.picker_routes import OWN_AGENTS
+from tests._helpers.polling import poll_until_async
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+
+# Stubbed host the composer auto-selects.
+_HOST_ID = "host_e2e"
+# Bare create endpoint — intercepts POST but lets GET through.
+_SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
+
+
+def _agents_body() -> str:
+    """Single Claude Code agent for the stub."""
+    return json.dumps(
+        {
+            "data": [
+                {
+                    "id": "ag_claude_e2e",
+                    "name": "claude-native-ui",
+                    "display_name": "Claude Code",
+                    "description": "Anthropic's coding agent",
+                    "harness": None,
+                    "skills": [],
+                }
+            ]
+        }
+    )
+
+
+def _hosts_body() -> str:
+    return json.dumps(
+        {
+            "hosts": [
+                {
+                    "host_id": _HOST_ID,
+                    "name": "e2e-host",
+                    "owner": "e2e",
+                    "status": "online",
+                }
+            ]
+        }
+    )
+
+
+async def _register_routes(
+    page,
+    *,
+    created_session_id: str,
+    create_requests: list[dict[str, Any]],
+) -> None:
+    """Install stubs for hosts, agents, session create, and events."""
+
+    async def handle_hosts(route: Route) -> None:
+        await route.fulfill(status=200, content_type="application/json", body=_hosts_body())
+
+    async def handle_agents(route: Route) -> None:
+        await route.fulfill(status=200, content_type="application/json", body=_agents_body())
+
+    async def handle_events(route: Route) -> None:
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"queued": True, "item_id": "ci_e2e"}),
+        )
+
+    async def handle_sessions(route: Route) -> None:
+        if route.request.method == "POST":
+            # Capture multipart or JSON create requests.
+            content_type = route.request.headers.get("content-type", "")
+            if "multipart" in content_type:
+                # For multipart, we can't easily parse the binary body in
+                # Playwright, so just record that a multipart POST happened.
+                create_requests.append({"__multipart__": True})
+            else:
+                create_requests.append(route.request.post_data_json)
+            await route.fulfill(
+                status=200,
+                content_type="application/json",
+                body=json.dumps({"id": created_session_id, "session_id": created_session_id}),
+            )
+        else:
+            await route.continue_()
+
+    async def handle_agent_scan(route: Route) -> None:
+        # Neutralize agent discovery so only the stubbed Claude agent feeds the
+        # picker. On the shared e2e_ui server, sessions other tests left behind
+        # would otherwise leak in as discovered custom agents — flipping the
+        # picker's custom-agent "Other..." group on and folding "Create custom agent"
+        # into a submenu, so the top-level create row this test clicks is absent.
+        await route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"data": []}),
+        )
+
+    await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
+    await page.route("**/v1/agents", handle_agents)
+    await page.route("**/v1/sessions/*/events", handle_events)
+    await page.route(_SESSIONS_RE, handle_sessions)
+    # Registered after the broad sessions glob so it wins the visibility=mine discovery
+    # scan; the bare conversation-list GET still falls through to handle_sessions.
+    await page.route(
+        re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine"), handle_agent_scan
+    )
+    await page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
+
+
+async def _seed_workspace(page) -> None:
+    """Seed a recent workspace so the composer can enable Send."""
+    await page.add_init_script(
+        f"""window.localStorage.setItem(
+            "omnigent:recent-workspaces",
+            JSON.stringify({{ {_HOST_ID}: ["/work/repo"] }})
+        );"""
+    )
+
+
+async def _open_create_agent(page) -> None:
+    """Open the agent picker and click "Create custom agent".
+
+    With no custom agents registered, the create action is a top-level row in
+    the picker (it only folds into an "Other..." submenu once custom agents
+    exist), so open the dropdown and click the create item directly.
+    """
+    await page.get_by_test_id("new-chat-landing-agent-select").click()
+    await page.get_by_test_id("new-chat-landing-custom-agents").click()
+    await page.get_by_test_id("new-chat-landing-create-agent").click()
+
+
+# ── Tests ──────────────────────────────────────────────────────────
+
+
+def test_create_agent_submits_multipart_bundle(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Creating a custom agent and sending produces a multipart POST."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_create_and_submit(base_url, session_id))
+
+
+async def _drive_create_and_submit(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_requests: list[dict[str, Any]] = []
+            await _register_routes(
+                page, created_session_id=session_id, create_requests=create_requests
+            )
+            await _seed_workspace(page)
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Open dropdown → Create custom agent.
+            await _open_create_agent(page)
+
+            dialog = page.get_by_test_id("create-agent-dialog")
+            await expect(dialog).to_be_visible(timeout=5_000)
+
+            # Fill in agent details.
+            await page.get_by_test_id("create-agent-name").fill("test-agent")
+            await page.get_by_test_id("create-agent-description").fill("A test agent")
+            await page.get_by_test_id("create-agent-model").fill("claude-sonnet-4-20250514")
+            await page.get_by_test_id("create-agent-instructions").fill(
+                "You are a test assistant."
+            )
+
+            # Submit the dialog.
+            await page.get_by_test_id("create-agent-submit").click()
+
+            # Dialog should close.
+            await expect(dialog).to_be_hidden(timeout=5_000)
+
+            # The agent chip should now show the custom agent name.
+            await expect(page.get_by_test_id("new-chat-landing-agent-select")).to_contain_text(
+                "test-agent"
+            )
+
+            # Type a message and submit the session.
+            await page.get_by_test_id("new-chat-landing-input").fill("hello world")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            # The create POST should have been a multipart request (the bundle).
+            await poll_until_async(lambda: len(create_requests) == 1)
+            assert create_requests[0].get("__multipart__") is True, (
+                f"Expected multipart POST, got: {create_requests[0]}"
+            )
+        finally:
+            await browser.close()
+
+
+def test_create_agent_with_mcp_server(
+    seeded_session: tuple[str, str],
+) -> None:
+    """Adding an MCP server in the dialog includes it in the bundle."""
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_mcp_server(base_url, session_id))
+
+
+async def _drive_mcp_server(base_url: str, session_id: str) -> None:
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        page = await browser.new_page()
+        try:
+            create_requests: list[dict[str, Any]] = []
+            await _register_routes(
+                page, created_session_id=session_id, create_requests=create_requests
+            )
+            await _seed_workspace(page)
+
+            await page.goto(f"{base_url}/")
+            await page.get_by_test_id("new-chat-landing-input").wait_for(
+                state="visible", timeout=30_000
+            )
+
+            # Open dropdown → Create custom agent.
+            await _open_create_agent(page)
+
+            dialog = page.get_by_test_id("create-agent-dialog")
+            await expect(dialog).to_be_visible(timeout=5_000)
+
+            # Fill in agent name and model (both required).
+            await page.get_by_test_id("create-agent-name").fill("mcp-agent")
+            await page.get_by_test_id("create-agent-model").fill("claude-sonnet-4-20250514")
+
+            # Add an MCP server.
+            await page.get_by_test_id("create-agent-add-mcp").click()
+
+            # An MCP entry card should appear.
+            mcp_entry = page.get_by_test_id("create-agent-mcp-entry")
+            await expect(mcp_entry).to_be_visible()
+
+            # Fill in MCP server details (stdio transport is default).
+            await page.get_by_test_id("create-agent-mcp-name").fill("github")
+            await page.get_by_test_id("create-agent-mcp-command").fill("npx")
+            await page.get_by_test_id("create-agent-mcp-args").fill(
+                "-y @modelcontextprotocol/server-github"
+            )
+            await page.get_by_test_id("create-agent-mcp-env").fill("GITHUB_TOKEN=ghp_test123")
+
+            # Submit the dialog.
+            await page.get_by_test_id("create-agent-submit").click()
+            await expect(dialog).to_be_hidden(timeout=5_000)
+
+            # Submit session.
+            await page.get_by_test_id("new-chat-landing-input").fill("list repos")
+            await page.get_by_test_id("new-chat-landing-submit").click()
+
+            await poll_until_async(lambda: len(create_requests) == 1)
+            assert create_requests[0].get("__multipart__") is True
+        finally:
+            await browser.close()

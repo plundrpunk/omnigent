@@ -12,13 +12,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import secrets
 import time
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
 import jwt
+
+_logger = logging.getLogger(__name__)
 
 # ── PKCE helpers (RFC 7636) ──────────────────────────────────────
 
@@ -47,11 +51,56 @@ def derive_code_challenge(code_verifier: str) -> str:
 # ── Session cookie helpers ───────────────────────────────────────
 
 
+def mint_session_token(
+    user_id: str,
+    cookie_secret: bytes,
+    ttl_seconds: int,
+    provider: str,
+    *,
+    account_generation: str | None = None,
+    cli_login_ticket: str | None = None,
+) -> str:
+    """
+    Mint a signed session JWT with a second-granularity lifetime.
+
+    The seconds-based core behind :func:`mint_session_cookie`. A managed
+    runner needs a short-lived (sub-hour) owner token, which the hours-only
+    cookie helper cannot express; both share this HS256 claim shape so the
+    same validator (:meth:`UnifiedAuthProvider._check_cookie`) accepts
+    either.
+
+    :param user_id: The authenticated user's email, e.g.
+        ``"alice@example.com"``.
+    :param cookie_secret: HMAC key for HS256 signing.
+    :param ttl_seconds: Token lifetime in seconds.
+    :param provider: Identity provider name, e.g. ``"google"`` or
+        ``"accounts"``. Stored as an informational claim.
+    :param cli_login_ticket: Ticket authenticated by the browser callback,
+        never included in runner, refresh, or CLI-issued credentials.
+    :returns: An HS256-signed JWT string.
+    """
+    now = int(time.time())
+    payload = {
+        "sub": user_id,
+        "iat": now,
+        "exp": now + ttl_seconds,
+        "provider": provider,
+    }
+    if account_generation is not None:
+        payload["account_generation"] = account_generation
+    if cli_login_ticket is not None:
+        payload["cli_login_ticket"] = cli_login_ticket
+    return jwt.encode(payload, cookie_secret, algorithm="HS256")
+
+
 def mint_session_cookie(
     user_id: str,
     cookie_secret: bytes,
     ttl_hours: int,
     provider: str,
+    *,
+    account_generation: str | None = None,
+    cli_login_ticket: str | None = None,
 ) -> str:
     """Mint a signed session cookie JWT.
 
@@ -61,16 +110,17 @@ def mint_session_cookie(
     :param ttl_hours: Session lifetime in hours.
     :param provider: Identity provider name, e.g. ``"google"``
         or ``"github"``. Stored as an informational claim.
+    :param cli_login_ticket: Ticket authenticated by the browser callback.
     :returns: An HS256-signed JWT string.
     """
-    now = int(time.time())
-    payload = {
-        "sub": user_id,
-        "iat": now,
-        "exp": now + (ttl_hours * 3600),
-        "provider": provider,
-    }
-    return jwt.encode(payload, cookie_secret, algorithm="HS256")
+    return mint_session_token(
+        user_id,
+        cookie_secret,
+        ttl_hours * 3600,
+        provider,
+        account_generation=account_generation,
+        cli_login_ticket=cli_login_ticket,
+    )
 
 
 def hmac_digest(token: str, secret: bytes) -> str:
@@ -108,7 +158,7 @@ class OIDCConfig:
     :param issuer: OIDC issuer URL, e.g.
         ``"https://accounts.google.com"``.
     :param client_id: OAuth client ID registered with the IdP.
-    :param client_secret: OAuth client secret.
+    :param client_secret: OAuth client secret, or empty for public PKCE clients.
     :param redirect_uri: Full callback URL, e.g.
         ``"https://myapp.example.com/auth/callback"``.
     :param cookie_secret: HMAC key for session cookie signing
@@ -130,6 +180,14 @@ class OIDCConfig:
     :param userinfo_endpoint: Userinfo URL for providers that
         don't issue ``id_token`` (GitHub). ``None`` for standard
         OIDC providers.
+    :param skip_email_verification: When ``True``, accept the
+        ``id_token`` email claim without requiring
+        ``email_verified``. Only affects the generic-OIDC path;
+        GitHub always requires a verified primary email.
+    :param email_claim: Name of the ``id_token`` claim that carries
+        the user's email identity, e.g. ``"preferred_username"`` for
+        IdPs that omit ``email`` (Microsoft Entra ID). Defaults to
+        ``"email"``. Only affects the generic-OIDC path.
     """
 
     issuer: str
@@ -147,6 +205,8 @@ class OIDCConfig:
     jwks_uri: str | None
     userinfo_endpoint: str | None
     allow_invites: bool
+    skip_email_verification: bool = False
+    email_claim: str = "email"
 
     @property
     def base_url(self) -> str:
@@ -193,8 +253,9 @@ class OIDCConfig:
     def from_env() -> OIDCConfig:
         """Read and validate all OIDC env vars.
 
-        Fetches the OIDC discovery document for standard providers,
-        or uses hardcoded endpoints for GitHub.
+        Uses explicit endpoints or discovery for standard providers,
+        and hardcoded endpoints for GitHub. Public clients must opt in
+        to token endpoint authentication method ``none``.
 
         :returns: A validated :class:`OIDCConfig`.
         :raises RuntimeError: If any required env var is missing or
@@ -212,7 +273,25 @@ class OIDCConfig:
 
         issuer = _require("OMNIGENT_OIDC_ISSUER")
         client_id = _require("OMNIGENT_OIDC_CLIENT_ID")
-        client_secret = _require("OMNIGENT_OIDC_CLIENT_SECRET")
+        auth_method = (
+            os.environ.get("OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD") or "client_secret_post"
+        ).strip()
+        if auth_method not in {"client_secret_post", "none"}:
+            raise RuntimeError(
+                "OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD must be client_secret_post or none"
+            )
+        is_github = issuer.rstrip("/") == _GITHUB_ISSUER
+        if auth_method == "none":
+            if is_github:
+                raise RuntimeError("GitHub login requires client_secret_post authentication")
+            if os.environ.get("OMNIGENT_OIDC_CLIENT_SECRET", "").strip():
+                raise RuntimeError(
+                    "Unset OMNIGENT_OIDC_CLIENT_SECRET when "
+                    "OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none"
+                )
+            client_secret = ""
+        else:
+            client_secret = _require("OMNIGENT_OIDC_CLIENT_SECRET")
         # Redirect URI: an explicit value wins; otherwise derive it from
         # OMNIGENT_DOMAIN (the same var the Caddy HTTPS overlay uses) as
         # ``https://<domain>/auth/callback``. A domain-based deploy then
@@ -257,8 +336,78 @@ class OIDCConfig:
 
         allow_invites = env_var_is_truthy("OMNIGENT_OIDC_ALLOW_INVITES")
 
+        # Some IdPs (e.g. Okta without custom API Access Management)
+        # omit ``email_verified`` for directory-provisioned users even
+        # though the directory is authoritative for the address. This
+        # opt-out trusts any signed email claim from the IdP — only
+        # enable it when the issuer is a trusted enterprise directory.
+        skip_email_verification = env_var_is_truthy("OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION")
+        if skip_email_verification:
+            _logger.warning(
+                "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is set: the "
+                "email_verified claim will not be required on OIDC "
+                "id_tokens. Any signed email claim from %s will be "
+                "trusted as the user's identity.",
+                issuer,
+            )
+
+        # Some IdPs carry the email identity in a claim other than
+        # ``email`` (Microsoft Entra ID commonly issues only
+        # ``preferred_username``, the UPN).
+        email_claim = (os.environ.get("OMNIGENT_OIDC_EMAIL_CLAIM") or "email").strip()
+        if email_claim != "email":
+            _logger.warning(
+                "OMNIGENT_OIDC_EMAIL_CLAIM is set: the user identity "
+                "will be read from the %r claim of id_tokens issued by "
+                "%s instead of ``email``.",
+                email_claim,
+                issuer,
+            )
+            if not skip_email_verification:
+                _logger.warning(
+                    "A custom email claim carries no email_verified "
+                    "marker, so logins will be rejected unless "
+                    "OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION is also set."
+                )
+
         # Determine provider type and resolve endpoints.
-        is_github = issuer.rstrip("/") == _GITHUB_ISSUER
+        endpoints = {
+            name: os.environ.get(f"OMNIGENT_OIDC_{name.upper()}", "").strip()
+            for name in ("authorization_endpoint", "token_endpoint", "jwks_uri")
+        }
+        if any(endpoints.values()):
+            if is_github:
+                raise RuntimeError("OIDC endpoint overrides are not supported for GitHub login")
+            if not all(endpoints.values()):
+                raise RuntimeError(
+                    "Set all three OIDC endpoint overrides: OMNIGENT_OIDC_AUTHORIZATION_ENDPOINT, "
+                    "OMNIGENT_OIDC_TOKEN_ENDPOINT, and OMNIGENT_OIDC_JWKS_URI"
+                )
+            for name, endpoint in endpoints.items():
+                try:
+                    parsed = urlsplit(endpoint)
+                    valid = (
+                        bool(parsed.hostname)
+                        and parsed.username is None
+                        and parsed.password is None
+                        and not parsed.fragment
+                        and (parsed.port is None or parsed.port > 0)
+                        and not any(character.isspace() for character in endpoint)
+                        and (
+                            parsed.scheme == "https"
+                            or (
+                                parsed.scheme == "http"
+                                and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+                            )
+                        )
+                    )
+                except ValueError:
+                    valid = False
+                if not valid:
+                    raise RuntimeError(
+                        f"OMNIGENT_OIDC_{name.upper()} must be an absolute HTTPS URL "
+                        "without userinfo or a fragment (HTTP is allowed only for loopback)"
+                    )
 
         if is_github:
             # Empty string (forwarded by `${VAR:-}` wrappers) → default.
@@ -279,19 +428,23 @@ class OIDCConfig:
                 jwks_uri=None,
                 userinfo_endpoint=_GITHUB_USERINFO_ENDPOINT,
                 allow_invites=allow_invites,
+                skip_email_verification=skip_email_verification,
             )
 
         # Standard OIDC: fetch discovery document.
         scopes = (os.environ.get("OMNIGENT_OIDC_SCOPES") or "openid email profile").strip()
         discovery_url = issuer.rstrip("/") + "/.well-known/openid-configuration"
-        try:
-            resp = httpx.get(discovery_url, timeout=10.0)
-            resp.raise_for_status()
-            doc = resp.json()
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to fetch OIDC discovery document from {discovery_url}: {exc}"
-            ) from exc
+        if all(endpoints.values()):
+            doc = endpoints
+        else:
+            try:
+                resp = httpx.get(discovery_url, timeout=10.0)
+                resp.raise_for_status()
+                doc = resp.json()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to fetch OIDC discovery document from {discovery_url}: {exc}"
+                ) from exc
 
         authorization_endpoint = doc.get("authorization_endpoint")
         token_endpoint = doc.get("token_endpoint")
@@ -320,4 +473,6 @@ class OIDCConfig:
             jwks_uri=jwks_uri,
             userinfo_endpoint=doc.get("userinfo_endpoint"),
             allow_invites=allow_invites,
+            skip_email_verification=skip_email_verification,
+            email_claim=email_claim,
         )

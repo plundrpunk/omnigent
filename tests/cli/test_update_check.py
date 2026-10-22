@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import subprocess
+import textwrap
 import time
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from click.testing import CliRunner
 
+from omnigent.cli import cli
 from omnigent.update_check import (
     _STALENESS_SECONDS,
     _CacheEntry,
@@ -28,12 +31,13 @@ from omnigent.update_check import (
 
 
 def test_find_repo_root_finds_git_dir() -> None:
-    """``_find_repo_root`` returns the repo root when a ``.git/`` exists."""
+    """``_find_repo_root`` returns the repo root when a ``.git`` exists."""
     root = _find_repo_root()
     # The test itself runs inside the repo, so root must be non-None
-    # and contain a .git directory.
+    # and contain a .git entry (directory for a normal clone, file
+    # for a git worktree).
     assert root is not None
-    assert (root / ".git").is_dir()
+    assert (root / ".git").exists()
 
 
 def test_find_repo_root_no_git_integration(
@@ -497,12 +501,20 @@ import sys  # noqa: E402
 from omnigent.update_check import (  # noqa: E402
     _build_upgrade_suggestion,
     _InstalledWheelInfo,
+    _parse_extras_from_spec,
     _pip_invocation,
     _read_build_info,
     _read_installed_wheel_info,
+    _read_pipx_extras,
+    _read_uv_tool_extras,
     _run_installed_wheel_check,
     _unredact_ssh_userinfo,
+    _uv_python_pin,
 )
+
+# uv upgrade commands pin the interpreter omnigent is running under, so
+# expectations derive the flag instead of hardcoding a python version.
+_UV_PY = _uv_python_pin()
 
 
 @pytest.fixture(autouse=True)
@@ -591,6 +603,7 @@ def _write_fake_dist_info(
     direct_url: dict[str, object] | None = None,
     uv_cache: dict[str, object] | None = None,
     dir_mtime_epoch: float | None = None,
+    version: str = "0.1.0",
 ) -> importlib.metadata.PathDistribution:
     """Build a real ``.dist-info/`` on disk and return a PathDistribution.
 
@@ -612,11 +625,14 @@ def _write_fake_dist_info(
     :param dir_mtime_epoch: When provided, ``os.utime`` is used to
         backdate the dist-info dir's mtime to this Unix timestamp —
         this is the fallback signal when ``uv_cache.json`` is absent.
+    :param version: Installed package version written to ``METADATA``.
     :returns: A ``PathDistribution`` constructed against the dir.
     """
-    dist_info = tmp_path / "omnigent-0.1.0.dist-info"
+    dist_info = tmp_path / f"omnigent-{version}.dist-info"
     dist_info.mkdir()
-    (dist_info / "METADATA").write_text("Metadata-Version: 2.1\nName: omnigent\nVersion: 0.1.0\n")
+    (dist_info / "METADATA").write_text(
+        f"Metadata-Version: 2.1\nName: omnigent\nVersion: {version}\n"
+    )
     if installer is not None:
         (dist_info / "INSTALLER").write_text(installer + "\n")
     if direct_url is not None:
@@ -759,7 +775,7 @@ def test_read_wheel_info_repairs_redacted_ssh_user(
     assert suggestion.runnable is True
     assert (
         suggestion.command
-        == "uv tool install --reinstall git+ssh://git@github.com/omnigent-ai/omnigent.git"
+        == f"uv tool install --reinstall{_UV_PY} git+ssh://git@github.com/omnigent-ai/omnigent.git"
     )
 
 
@@ -856,7 +872,7 @@ def test_read_wheel_info_handles_corrupt_direct_url(
     [
         # uv + git install — recommend ``uv tool install --reinstall``
         # with the original URL so the user pulls a fresh commit.
-        ("uv", _FAKE_GIT_URL, f"uv tool install --reinstall {_FAKE_GIT_URL}", True),
+        ("uv", _FAKE_GIT_URL, f"uv tool install --reinstall{_UV_PY} {_FAKE_GIT_URL}", True),
         # uv + registry install — ``uv tool upgrade`` resolves from the
         # configured index. The user doesn't need to remember the spec.
         ("uv", None, "uv tool upgrade omnigent", True),
@@ -988,6 +1004,30 @@ def test_wheel_check_no_nag_when_up_to_date(
         )
     )
     dist = _write_fake_dist_info(tmp_path, installer="uv")
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+
+    _run_installed_wheel_check()
+
+    assert capsys.readouterr().err == ""
+
+
+def test_wheel_check_no_nag_for_matching_dev_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A dev build from the latest release line is already current."""
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    _point_cache_at(tmp_path, monkeypatch)
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=0,
+            kind="wheel",
+            latest_version="0.9.0",
+        )
+    )
+    dist = _write_fake_dist_info(tmp_path, installer="uv", version="0.9.0.dev0")
     monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
 
     _run_installed_wheel_check()
@@ -1227,6 +1267,15 @@ def test_is_newer_tolerates_garbage() -> None:
     assert _is_newer("", "0.1.0") is False
 
 
+def test_should_notify_release_treats_dev_build_as_current_release() -> None:
+    """Matching finals stay quiet without hiding later release lines."""
+    from omnigent.update_check import _should_notify_release
+
+    assert _should_notify_release("0.9.0", "0.9.0.dev0") is False
+    assert _should_notify_release("0.9.1", "0.9.0.dev0") is True
+    assert _should_notify_release("0.9.0.post1", "0.9.0.dev0") is True
+
+
 class _FakeResp:
     """Minimal httpx.Response stand-in for the Simple-API parser."""
 
@@ -1292,6 +1341,71 @@ def test_fetch_latest_version_pep691_json(monkeypatch: pytest.MonkeyPatch) -> No
     # Default index + normalized project name + JSON Accept header.
     assert captured["url"] == "https://pypi.org/simple/omnigent/"
     assert captured["headers"] == {"Accept": "application/vnd.pypi.simple.v1+json"}
+
+
+def test_fetch_latest_version_retries_transient_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``attempts=2`` retries a transient connection error, then succeeds.
+
+    Regression: the foreground ``omni upgrade`` shouldn't report the index as
+    unreachable on a single momentary blip against a slow mirror.
+    """
+    import httpx
+
+    from omnigent.update_check import fetch_latest_version
+
+    _clear_index_env(monkeypatch)
+    calls = {"n": 0}
+
+    def _get(url: str, **_kw: object) -> _FakeResp:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("transient")
+        return _FakeResp(json_body={"versions": ["0.1.0", "0.2.0"]})
+
+    monkeypatch.setattr(httpx, "get", _get)
+
+    assert fetch_latest_version(attempts=2) == "0.2.0"
+    assert calls["n"] == 2  # retried exactly once
+
+
+def test_fetch_latest_version_no_retry_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The background path (default ``attempts=1``) makes a single try."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_version
+
+    _clear_index_env(monkeypatch)
+    calls = {"n": 0}
+
+    def _get(url: str, **_kw: object) -> _FakeResp:
+        calls["n"] += 1
+        raise httpx.ConnectError("transient")
+
+    monkeypatch.setattr(httpx, "get", _get)
+
+    assert fetch_latest_version() is None
+    assert calls["n"] == 1
+
+
+def test_fetch_latest_version_does_not_retry_non_200(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A definitive non-200 reply is not retried, even with ``attempts=2``."""
+    import httpx
+
+    from omnigent.update_check import fetch_latest_version
+
+    _clear_index_env(monkeypatch)
+    calls = {"n": 0}
+
+    def _get(url: str, **_kw: object) -> _FakeResp:
+        calls["n"] += 1
+        return _FakeResp(status_code=503)
+
+    monkeypatch.setattr(httpx, "get", _get)
+
+    assert fetch_latest_version(attempts=2) is None
+    assert calls["n"] == 1
 
 
 def test_fetch_latest_version_from_files_when_no_versions_key(
@@ -1403,8 +1517,206 @@ def test_build_upgrade_suggestion_allow_prerelease() -> None:
         _build_upgrade_suggestion(
             _info("uv", vcs_url="git+https://x/omnigent.git"), allow_prerelease=True
         ).command
-        == "uv tool install --reinstall git+https://x/omnigent.git --prerelease allow"
+        == f"uv tool install --reinstall{_UV_PY} git+https://x/omnigent.git --prerelease allow"
     )
+
+
+# ------------------------------------------------------------------
+# Extras preservation
+# ------------------------------------------------------------------
+
+
+def test_parse_extras_from_spec() -> None:
+    """`_parse_extras_from_spec` extracts extras in declaration order."""
+    assert _parse_extras_from_spec("omnigent") == []
+    assert _parse_extras_from_spec("omnigent[all]") == ["all"]
+    assert _parse_extras_from_spec("omnigent[all,server]") == ["all", "server"]
+    assert _parse_extras_from_spec("omnigent[all , server]") == ["all", "server"]
+
+
+def _make_info(
+    installer: str = "uv",
+    *,
+    extras: tuple[str, ...] = (),
+    vcs_url: str | None = None,
+) -> _InstalledWheelInfo:
+    return _InstalledWheelInfo(
+        install_time_epoch=0.0,
+        installer=installer,
+        vcs_url=vcs_url,
+        commit_sha=None,
+        is_editable=False,
+        package_version="0.1.0",
+        detected_installer=installer,
+        extras=extras,
+    )
+
+
+def test_build_upgrade_suggestion_preserves_uv_tool_extras() -> None:
+    """uv tool installs with extras use ``install --reinstall`` to keep them."""
+    # No extras → plain uv tool upgrade.
+    assert _build_upgrade_suggestion(_make_info("uv")).command == "uv tool upgrade omnigent"
+    # With extras → reinstall with the PEP 508 spec.
+    assert (
+        _build_upgrade_suggestion(_make_info("uv", extras=("all",))).command
+        == f"uv tool install --reinstall{_UV_PY} omnigent[all]"
+    )
+    assert (
+        _build_upgrade_suggestion(_make_info("uv", extras=("server", "all"))).command
+        == f"uv tool install --reinstall{_UV_PY} omnigent[all,server]"
+    )
+
+
+def test_build_upgrade_suggestion_uv_target_version() -> None:
+    """A pinned target version produces ``install --reinstall`` with the spec."""
+    assert (
+        _build_upgrade_suggestion(_make_info("uv"), target_version="0.2.0").command
+        == f"uv tool install --reinstall{_UV_PY} omnigent==0.2.0"
+    )
+    assert (
+        _build_upgrade_suggestion(
+            _make_info("uv", extras=("all",)), target_version="0.2.0"
+        ).command
+        == f"uv tool install --reinstall{_UV_PY} omnigent==0.2.0[all]"
+    )
+
+
+def test_build_upgrade_suggestion_extra_overrides_win() -> None:
+    """``--extra`` appends to / overrides detected extras."""
+    assert (
+        _build_upgrade_suggestion(
+            _make_info("uv", extras=("all",)), extra_overrides=("server",)
+        ).command
+        == f"uv tool install --reinstall{_UV_PY} omnigent[all,server]"
+    )
+    assert (
+        _build_upgrade_suggestion(_make_info("uv"), extra_overrides=("all",)).command
+        == f"uv tool install --reinstall{_UV_PY} omnigent[all]"
+    )
+
+
+def test_build_upgrade_suggestion_preserves_pipx_extras() -> None:
+    """pipx installs with extras use ``install --force``; plain ones use ``upgrade``."""
+    assert _build_upgrade_suggestion(_make_info("pipx")).command == "pipx upgrade omnigent"
+    assert (
+        _build_upgrade_suggestion(_make_info("pipx", extras=("all",))).command
+        == "pipx install --force omnigent[all]"
+    )
+
+
+def test_build_upgrade_suggestion_vcs_preserves_extras() -> None:
+    """VCS installs append extras via an egg fragment."""
+    git_url = "git+https://github.com/example-org/omnigent.git"
+    assert (
+        _build_upgrade_suggestion(_make_info("uv", vcs_url=git_url)).command
+        == f"uv tool install --reinstall{_UV_PY} {git_url}"
+    )
+    assert (
+        _build_upgrade_suggestion(_make_info("uv", vcs_url=git_url, extras=("all",))).command
+        == f"uv tool install --reinstall{_UV_PY} {git_url}#egg=omnigent[all]"
+    )
+
+
+def test_build_upgrade_suggestion_pip_still_forms_command() -> None:
+    """pip commands are still generated; ``omni upgrade`` refuses to run them."""
+    assert (
+        _build_upgrade_suggestion(_make_info("pip", extras=("all",))).command
+        == f"{_pip_invocation()} install -U omnigent[all]"
+    )
+
+
+def test_read_uv_tool_extras_from_receipt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_read_uv_tool_extras` parses extras from ``uv-receipt.toml``."""
+    tool_dir = tmp_path / "omnigent"
+    bin_dir = tool_dir / "bin"
+    bin_dir.mkdir(parents=True)
+    receipt = tool_dir / "uv-receipt.toml"
+    receipt.write_text(
+        textwrap.dedent(
+            """
+            [tool]
+            requirements = [
+                { name = "omnigent", extras = ["all", "server"] },
+                { name = "black", extras = ["jupyter"] },
+            ]
+            """
+        )
+    )
+    monkeypatch.setattr(sys, "executable", str(bin_dir / "python"))
+    assert _read_uv_tool_extras() == ["all", "server"]
+
+
+def test_read_uv_tool_extras_missing_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No receipt means this is not a uv tool install."""
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "python"))
+    assert _read_uv_tool_extras() is None
+
+
+def test_read_installed_wheel_info_uses_uv_tool_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``_read_installed_wheel_info`` reads extras from a uv tool receipt."""
+    dist = _write_fake_dist_info(tmp_path, installer="uv")
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+
+    tool_dir = tmp_path / "omnigent"
+    bin_dir = tool_dir / "bin"
+    bin_dir.mkdir(parents=True)
+    (tool_dir / "uv-receipt.toml").write_text(
+        textwrap.dedent(
+            """
+            [tool]
+            requirements = [{ name = "omnigent", extras = ["all"] }]
+            """
+        )
+    )
+    monkeypatch.setattr(sys, "executable", str(bin_dir / "python"))
+
+    info = _read_installed_wheel_info()
+    assert info is not None
+    assert info.extras == ("all",)
+
+
+def test_read_installed_wheel_info_uv_pip_no_receipt_no_extras(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``uv pip install`` leaves no uv receipt, so extras stay empty."""
+    dist = _write_fake_dist_info(tmp_path, installer="uv")
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+    # A generic venv interpreter, not a uv tool directory.
+    monkeypatch.setattr(sys, "executable", str(tmp_path / ".venv" / "bin" / "python"))
+
+    info = _read_installed_wheel_info()
+    assert info is not None
+    assert info.extras == ()
+
+
+def test_read_pipx_extras_from_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_read_pipx_extras` parses extras from pipx metadata."""
+    venv_dir = tmp_path / "pipx" / "venvs" / "omnigent"
+    (venv_dir / "bin").mkdir(parents=True)
+    (venv_dir / "pipx_metadata.json").write_text(
+        json.dumps(
+            {
+                "main_package": {
+                    "package": "omnigent",
+                    "package_or_url": "omnigent[all,server]",
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(sys, "prefix", str(venv_dir))
+    assert _read_pipx_extras() == ["all", "server"]
+
+
+def test_read_pipx_extras_missing_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No pipx metadata file means extras cannot be recovered."""
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    assert _read_pipx_extras() is None
 
 
 def test_fetch_latest_version_swallows_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1977,3 +2289,213 @@ def test_format_version_omits_sha_when_build_info_has_empty_sha(
     # Critical: no orphan comma or empty parens from the missing SHA.
     assert "(, " not in out
     assert "()" not in out
+
+
+# --- VCS (git) install handling: passive notice + URL parsing -----------------
+
+
+def test_split_vcs_url_strips_prefix_and_separates_revision() -> None:
+    """``git+<url>@<rev>`` splits into the bare repo URL and the revision."""
+    from omnigent.update_check import _split_vcs_url
+
+    assert _split_vcs_url("git+https://github.com/o/omnigent.git") == (
+        "https://github.com/o/omnigent.git",
+        None,
+    )
+    assert _split_vcs_url("git+https://github.com/o/omnigent.git@main") == (
+        "https://github.com/o/omnigent.git",
+        "main",
+    )
+
+
+def test_split_vcs_url_strips_pip_fragment() -> None:
+    """A ``#egg=`` / ``#subdirectory=`` fragment is dropped from URL and ref.
+
+    Left on, the fragment would ride along into ``git ls-remote`` and match no
+    ref, silently making the commit comparison indeterminate.
+    """
+    from omnigent.update_check import _split_vcs_url
+
+    assert _split_vcs_url("git+https://github.com/o/omnigent.git#egg=omnigent") == (
+        "https://github.com/o/omnigent.git",
+        None,
+    )
+    assert _split_vcs_url("git+https://github.com/o/omnigent.git@main#subdirectory=pkg") == (
+        "https://github.com/o/omnigent.git",
+        "main",
+    )
+
+
+def test_split_vcs_url_ssh_userinfo_is_not_a_revision() -> None:
+    """An ``@`` in SSH userinfo (``git@host``) must not be read as a revision."""
+    from omnigent.update_check import _split_vcs_url
+
+    assert _split_vcs_url("git+ssh://git@github.com/o/omnigent.git") == (
+        "ssh://git@github.com/o/omnigent.git",
+        None,
+    )
+    # …but a real trailing revision still parses, even with SSH userinfo.
+    assert _split_vcs_url("git+ssh://git@github.com/o/omnigent.git@v1") == (
+        "ssh://git@github.com/o/omnigent.git",
+        "v1",
+    )
+
+
+def test_wheel_check_skips_vcs_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A git/VCS install is never nagged about a PyPI version.
+
+    Its version string is frozen at the source branch's (e.g. an unbumped
+    ``main`` still saying ``0.1.0``), so a PyPI-version comparison would
+    fire forever — even on a build that is *ahead* of the latest release.
+    The passive notice must bail for vcs installs just like editable ones.
+    """
+    monkeypatch.delenv("OMNIGENT_NO_UPDATE_CHECK", raising=False)
+    _point_cache_at(tmp_path, monkeypatch)
+    _write_cache(
+        _CacheEntry(
+            last_check_epoch=time.time(),
+            commits_behind=0,
+            kind="wheel",
+            latest_version="0.2.0",  # strictly newer than the dist's 0.1.0
+        )
+    )
+    dist = _write_fake_dist_info(
+        tmp_path,
+        installer="uv",
+        direct_url={"url": _FAKE_GIT_URL, "vcs_info": {"vcs": "git", "commit_id": _FAKE_COMMIT}},
+    )
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+
+    _run_installed_wheel_check()
+
+    assert capsys.readouterr().err == ""
+
+
+# ------------------------------------------------------------------
+# CLI refusal / dry-run
+# ------------------------------------------------------------------
+
+
+def _make_wheel_info(**kwargs: object) -> _InstalledWheelInfo:
+    defaults = {
+        "install_time_epoch": 0.0,
+        "installer": "uv",
+        "vcs_url": None,
+        "commit_sha": None,
+        "is_editable": False,
+        "package_version": "0.1.0",
+        "detected_installer": "uv",
+        "extras": (),
+    }
+    defaults.update(kwargs)  # type: ignore[typeddict-item]
+    return _InstalledWheelInfo(**defaults)  # type: ignore[arg-type]
+
+
+def test_cli_upgrade_refuses_pip_and_prints_manual_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pip installs are refused because extras cannot be recovered."""
+    monkeypatch.setattr(
+        "omnigent.update_check._read_installed_wheel_info",
+        lambda: _make_wheel_info(installer="pip", detected_installer="pip"),
+    )
+    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr("omnigent.update_check._uv_tool_receipt_path", lambda: None)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["upgrade"])
+    assert result.exit_code == 0
+    assert "pip does not record which extras" in result.output
+    assert "pip install -U omnigent" in result.output
+
+
+def test_cli_upgrade_refuses_uv_pip_and_prints_manual_command(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """uv pip installs without a tool receipt are refused."""
+    monkeypatch.setattr(
+        "omnigent.update_check._read_installed_wheel_info",
+        lambda: _make_wheel_info(installer="uv", detected_installer="uv"),
+    )
+    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr("omnigent.update_check._uv_tool_receipt_path", lambda: None)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["upgrade"])
+    assert result.exit_code == 0
+    assert "uv pip" in result.output
+    assert "uv pip install -U omnigent" in result.output
+
+
+def test_cli_upgrade_dry_run_uv_tool_with_extras(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--dry-run`` prints the command without touching sessions or index."""
+    monkeypatch.setattr(
+        "omnigent.update_check._read_installed_wheel_info",
+        lambda: _make_wheel_info(installer="uv", detected_installer="uv", extras=("all",)),
+    )
+    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.update_check._uv_tool_receipt_path",
+        lambda: Path("/fake/uv-receipt.toml"),
+    )
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda **_: "0.2.0")
+    monkeypatch.setattr("omnigent.update_check._is_newer", lambda latest, current: True)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["upgrade", "--dry-run"])
+    assert result.exit_code == 0
+    assert f"uv tool install --reinstall{_UV_PY} omnigent[all]" in result.output
+    assert "Would run:" in result.output
+
+
+def test_cli_upgrade_check_still_allows_pip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--check`` is not an auto-upgrade, so pip installs can use it."""
+    monkeypatch.setattr(
+        "omnigent.update_check._read_installed_wheel_info",
+        lambda: _make_wheel_info(installer="pip", detected_installer="pip"),
+    )
+    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda **_: "0.2.0")
+    monkeypatch.setattr("omnigent.update_check._is_newer", lambda latest, current: True)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["upgrade", "--check"])
+    assert result.exit_code == 1
+    assert "A new release is available" in result.output
+
+
+def test_read_installed_wheel_info_reads_pipx_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When inside a pipx venv, extras are read from pipx metadata."""
+    dist = _write_fake_dist_info(tmp_path, installer="pip")
+    monkeypatch.setattr("omnigent.update_check._get_distribution", lambda: dist)
+
+    venv_dir = tmp_path / "pipx" / "venvs" / "omnigent"
+    (venv_dir / "bin").mkdir(parents=True)
+    (venv_dir / "pipx_metadata.json").write_text(
+        json.dumps(
+            {
+                "main_package": {
+                    "package": "omnigent",
+                    "package_or_url": "omnigent[all]",
+                }
+            }
+        )
+    )
+    monkeypatch.setattr(sys, "prefix", str(venv_dir))
+
+    info = _read_installed_wheel_info()
+    assert info is not None
+    assert info.installer == "pip"
+    assert info.detected_installer == "pipx"
+    assert info.extras == ("all",)

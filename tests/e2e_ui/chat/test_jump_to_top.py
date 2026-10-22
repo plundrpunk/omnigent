@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from playwright.sync_api import Page, expect
 
-_COMPOSER = "Ask the agent anything…"
+_COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _USER = '[data-testid="message-bubble"][data-role="user"]'
 _WORKING = '[data-testid="working-indicator"]'
@@ -45,6 +45,11 @@ _TAG_SCROLLER = """
 }
 """
 _SCROLL_TOP = "document.querySelector('[data-pw-scroller]').scrollTop"
+# True while the pill is revealed and clickable (opacity-100 / pointer-events-auto).
+_PILL_INTERACTIVE = (
+    "document.querySelector(\"button[aria-label='Jump to the first message']\")"
+    ".className.includes('pointer-events-auto')"
+)
 
 
 def _send_turn(page: Page, text: str, turn: int) -> None:
@@ -98,3 +103,42 @@ def test_jump_to_top_returns_to_first_message(
     # scroll position has settled at (or within a pixel of) the top.
     expect(page.locator(_USER).first).to_be_in_viewport(timeout=30_000)
     page.wait_for_function(f"{_SCROLL_TOP} <= 2", timeout=30_000)
+
+
+def test_jump_to_top_reveals_on_scroll_up_then_auto_hides(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Scrolling up surfaces the pill (no hover needed); pausing fades it out."""
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+    page.set_viewport_size(_VIEWPORT)
+
+    for turn, prompt in enumerate(("Say hello.", "Say hello again.", "Say hello once more."), 1):
+        _send_turn(page, prompt, turn)
+
+    # Scroll to the bottom: the pill is hidden there.
+    scroll_top = page.evaluate(_TAG_SCROLLER)
+    assert scroll_top > 50, (
+        f"conversation did not overflow enough to scroll (scrollTop={scroll_top})"
+    )
+    # Keep the pointer outside the short transcript's entire hover band.
+    page.mouse.move(0, 0)
+    page.wait_for_function(f"!({_PILL_INTERACTIVE})", timeout=10_000)
+
+    # Scroll up to roughly the middle. Setting scrollTop dispatches a real
+    # 'scroll' event — the same signal a wheel/drag emits, and exactly how
+    # _TAG_SCROLLER above scrolls — so this drives the component's scroll
+    # direction detection deterministically, without depending on wheel-delta
+    # mapping. Staying near the middle keeps us clear of the very top, where the
+    # at-top state deliberately suppresses the scroll reveal.
+    mid = page.evaluate(
+        "() => { const el = document.querySelector('[data-pw-scroller]');"
+        " el.scrollTop = Math.floor(el.scrollHeight / 2); return el.scrollTop; }"
+    )
+    assert mid > 1, f"scroll-up did not land clear of the top (scrollTop={mid})"
+
+    # The pill reveals on the upward scroll…
+    page.wait_for_function(_PILL_INTERACTIVE, timeout=10_000)
+    # …then fades back out once scrolling settles (SCROLL_REVEAL_MS = 2000ms).
+    page.wait_for_function(f"!({_PILL_INTERACTIVE})", timeout=10_000)

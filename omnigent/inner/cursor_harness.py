@@ -13,12 +13,12 @@ Mirrors the codex / pi wraps' env-var config flow.
 Unlike the gateway-backed harnesses, cursor has NO gateway /
 Databricks-profile env vars: the SDK talks only to Cursor's own backend and has
 no custom API base-URL override, so there is nothing for the workflow layer to
-route through the Databricks AI gateway.
+route through the Databricks Unity Gateway.
 
 Env vars read at startup:
 
-- ``HARNESS_CURSOR_MODEL``: Cursor model id, e.g. ``"gpt-5"`` or ``"auto"``.
-  ``None`` resolves to cursor's ``auto`` select. A ``databricks-*`` id (from a
+- ``HARNESS_CURSOR_MODEL``: Cursor model id, e.g. ``"gpt-5"`` or ``"auto-smart"``.
+  ``None`` resolves to cursor's ``auto-smart`` select. A ``databricks-*`` id (from a
   spec authored for another harness) is dropped by the executor.
 - ``HARNESS_CURSOR_CWD``: working directory the session operates in.
   ``None`` falls back to ``os_env.cwd`` then the process cwd.
@@ -32,6 +32,10 @@ Env vars read at startup:
   cursor has no skill mechanism here). Defaults to ``"all"``.
 - ``HARNESS_CURSOR_BUNDLE_DIR`` / ``HARNESS_CURSOR_AGENT_NAME``:
   reserved for future use.
+- ``HARNESS_CURSOR_PERMISSION_MODE``: Omnigent permission stance
+  (``auto`` default, ``bypassPermissions``, or an interactive mode).
+  ``auto`` / ``bypassPermissions`` skip web-UI elicitation for native
+  tools; other values keep per-tool approval cards.
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ from fastapi import FastAPI
 from omnigent.inner.cursor_executor import CursorExecutor
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
+from omnigent.inner.os_env_serialization import decode_sandbox_spec
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
 _logger = logging.getLogger(__name__)
@@ -57,6 +62,8 @@ _ENV_OS_ENV = "HARNESS_CURSOR_OS_ENV"
 _ENV_SKILLS_FILTER = "HARNESS_CURSOR_SKILLS_FILTER"
 _ENV_BUNDLE_DIR = "HARNESS_CURSOR_BUNDLE_DIR"
 _ENV_AGENT_NAME = "HARNESS_CURSOR_AGENT_NAME"
+_ENV_PERMISSION_MODE = "HARNESS_CURSOR_PERMISSION_MODE"
+_DEFAULT_PERMISSION_MODE = "auto"
 
 
 def _resolve_os_env() -> OSEnvSpec:
@@ -79,7 +86,7 @@ def _resolve_os_env() -> OSEnvSpec:
         if isinstance(payload, dict):
             sandbox_payload = payload.get("sandbox")
             sandbox = (
-                OSEnvSandboxSpec(**sandbox_payload) if isinstance(sandbox_payload, dict) else None
+                decode_sandbox_spec(sandbox_payload) if isinstance(sandbox_payload, dict) else None
             )
             return OSEnvSpec(
                 type=str(payload.get("type", "caller_process")),
@@ -136,10 +143,13 @@ def _build_cursor_executor() -> Executor:
         bundle_dir=bundle_dir,
         agent_name=os.environ.get(_ENV_AGENT_NAME, "").strip() or None,
         skills_filter=_resolve_skills_filter(),
+        permission_mode=(
+            os.environ.get(_ENV_PERMISSION_MODE, "").strip() or _DEFAULT_PERMISSION_MODE
+        ),
     )
 
 
 def create_app() -> FastAPI:
     """Build the cursor harness's FastAPI app (required entry point)."""
-    adapter = ExecutorAdapter(executor_factory=_build_cursor_executor)
+    adapter = ExecutorAdapter(executor_factory=_build_cursor_executor, harness_label="Cursor")
     return adapter.build()

@@ -26,6 +26,7 @@ Or consume semantic blocks via :class:`BlockStream`::
         ...
 """
 
+from ._agent_catalog import AgentCatalogEntry, RegisteredAgentCatalog
 from ._blocks import (
     AnyBlock,
     BlockContext,
@@ -46,13 +47,23 @@ from ._blocks import (
     ToolGroup,
     ToolResultBlock,
 )
+from ._child_status import (
+    TERMINAL_TASK_STATUSES,
+    child_session_busy,
+    child_summary_busy,
+)
 from ._client import OmnigentClient
-from ._errors import OmnigentError, ToolCallDenied
+from ._errors import (
+    OmnigentError,
+    RateLimitedError,
+    StaleCursorError,
+    ToolCallDenied,
+)
 from ._events import MCP_ELICITATION_METHOD, ElicitationRequest
 from ._query import QueryResult, QueryStream
 from ._server import LocalServer
 from ._session import Session
-from ._sessions import SessionsNamespace
+from ._sessions import LaunchHost, RegisteredAgent, SessionsNamespace
 from ._sessions_chat import SessionsChat, SessionToolCallInfo, ToolCallable
 from ._stream import BlockStream, format_tool_args_brief
 from ._tool_handler import (
@@ -68,11 +79,13 @@ from ._transforms import (
     skip_blocks,
     skip_intermediate_ends,
 )
-from ._types import File
+from ._types import File, PaginatedList
 from .tools import ToolMetadata, ToolState, tool
 
 __all__ = [
     "MCP_ELICITATION_METHOD",
+    "TERMINAL_TASK_STATUSES",
+    "AgentCatalogEntry",
     "AnyBlock",
     "BlockContext",
     "BlockStream",
@@ -82,15 +95,20 @@ __all__ = [
     "ErrorBlock",
     "File",
     "FileBlock",
+    "LaunchHost",
     "LocalServer",
     "NativeToolBlock",
     "OmnigentClient",
     "OmnigentError",
+    "PaginatedList",
     "QueryResult",
     "QueryStream",
+    "RateLimitedError",
     "ReasoningBlock",
     "ReasoningChunk",
     "ReasoningStartBlock",
+    "RegisteredAgent",
+    "RegisteredAgentCatalog",
     "ResponseEndBlock",
     "ResponseStartBlock",
     "RetryBlock",
@@ -98,6 +116,7 @@ __all__ = [
     "SessionToolCallInfo",
     "SessionsChat",
     "SessionsNamespace",
+    "StaleCursorError",
     "StreamBlock",
     "StreamHooks",
     "TextChunk",
@@ -111,6 +130,8 @@ __all__ = [
     "ToolMetadata",
     "ToolResultBlock",
     "ToolState",
+    "child_session_busy",
+    "child_summary_busy",
     "format_tool_args_brief",
     "merge_text_across_iterations",
     "only_agent",

@@ -25,7 +25,7 @@ Env vars read at startup:
   Claude SDK's own default.
 - ``HARNESS_CLAUDE_SDK_GATEWAY``: ``"1"`` / ``"true"`` to route
   through a vendor-neutral gateway (base URL + bearer-token
-  command + model). The Databricks AI gateway is one producer of
+  command + model). The Databricks Unity Gateway is one producer of
   this transport; generic ``key`` / ``gateway`` providers are
   another. Otherwise the SDK uses its built-in API path.
 - ``HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE``: Databricks-specific
@@ -37,9 +37,12 @@ Env vars read at startup:
   the Claude CLI in. ``None`` falls back to the subprocess's
   inherited cwd.
 - ``HARNESS_CLAUDE_SDK_PERMISSION_MODE``: SDK permission mode
-  (``"bypassPermissions"``, ``"acceptEdits"``,
-  ``"plan"``, ``"default"``). Defaults to
-  ``"bypassPermissions"`` so the agent runs autonomously.
+  (``"auto"``, ``"bypassPermissions"``, ``"acceptEdits"``,
+  ``"plan"``, ``"dontAsk"``, ``"default"``). Defaults to
+  ``"auto"`` so the agent runs autonomously with background
+  safety checks.
+- ``HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET``: ``claude_code`` appends
+  agent instructions to Claude Code's prompt. Unset keeps the custom prompt.
 - ``HARNESS_CLAUDE_SDK_OS_ENV``: JSON-encoded :class:`OSEnvSpec`
   (from :func:`dataclasses.asdict`) controlling the SDK's
   native OS-tool exposure. When set, the inner executor builds
@@ -70,7 +73,7 @@ Env vars read at startup:
 - ``HARNESS_CLAUDE_SDK_BUNDLE_DIR``: Absolute path to the
   agent bundle's extracted root. When set, the inner executor
   passes ``plugins=[{"type": "local", "path": <bundle_dir>}]``
-  to the SDK so any ``<bundle>/skills/<name>/SKILL.md`` files
+  to the SDK so any ``<bundle>/skills/<dir>/SKILL.md`` files
   surface as agent-bundled skills (regardless of
   ``skills_filter``). Unset for agents without a bundled-skills
   directory.
@@ -94,6 +97,7 @@ from fastapi import FastAPI
 from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import Executor
+from omnigent.inner.os_env_serialization import decode_sandbox_spec
 from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 from omnigent.spec.types import RetryPolicy
 
@@ -108,6 +112,7 @@ _ENV_DATABRICKS_PROFILE = "HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE"
 _ENV_GATEWAY_HOST = "HARNESS_CLAUDE_SDK_GATEWAY_HOST"
 _ENV_CWD = "HARNESS_CLAUDE_SDK_CWD"
 _ENV_PERMISSION_MODE = "HARNESS_CLAUDE_SDK_PERMISSION_MODE"
+_ENV_SYSTEM_PROMPT_PRESET = "HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"
 _ENV_OS_ENV = "HARNESS_CLAUDE_SDK_OS_ENV"
 _ENV_RETRY_POLICY = "HARNESS_CLAUDE_SDK_RETRY_POLICY"
 _ENV_SKILLS_FILTER = "HARNESS_CLAUDE_SDK_SKILLS_FILTER"
@@ -124,10 +129,10 @@ _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_CLAUDE_SDK_GATEWAY_AUTH_REFRESH
 # auth being bypassed).
 _ENV_API_KEY_HELPER = "HARNESS_CLAUDE_SDK_API_KEY_HELPER"
 
-# Default permission mode for the Claude SDK. ``"bypassPermissions"``
-# matches the inner executor's own default and lets the agent run
-# autonomously without prompting per tool call.
-_DEFAULT_PERMISSION_MODE = "bypassPermissions"
+# Default permission mode for the Claude SDK. ``"auto"`` auto-approves
+# tool calls with background safety checks that verify actions align
+# with the request.
+_DEFAULT_PERMISSION_MODE = "auto"
 
 
 def _resolve_os_env() -> OSEnvSpec:
@@ -160,7 +165,7 @@ def _resolve_os_env() -> OSEnvSpec:
         if isinstance(payload, dict):
             sandbox_payload = payload.get("sandbox")
             sandbox = (
-                OSEnvSandboxSpec(**sandbox_payload) if isinstance(sandbox_payload, dict) else None
+                decode_sandbox_spec(sandbox_payload) if isinstance(sandbox_payload, dict) else None
             )
             return OSEnvSpec(
                 type=str(payload.get("type", "caller_process")),
@@ -271,10 +276,19 @@ def _build_claude_sdk_executor() -> Executor:
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
     agent_name = agent_name_raw or None
     return ClaudeSDKExecutor(
-        cwd=os.environ.get(_ENV_CWD),
+        # Run the CLI in the session workspace: an explicit
+        # HARNESS_CLAUDE_SDK_CWD wins, else the runner's
+        # OMNIGENT_RUNNER_WORKSPACE (the folder the user launched in, and
+        # the same one the tmux terminal uses), else the process cwd.
+        # Without the workspace fallback the CLI ran out of the runner
+        # daemon's $HOME — disagreeing with the terminal and rooting the
+        # sandbox at the whole home dir. Mirrors goose / kimi / pi / qwen
+        # / hermes harness cwd resolution.
+        cwd=os.environ.get(_ENV_CWD) or os.environ.get("OMNIGENT_RUNNER_WORKSPACE") or None,
         os_env=_resolve_os_env(),
         model=os.environ.get(_ENV_MODEL),
         permission_mode=os.environ.get(_ENV_PERMISSION_MODE, _DEFAULT_PERMISSION_MODE),
+        system_prompt_preset=os.environ.get(_ENV_SYSTEM_PROMPT_PRESET) or None,
         gateway=gateway,
         databricks_profile=os.environ.get(_ENV_DATABRICKS_PROFILE),
         gateway_host=os.environ.get(_ENV_GATEWAY_HOST) or None,

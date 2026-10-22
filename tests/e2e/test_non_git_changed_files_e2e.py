@@ -38,11 +38,6 @@ Usage::
 from __future__ import annotations
 
 import json
-import os
-import secrets
-import signal
-import subprocess
-import sys
 import tempfile
 import time
 import uuid
@@ -52,11 +47,14 @@ from typing import Any
 
 import httpx
 import pytest
+import yaml
 
+from tests._helpers.server_runner import ServerRunner, server_runner
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e.conftest import (
-    build_agent_bundle,
-    find_free_port,
+    configure_mock_llm,
     poll_session_until_terminal,
+    reset_mock_llm,
     send_user_message_to_session,
 )
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S
@@ -104,166 +102,41 @@ def non_git_workspace() -> Iterator[Path]:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
-_non_git_runner_state: dict[str, str] = {}
-
-
 @pytest.fixture(scope="module")
-def non_git_runner_id() -> str:
-    """A stable runner id for the module-scoped non-git server.
-
-    The runner id is derived from a binding token shared with the
-    server so the server's tunnel allowlist accepts exactly this
-    runner's WebSocket upgrade.
-
-    :returns: Runner id string, e.g. ``"runner_token_abc123..."``.
-    """
-    from omnigent.runner.identity import token_bound_runner_id
-
-    if "runner_id" not in _non_git_runner_state:
-        token = secrets.token_urlsafe(32)
-        _non_git_runner_state["binding_token"] = token
-        _non_git_runner_state["runner_id"] = token_bound_runner_id(token)
-    return _non_git_runner_state["runner_id"]
-
-
-@pytest.fixture(scope="module")
-def non_git_server(
-    request: pytest.FixtureRequest,
+def non_git_stack(
     llm_api_key: str,
-    databricks_workspace_host: str | None,
+    mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
     non_git_workspace: Path,
-    non_git_runner_id: str,
-) -> Iterator[str]:
-    """Spawn a real ``omnigent server`` whose CWD is a non-git workspace.
-
-    The server is started with ``cwd=non_git_workspace``.  Inside
-    ``server()``, ``Path.cwd()`` resolves to ``non_git_workspace`` and
-    is passed as ``workspace_cwd`` to the runner subprocess.  The
-    runner's :func:`create_filesystem_registry` then sees a non-git
-    directory and returns an :class:`AgentEditFilesystemRegistry`.
-
-    :param llm_api_key: The ``--llm-api-key`` option value.
-    :param databricks_workspace_host: Workspace host, or ``None``
-        when ``--profile`` is not set.
-    :param tmp_path_factory: pytest temp path factory.
-    :param non_git_workspace: Non-git workspace directory (used as CWD).
-    :param non_git_runner_id: Runner id to register.
-    :returns: Server base URL, e.g. ``"http://localhost:18600"``.
-    """
-    port = find_free_port()
-    db_path = tmp_path_factory.mktemp("e2e_ng") / "e2e.db"
-    artifact_dir = tmp_path_factory.mktemp("e2e_ng_artifacts")
-    server_log = tmp_path_factory.mktemp("e2e_ng_logs") / "server.log"
-
-    binding_token = _non_git_runner_state["binding_token"]
-    env: dict[str, str] = {
-        **os.environ,
+) -> Iterator[ServerRunner]:
+    """Run both processes in the workspace observed by the filesystem registry."""
+    env = {
         "OPENAI_API_KEY": llm_api_key,
-        "PYTHONPATH": (f"{_REPO_ROOT}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"),
+        "OPENAI_BASE_URL": f"{mock_llm_server_url}/v1",
         "OMNIGENT_SKIP_ONBOARD": "1",
         "OMNIGENT_NO_UPDATE_CHECK": "1",
     }
-    if databricks_workspace_host is not None:
-        env["OPENAI_BASE_URL"] = f"{databricks_workspace_host}/serving-endpoints"
-        env["DATABRICKS_CONFIG_PROFILE"] = request.config.getoption("--profile")
+    with server_runner(
+        tmp_path_factory.mktemp("non_git_stack"),
+        workspace=non_git_workspace,
+        server_cwd=non_git_workspace,
+        server_env=env,
+        health_timeout=HEALTH_TIMEOUT_S,
+        poll_interval=POLL_INTERVAL_S,
+        wait_ready=False,
+    ) as stack:
+        stack.start_runner(cwd=non_git_workspace, env=env)
+        yield stack
 
-    log_handle = open(server_log, "w")  # noqa: SIM115
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "omnigent.cli",
-            "server",
-            "--port",
-            str(port),
-            "--database-uri",
-            f"sqlite:///{db_path}",
-            "--artifact-location",
-            str(artifact_dir),
-        ],
-        env={**env, "OMNIGENT_RUNNER_TUNNEL_TOKEN": binding_token},
-        # CWD = non_git_workspace so that Path.cwd() inside server()
-        # resolves to the non-git temp dir, causing the runner to use
-        # AgentEditFilesystemRegistry instead of GitFilesystemRegistry.
-        cwd=str(non_git_workspace),
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
-    base_url = f"http://localhost:{port}"
 
-    # Spawn runner as sibling subprocess.
-    runner_log = tmp_path_factory.mktemp("e2e_ng_runner_logs") / "runner.log"
-    runner_log_handle = open(runner_log, "w")  # noqa: SIM115
-    runner_proc = subprocess.Popen(
-        [sys.executable, "-m", "omnigent.runner._entry"],
-        env={
-            **env,
-            "OMNIGENT_RUNNER_ID": non_git_runner_id,
-            "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN": binding_token,
-            "OMNIGENT_RUNNER_PARENT_PID": str(os.getpid()),
-            "RUNNER_SERVER_URL": base_url,
-            # Without a workspace the runner builds no filesystem
-            # registry (app.py), so record_change is a no-op and writes
-            # never surface in GET .../changes. The real CLI always sets
-            # this via _start_cli_runner_process.
-            "OMNIGENT_RUNNER_WORKSPACE": str(non_git_workspace),
-        },
-        cwd=str(non_git_workspace),
-        stdout=runner_log_handle,
-        stderr=subprocess.STDOUT,
-    )
+@pytest.fixture(scope="module")
+def non_git_runner_id(non_git_stack: ServerRunner) -> str:
+    return non_git_stack.runner_id
 
-    health_iters = int(HEALTH_TIMEOUT_S / POLL_INTERVAL_S)
-    for _ in range(health_iters):
-        try:
-            health_resp = httpx.get(f"{base_url}/health", timeout=2)
-            runner_resp = httpx.get(
-                f"{base_url}/v1/runners/{non_git_runner_id}/status",
-                timeout=2,
-            )
-            if (
-                health_resp.status_code == 200
-                and runner_resp.status_code == 200
-                and runner_resp.json().get("online") is True
-            ):
-                break
-        except httpx.ConnectError:
-            pass
-        time.sleep(POLL_INTERVAL_S)
-    else:
-        if runner_proc.poll() is None:
-            runner_proc.kill()
-            runner_proc.wait(timeout=5)
-        runner_log_handle.close()
-        proc.kill()
-        log_handle.close()
-        log_contents = server_log.read_text() if server_log.exists() else ""
-        runner_log_contents = runner_log.read_text() if runner_log.exists() else ""
-        raise RuntimeError(
-            f"Non-git server did not start within {HEALTH_TIMEOUT_S}s.\n"
-            f"Server log: {log_contents[-3000:]}\n"
-            f"Runner log: {runner_log_contents[-3000:]}"
-        )
 
-    try:
-        yield base_url
-    finally:
-        if runner_proc.poll() is None:
-            runner_proc.send_signal(signal.SIGTERM)
-            try:
-                runner_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                runner_proc.kill()
-                runner_proc.wait(timeout=5)
-        runner_log_handle.close()
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-        log_handle.close()
+@pytest.fixture(scope="module")
+def non_git_server(non_git_stack: ServerRunner) -> str:
+    return non_git_stack.base_url
 
 
 @pytest.fixture(scope="module")
@@ -280,11 +153,24 @@ def non_git_client(non_git_server: str) -> Iterator[httpx.Client]:
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 
+def _build_mock_workspace_writer_bundle(mock_llm_base_url: str) -> bytes:
+    """Read the on-disk workspace-file-writer YAML, inject mock auth, tarball."""
+    yaml_path = _WORKSPACE_WRITER_DIR / "workspace-file-writer.yaml"
+    spec = yaml.safe_load(yaml_path.read_text())
+    spec.setdefault("executor", {})["auth"] = {
+        "type": "api_key",
+        "api_key": "mock-key",
+        "base_url": f"{mock_llm_base_url}/v1",
+    }
+    patched = yaml.dump(spec, sort_keys=False).encode()
+    return bundle_files({"./workspace-file-writer.yaml": patched})
+
+
 def _create_session(
     client: httpx.Client,
     *,
     runner_id: str,
-    databricks_workspace_host: str | None,
+    mock_llm_server_url: str,
 ) -> str:
     """Upload the workspace-writer agent and create a bound session.
 
@@ -294,27 +180,16 @@ def _create_session(
 
     :param client: HTTP client pointed at the non-git server.
     :param runner_id: Runner id to bind the session to.
-    :param databricks_workspace_host: Workspace host URL used for model
-        rewriting; ``None`` when not running against Databricks.
+    :param mock_llm_server_url: Mock LLM server URL used to inject
+        mock auth into the agent bundle.
     :returns: The new session id, e.g. ``"conv_abc123"``.
     """
-    bundle = build_agent_bundle(
-        _WORKSPACE_WRITER_DIR,
-        rewrite_model_for_databricks=databricks_workspace_host is not None,
-    )
-    create_resp = client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps({})},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-    )
+    bundle = _build_mock_workspace_writer_bundle(mock_llm_server_url)
+    create_resp = post_session_bundle(client.post, "/v1/sessions", bundle)
     create_resp.raise_for_status()
     session_id: str = create_resp.json()["session_id"]
 
-    bind_resp = client.patch(
-        f"/v1/sessions/{session_id}",
-        json={"runner_id": runner_id},
-    )
-    bind_resp.raise_for_status()
+    bind_session_runner(client.patch, "", session_id, runner_id)
     return session_id
 
 
@@ -358,7 +233,7 @@ def test_non_git_create_file(
     non_git_client: httpx.Client,
     non_git_runner_id: str,
     non_git_workspace: Path,
-    databricks_workspace_host: str | None,
+    mock_llm_server_url: str,
 ) -> None:
     """Agent-created file appears in the changes listing with status ``"created"``.
 
@@ -379,15 +254,33 @@ def test_non_git_create_file(
     :param non_git_client: HTTP client pointed at the non-git server.
     :param non_git_runner_id: Runner id registered by the fixture.
     :param non_git_workspace: Non-git temp workspace directory (= server CWD).
-    :param databricks_workspace_host: Workspace host URL for model rewriting.
+    :param mock_llm_server_url: Mock LLM server URL.
     """
     filename = f"create_{uuid.uuid4().hex[:8]}.txt"
     content = "created by e2e test"
 
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_write_1",
+                        "name": "sys_os_write",
+                        "arguments": json.dumps({"path": filename, "content": content}),
+                    },
+                ],
+            },
+            {"text": "File created successfully."},
+        ],
+        key="default",
+    )
+
     session_id = _create_session(
         non_git_client,
         runner_id=non_git_runner_id,
-        databricks_workspace_host=databricks_workspace_host,
+        mock_llm_server_url=mock_llm_server_url,
     )
     response_id = send_user_message_to_session(
         non_git_client,
@@ -436,7 +329,7 @@ def test_non_git_edit_file(
     non_git_client: httpx.Client,
     non_git_runner_id: str,
     non_git_workspace: Path,
-    databricks_workspace_host: str | None,
+    mock_llm_server_url: str,
 ) -> None:
     """Agent overwrite of a pre-existing file appears with status ``"modified"``.
 
@@ -454,17 +347,35 @@ def test_non_git_edit_file(
     :param non_git_client: HTTP client pointed at the non-git server.
     :param non_git_runner_id: Runner id registered by the fixture.
     :param non_git_workspace: Non-git temp workspace directory.
-    :param databricks_workspace_host: Workspace host URL for model rewriting.
+    :param mock_llm_server_url: Mock LLM server URL.
     """
     filename = f"edit_{uuid.uuid4().hex[:8]}.txt"
     original_content = "original content written before session"
     updated_content = "overwritten by e2e edit test"
 
+    reset_mock_llm(mock_llm_server_url)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [
+            {
+                "tool_calls": [
+                    {
+                        "call_id": "call_write_2",
+                        "name": "sys_os_write",
+                        "arguments": json.dumps({"path": filename, "content": updated_content}),
+                    },
+                ],
+            },
+            {"text": "File overwritten successfully."},
+        ],
+        key="default",
+    )
+
     # Create the session to learn its id before seeding the file.
     session_id = _create_session(
         non_git_client,
         runner_id=non_git_runner_id,
-        databricks_workspace_host=databricks_workspace_host,
+        mock_llm_server_url=mock_llm_server_url,
     )
 
     # Seed the file into the workspace root so the agent's write is an

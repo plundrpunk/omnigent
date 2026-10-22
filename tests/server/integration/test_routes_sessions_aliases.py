@@ -23,9 +23,14 @@ comments). This file pins only the new BE-2 surface.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+
 import httpx
 import pytest
 
+from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from tests.server.helpers import (
     create_test_session,
 )
@@ -42,11 +47,8 @@ async def _create_session(
     """Create a session via ``POST /v1/sessions`` and return its id.
 
     ``GET /v1/sessions`` filters to conversations with ``agent_id IS
-    NOT NULL`` (i.e. real sessions). The legacy ``POST /v1/responses``
-    path used by ``create_test_response`` does NOT bind an agent id,
-    so its conversations are invisible to this route. Tests that
-    need a session in the listing must go through ``POST /v1/
-    sessions`` instead.
+    NOT NULL`` (i.e. real sessions). Tests that need a session in the
+    listing must go through ``POST /v1/sessions``.
 
     :param client: HTTP client wired to the test app.
     :param name: Agent name to write into the uploaded bundle, e.g.
@@ -140,6 +142,56 @@ async def test_list_sessions_search_query_excludes_null_titles(
     assert ids == [conv_a]
 
 
+async def test_list_sessions_search_snippet_on_content_match(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A content match returns a ``search_snippet``; a title match omits it.
+
+    The palette uses ``search_snippet`` to show *where* a session matched
+    when the hit is in the chat body (invisible in the title). Seed one
+    session whose body — not title — contains the query, and one whose
+    title matches, then assert only the content match carries the snippet.
+
+    :param client: HTTP client wired to the test app.
+    :param db_uri: Per-test SQLite database URI (same DB the app uses),
+        so an item can be appended directly through a store.
+    """
+    conv_content = await _create_session(
+        client,
+        name="snippet-content-agent",
+        title="General chat",
+    )
+    conv_title = await _create_session(
+        client,
+        name="snippet-title-agent",
+        title="deployment runbook",
+    )
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.append(
+        conv_content,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_snip",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": "please fix the deployment pipeline"}],
+                ),
+            ),
+        ],
+    )
+
+    resp = await client.get("/v1/sessions", params={"search_query": "deployment"})
+    assert resp.status_code == 200
+    by_id = {c["id"]: c for c in resp.json()["data"]}
+    # Content match carries the excerpt with the matched term.
+    assert "deployment" in by_id[conv_content]["search_snippet"].lower()
+    # Title-only match: exclude_none drops the null field entirely.
+    assert "search_snippet" not in by_id[conv_title]
+
+
 # ── DELETE /v1/sessions/{conversation_id} ─────────────────────
 
 
@@ -214,3 +266,74 @@ async def test_delete_session_when_runner_offline(client: httpx.AsyncClient) -> 
 
     get_resp = await client.get(f"/v1/sessions/{conv_id}")
     assert get_resp.status_code == 404
+
+
+class _DroppedRunnerClient:
+    """Runner client whose stream fails as if its tunnel had just closed."""
+
+    def stream(self, method: str, path: str, *, timeout: object) -> object:
+        del method, path, timeout
+        raise ConnectionError("tunnel closed before request completed")
+
+
+async def test_delete_session_cancels_relays_waiting_out_runner_grace(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deleting a session whose runner just dropped ends its relays' reconnect grace.
+
+    Otherwise the grace expiry would fail the deleted session's (and its
+    sub-agent's) turn with ``runner_disconnected``.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime import _globals, set_runner_router
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 60.0)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.01)
+    store = SqlAlchemyConversationStore(db_uri)
+    conv_id = (await create_test_session(client))["id"]
+    child_id = store.create_conversation(kind="sub_agent", parent_conversation_id=conv_id).id
+
+    class _OfflineRunnerRouter:
+        def client_for_session_resources(self, session_id: str) -> object:
+            del session_id
+            raise OmnigentError(
+                "runner 'runner_dropped' is offline",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+
+    handles = []
+    prior = _globals._runner_router
+    try:
+        for session_id in (conv_id, child_id):
+            sessions_module._session_status_cache[session_id] = "running"
+            handle = sessions_module._ensure_runner_relay(
+                session_id,
+                "runner_dropped",
+                _DroppedRunnerClient(),  # type: ignore[arg-type]
+                conversation_store=store,
+            )
+            assert handle is not None
+            handles.append(handle)
+        await asyncio.sleep(0.05)
+        assert not any(h.task.done() for h in handles), "relays should be inside the grace"
+
+        set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
+        del_resp = await client.delete(f"/v1/sessions/{conv_id}")
+        assert del_resp.status_code == 200
+        for handle in handles:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(handle.task), timeout=2.0)
+            assert handle.task.cancelled()
+        for session_id in (conv_id, child_id):
+            assert sessions_module._session_status_cache.get(session_id) != "failed"
+    finally:
+        set_runner_router(prior)
+        # A failed assertion must not leave relays retrying into later tests.
+        for handle in handles:
+            handle.task.cancel()
+        for session_id in (conv_id, child_id):
+            sessions_module._session_status_cache.pop(session_id, None)

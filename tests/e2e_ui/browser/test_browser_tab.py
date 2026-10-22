@@ -1,0 +1,174 @@
+"""E2E: the embedded-browser "Browser" tab in the right Workspace rail.
+
+The browser pane is desktop-only: ``AppShell`` marks the Browser rail tab
+available when ``supportsBrowser()`` is true, i.e. when the Electron preload
+exposes ``window.omnigentDesktop.kind === "electron"`` *and* the embedded-
+browser bridge method ``browserOpenOrNavigate`` (an older desktop build that
+predates the feature lacks it) — see ``web/src/lib/nativeBridge.ts``. Browser
+is offered only from ``+`` and opens as a closable soft tab; there is no fixed
+Browser navigation icon.
+
+The e2e_ui harness runs the SPA in a plain Chromium browser, not Electron, so
+by default the tab is absent. To exercise the desktop path end-to-end we inject
+a minimal ``window.omnigentDesktop`` stub via ``add_init_script`` *before any
+app script runs* — the same feature-detection stubbing
+``sessions/test_pinned_session_hotkeys.py`` uses. That covers the chain the
+component/unit tests can't reach end to end: the injected bridge ->
+``supportsBrowser()`` -> ``WorkspacePanel`` offering Browser from ``+`` ->
+creating a soft tab -> selecting it mounting the pane.
+
+No LLM turn is involved; the assertions are DOM-based.
+"""
+
+from __future__ import annotations
+
+import re
+
+from playwright.sync_api import Page, expect
+
+from tests.e2e_ui.conftest import open_right_rail
+
+# Minimal stand-in for the Electron preload bridge. Runs before any app script
+# on every navigation (add_init_script), so the SPA's feature detection
+# (``supportsBrowser()`` in nativeBridge.ts) sees a browser-capable shell. Every
+# method the web layer may call is a guarded no-op: ``kind`` marks the native
+# shell, ``browserOpenOrNavigate`` is the capability marker that gates the
+# Browser tab (a shell too old to ship the embedded browser lacks it, so the
+# tab hides), and the rest keep unrelated native calls (badge, notify, the
+# title-bar server picker, and the browser-pane bridge probes) from throwing
+# under the stub. ``browserHasView`` resolves "no view yet" so the pane shows
+# its empty state instead of trying to attach a native WebContentsView.
+_ELECTRON_SHELL_INIT_SCRIPT = """
+window.omnigentDesktop = {
+  kind: "electron",
+  setBadgeCount: function () {},
+  notify: function () { return Promise.resolve(false); },
+  onNotificationActivated: function () { return function () {}; },
+  getServerPicker: function () { return Promise.resolve(null); },
+  switchServer: function () { return Promise.resolve(); },
+  openServerSetup: function () {},
+  browserOpenOrNavigate: function () { return Promise.resolve({ ok: true }); },
+  browserHasView: function () { return Promise.resolve({ exists: false }); },
+  onBrowserViewCreated: function () { return function () {}; },
+  onBrowserHostActiveChanged: function () { return function () {}; },
+  onBrowserViewClosed: function () { return function () {}; },
+  onBrowserUrlChanged: function () { return function () {}; },
+  onBrowserNavState: function () { return function () {}; },
+};
+"""
+
+
+def test_browser_is_soft_tab_only_and_opens_pane(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Under the Electron stub, Browser opens only as a soft tab.
+
+    Asserts the desktop-only chain end to end:
+
+    1. No permanent Browser navigation tab is present.
+    2. ``+`` offers Browser and creates it as the last, closable soft tab.
+    3. Selecting it mounts the browser pane region.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
+    """
+    base_url, session_id = seeded_session
+
+    page.add_init_script(_ELECTRON_SHELL_INIT_SCRIPT)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+
+    # (1) Browser has no permanent icon-only navigation tab.
+    expect(rail.get_by_role("tab", name="Browser", exact=True)).to_have_count(0)
+
+    # (2) The new-tab menu creates the Browser soft tab.
+    rail.get_by_role("button", name="Open new", exact=True).click()
+    page.get_by_role("menuitem", name="Browser", exact=True).click()
+    browser_tab = rail.get_by_role("tab", name="Browser 1", exact=True)
+    expect(browser_tab).to_be_visible()
+
+    # It is the LAST tab. Read every rail tab's accessible name in DOM order.
+    tab_names = rail.get_by_role("tab").all_inner_texts()
+    assert tab_names, "expected at least one Workspace rail tab"
+    assert re.search("Browser", tab_names[-1]), (
+        f"Browser tab must be last; rail tab order was {tab_names!r}"
+    )
+
+    # (3) The soft tab is selected and mounts the browser content region.
+    expect(browser_tab).to_have_attribute("aria-selected", "true")
+
+
+def test_no_browser_tab_in_plain_browser(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A plain browser tab (no Electron bridge) never shows the Browser tab.
+
+    Without the ``window.omnigentDesktop`` stub, ``supportsBrowser()`` is
+    false, so ``AppShell`` marks the Browser rail tab unavailable and it must
+    not render — the gate that keeps the embedded browser off the plain web
+    app (there is no WebContentsView to host). This is the half of the
+    contract only an end-to-end browser run can prove.
+
+    :param page: Playwright page fixture (fresh context per test).
+    :param seeded_session: ``(base_url, session_id)`` of a runner-bound session.
+    """
+    base_url, session_id = seeded_session
+
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+
+    # The Files/Agents tabs prove the rail rendered; the Browser tab must be
+    # absent (not merely hidden) in a non-Electron shell.
+    expect(rail.get_by_role("tab", name=re.compile("Agents"))).to_be_visible()
+    expect(rail.get_by_role("tab", name=re.compile("Browser"))).to_have_count(0)
+
+
+def test_multiple_browser_soft_tabs(page: Page, seeded_session: tuple[str, str]) -> None:
+    """User-created browser tabs select independent views and close individually."""
+    base_url, session_id = seeded_session
+    page.add_init_script(_ELECTRON_SHELL_INIT_SCRIPT)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_placeholder("Send a message…")).to_be_visible()
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+
+    for ordinal in (1, 2):
+        rail.get_by_role("button", name="Open new", exact=True).click()
+        page.get_by_role("menuitem", name="Browser", exact=True).click()
+        expect(rail.get_by_role("tab", name=f"Browser {ordinal}", exact=True)).to_have_attribute(
+            "aria-selected", "true"
+        )
+
+    second_view = rail.locator("[data-browser-pane-conversation]").get_attribute(
+        "data-browser-pane-conversation"
+    )
+    rail.get_by_role("tab", name="Browser 1", exact=True).click()
+    first_view = rail.locator("[data-browser-pane-conversation]").get_attribute(
+        "data-browser-pane-conversation"
+    )
+    assert first_view != second_view
+    assert first_view != session_id
+    rail.get_by_role("tab", name="Browser 2", exact=True).click()
+    expect(rail.locator("[data-browser-pane-conversation]")).to_have_attribute(
+        "data-browser-pane-conversation", second_view
+    )
+
+    page.reload()
+    expect(rail.get_by_role("tab", name="Browser 2", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    rail.get_by_role("button", name="Close Browser 2", exact=True).click()
+    expect(rail.get_by_role("tab", name="Browser 2", exact=True)).to_have_count(0)
+    expect(rail.get_by_role("tab", name="Browser 1", exact=True)).to_have_attribute(
+        "aria-selected", "true"
+    )
+    rail.get_by_role("button", name="Close Browser 1", exact=True).click()
+    expect(rail.get_by_role("tab", name=re.compile("Browser"))).to_have_count(0)

@@ -18,12 +18,21 @@
 # and server-launched managed hosts. It bakes the full omnigent
 # install plus the tools a host needs at runtime — git (workspaces /
 # worktrees), tmux (terminal sessions spawned by native harnesses),
-# and the coding-harness CLIs (claude / codex / pi, via Node) — and
+# and the coding-harness CLIs (claude / codex / pi, via Node; kiro-cli via
+# Kiro's installer) — and
 # skips everything server-only: no SPA bundle, no psycopg, no
 # uvicorn entrypoint. Modal's `Image.from_registry` requirements shape
-# it: built for linux/amd64, `python` + `pip` on $PATH, and CMD-only
-# (an ENTRYPOINT that doesn't exec its args would block Modal's own
-# runtime from running).
+# it: `python` + `pip` on $PATH, and CMD-only (an ENTRYPOINT that
+# doesn't exec its args would block Modal's own runtime from running).
+#
+# Both images publish multi-arch (linux/amd64 + linux/arm64) — see
+# .github/workflows/oss-publish-images.yml — so they run natively on
+# arm64 hosts (Apple Silicon laptops, arm64 clusters) as well as amd64.
+# Nothing below is arch-specific: the python/node base images are
+# multi-arch and apt/pip/npm/COPY-from-node all resolve per-arch under
+# buildx. Only web-builder is pinned to $BUILDPLATFORM (see that stage).
+# Amd64-only consumers (Modal, Daytona, CoreWeave) keep pulling the
+# amd64 variant from the manifest list, unchanged.
 #
 # Build (from repo root):
 #
@@ -32,6 +41,11 @@
 #
 #   docker build -t omnigent-host:latest --target host \
 #                -f deploy/docker/Dockerfile .
+#
+# To bake extra harness CLIs into a host image beyond the default set, build
+# with EXTRA_HARNESS_CLIS="goose jcode opencode" — harness names, optional
+# @version pins, or npm:<pkg-spec> entries (see deploy/docker/README.md and
+# deploy/docker/install-harness-cli.sh for the supported names).
 #
 # Behind corporate package proxies (the host target also installs the
 # harness CLIs from npm, so it needs the npm proxy too):
@@ -47,27 +61,43 @@
 
 # Must satisfy pyproject requires-python (>=3.12); 3.11 fails dependency resolution.
 ARG PYTHON_VERSION=3.12
-ARG NODE_VERSION=20
+ARG NODE_VERSION=22
 
 # ── Web UI builder ──────────────────────────────────────
-# Builds the ap-web SPA so `docker build` works from a clean checkout —
-# no separate `cd ap-web && npm run build` step, no "SPA bundle missing"
+# Builds the web SPA so `docker build` works from a clean checkout —
+# no separate `cd web && npm run build` step, no "SPA bundle missing"
 # hard-fail. vite.config emits to ../omnigent/server/static/web-ui
-# (relative to ap-web/), so from /web/ap-web the bundle lands at
+# (relative to web/), so from /web/web the bundle lands at
 # /web/omnigent/server/static/web-ui, which the server builder overlays.
 # Server-only: the host target never reaches this stage.
 #
+# Pinned to the build host's platform: the bundle is arch-independent
+# (plain JS/CSS/HTML), and vite's native bundler has stalled indefinitely
+# at "rendering chunks" under QEMU arm64 emulation, timing out releases.
+#
 # Behind a corporate npm proxy, pass it through:
 #   --build-arg NPM_CONFIG_REGISTRY=https://npm-proxy.example.com
-FROM node:${NODE_VERSION}-slim AS web-builder
+FROM --platform=$BUILDPLATFORM node:${NODE_VERSION}-slim AS web-builder
 ARG NPM_CONFIG_REGISTRY=
-ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
-WORKDIR /web/ap-web
-# Manifests first so the install layer caches across pure source edits.
-COPY ap-web/package.json ap-web/package-lock.json ./
-RUN npm install --no-audit --no-fund
-COPY ap-web/ ./
-RUN npm run build
+ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org}
+# pnpm 11 uses PNPM_CONFIG_ settings; npm uses NPM_CONFIG_.
+ENV PNPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
+WORKDIR /web
+
+# Workspace manifests + lockfile first so the install layer caches across pure
+# source edits. The electron package JSON is included so the root workspace is
+# structurally complete, but we --filter web to avoid downloading Electron.
+COPY pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY patches/ ./patches/
+COPY web/package.json ./web/
+COPY web/electron/package.json ./web/electron/
+
+RUN npm install -g pnpm@11.15.1
+RUN pnpm install --frozen-lockfile --filter web
+
+COPY web/ ./web/
+ARG VITE_OMNIGENT_HOST_ROUTING=false
+RUN pnpm --filter web run build
 
 # ── Python builder (shared: server + host) ──────────────
 # Installs the package (and its transitive native-extension deps) into
@@ -131,11 +161,20 @@ ARG PYPI_INDEX_URL=https://pypi.org/simple
 # complete image. This replaces the old "prebuild or hard-fail" check.
 COPY --from=web-builder /web/omnigent/server/static/web-ui ./omnigent/server/static/web-ui
 RUN test -f ./omnigent/server/static/web-ui/index.html \
-    || (echo "ERROR: SPA bundle missing after web-builder stage — check the ap-web build." && exit 1)
+    || (echo "ERROR: SPA bundle missing after web-builder stage — check the web build." && exit 1)
 
 # psycopg[binary] is not a baseline dep — pulled in by the
 # [databricks] extra in pyproject — so add it explicitly here.
 RUN uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} 'psycopg[binary]>=3.1,<4'
+
+# Optional managed-sandbox provider extras for the SERVER (the launcher imports
+# the provider SDK — e.g. the kubernetes client for `sandbox.provider:
+# kubernetes`). Off by default; the runner host image needs none of these. Build
+# with `--build-arg OMNIGENT_EXTRAS=kubernetes` (comma-separate for several).
+ARG OMNIGENT_EXTRAS=
+RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
+        uv pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} -e ".[${OMNIGENT_EXTRAS}]"; \
+    fi
 
 # ── Node alias stage ─────────────────────────────────────
 # Pure alias so the host stage can COPY node out of a version-pinned
@@ -144,12 +183,30 @@ FROM node:${NODE_VERSION}-slim AS node-runtime
 
 # ── Host runtime (`--target host`) ──────────────────────
 # Prebaked Omnigent host for remote sandboxes: full omnigent install,
-# git + tmux for harness runtime needs, bubblewrap to OS-sandbox the
+# git + tmux for harness runtime needs, procps + lsof so the antigravity-native
+# executor can discover agy's connect-RPC port (antigravity_native_rpc.py uses
+# `pgrep` in _list_agy_pids to find agy processes — with a /proc-scan fallback if
+# pgrep is absent — then `lsof` in resolve_language_server_port to read their
+# loopback ports; lsof has NO fallback, so a missing lsof silently yields "no
+# port" and breaks web-turn injection), bubblewrap to OS-sandbox the
 # native harness terminals (mandatory and fail-loud on Linux), curl + CA
 # certificates for outbound HTTPS and in-sandbox downloads, plus the
-# coding-harness CLIs (claude / codex / pi) so claude-sdk, claude-native,
-# codex, and pi agents can run in managed sandboxes without an in-sandbox
-# install. No SPA, no psycopg, no server entrypoint.
+# coding-harness CLIs (claude / codex / pi / kiro-cli) so claude-sdk,
+# claude-native, codex, pi, and kiro-native agents can run in managed
+# sandboxes without an in-sandbox install. No SPA, no psycopg, no server
+# entrypoint.
+#
+# Also carries two additions required only by the NVIDIA OpenShell provider
+# (deploy/openshell/README.md) and inert for the root-based providers
+# (Modal / Daytona / CoreWeave):
+#   - iproute2 / nftables: OpenShell puts each sandbox in its own network
+#     namespace and routes egress through a policy proxy; the supervisor
+#     shells out to `ip` to build that netns and refuses to start a sandbox
+#     without it. The other providers create no namespaces, so it sits unused.
+#   - a non-root `sandbox` user/group: OpenShell drops privileges to a user
+#     literally named `sandbox` before running the agent (defense in depth)
+#     and fails closed if it is absent. The other providers run as root and
+#     never reference it.
 FROM python:${PYTHON_VERSION}-slim AS host
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
@@ -165,9 +222,20 @@ ENV PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:${PATH}" \
     IS_SANDBOX=1
 
+# bzip2 ships on every host so the goose EXTRA_HARNESS_CLIS row works without
+# another package-list edit (goose's release archive is .tar.bz2).
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git tmux bubblewrap curl ca-certificates \
+ && apt-get install -y --no-install-recommends \
+      git tmux procps lsof bubblewrap curl ca-certificates unzip bzip2 \
+      iproute2 nftables \
  && rm -rf /var/lib/apt/lists/*
+
+# OpenShell-required non-root user (see the header note). UID/GID in the high
+# range per OpenShell's bring-your-own-container guidance, so that without
+# user-namespace remapping the sandbox user maps to an unprivileged, unused
+# host id. Unused by the root-based providers.
+RUN groupadd -g 1000660000 sandbox \
+ && useradd -m -d /sandbox -u 1000660000 -g sandbox sandbox
 
 # Git credential helper for private repositories over HTTPS: answers
 # `git credential get` from GIT_TOKEN / GIT_USERNAME in the
@@ -202,11 +270,134 @@ RUN npm install -g --no-audit --no-fund \
       @earendil-works/pi-coding-agent \
  && npm cache clean --force
 
-# Preserve /build/ — the venv's editable install .pth files reference
-# /build/omnigent and /build/sdks/* by absolute path. Copying these to
-# /app/ would break the import paths silently.
+# Kiro CLI is not published as an npm package, and its installer has NO version
+# flag — `curl …/install | bash` always fetches `latest`, so the image was
+# non-deterministic. The kiro-native harness is behaviorally coupled to a
+# specific kiro-cli build (Escape-interrupt leaves an empty composer, the
+# bracketed-paste multi-line path, the session-JSONL layout — all verified
+# against 2.10.0; grep `kiro-cli 2.10.0`). So pin it the same way as `agy` below:
+# fetch the immutable per-arch zip from the versioned CDN path and verify its
+# sha256, run the package's own (network-free) install.sh, then copy the binaries
+# onto a system PATH dir every sandbox user shares. A trailing `kiro-cli
+# --version` check asserts the unpacked binary really is the pinned version — a
+# cheap sanity guard atop the sha256. To adopt a new kiro-cli: re-verify the
+# coupled behavior, then bump KIRO_CLI_VERSION + both
+# SHA256s (the `sha256` fields in
+# https://prod.download.cli.kiro.dev/stable/latest/manifest.json). Keep in sync
+# with deploy/docker/Dockerfile.ubi.
+ARG KIRO_CLI_VERSION=2.10.0
+ARG KIRO_CLI_SHA256_AMD64=be9d8b6d7c44f93a83ca22466043d98ad058e6ed3c12fffd068f3fb8a60b3b70
+ARG KIRO_CLI_SHA256_ARM64=0afb37399b9e2847c2f2e3f5d9052c8bc52bbf1e30401ea284a602661bce34bc
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64)  asset="kirocli-x86_64-linux.zip";  sha="$KIRO_CLI_SHA256_AMD64" ;; \
+      aarch64) asset="kirocli-aarch64-linux.zip"; sha="$KIRO_CLI_SHA256_ARM64" ;; \
+      *) echo "ERROR: unsupported arch '$(uname -m)' for kiro-cli" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/kiro.zip "https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/${asset}"; \
+    echo "${sha}  /tmp/kiro.zip" | sha256sum -c -; \
+    unzip -q /tmp/kiro.zip -d /tmp/kiro; \
+    KIRO_CLI_SKIP_SETUP=1 sh /tmp/kiro/kirocli/install.sh; \
+    install -m 0755 /root/.local/bin/kiro-cli /usr/local/bin/kiro-cli; \
+    if [ -f /root/.local/bin/kiro-cli-chat ]; then \
+      install -m 0755 /root/.local/bin/kiro-cli-chat /usr/local/bin/kiro-cli-chat; \
+    fi; \
+    rm -rf /tmp/kiro /tmp/kiro.zip; \
+    installed="$(/usr/local/bin/kiro-cli --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
+    [ "$installed" = "$KIRO_CLI_VERSION" ] || { \
+      echo "ERROR: kiro-cli reports '${installed:-<none>}', expected '$KIRO_CLI_VERSION'." >&2; exit 1; }; \
+    echo "kiro-cli ${KIRO_CLI_VERSION} pinned (sha256 verified)"
+# Antigravity CLI (`agy`) — the antigravity-native harness shells out to `agy`
+# on the host, launching it in a tmux pane (see omnigent/antigravity_native*.py),
+# so a managed host image must carry it. It is NOT an npm package
+# (harness_install.py lists agy as a non-npm, installer-script harness), so it
+# can't join the `npm install -g` set above. The tarball holds a single
+# self-contained ``antigravity`` binary; install it as ``agy`` on a system PATH
+# dir every user shares (its bootstrapper default ~/.local/bin is per-user and
+# off the venv PATH). ``test -x`` fails the build loudly if the layout changes.
+#
+# Version + integrity pin: the native harness is behaviorally coupled to a
+# specific agy build (out-of-order transcript writes, connect-RPC quirks, and TUI
+# injection are all verified against 1.1.16 — grep ``agy 1.1.16`` under
+# omnigent/antigravity_native*). The official ``install.sh`` bootstrapper has NO
+# version flag — it always fetches the LATEST build from an auto-updater manifest
+# and old builds are not retained at any stable, reconstructable URL — so it
+# cannot pin anything. Instead we fetch the exact, immutable per-arch release
+# asset from GitHub and verify its SHA256: this both holds the verified version
+# AND fails the build if the bytes ever change underneath us, which is the actual
+# supply-chain control (a version-string check alone is not). To adopt a new agy:
+# re-verify the coupled behavior, then bump AGY_VERSION and both SHA256s (from
+# https://github.com/google-antigravity/antigravity-cli/releases).
+ARG AGY_VERSION=1.1.16
+ARG AGY_SHA256_AMD64=7742953b7835b457e9102f1357a493913657dfd147435584f609d58356ec085a
+ARG AGY_SHA256_ARM64=c71599bb548cf72dfe7a8f6c411b3c7a3623cd4b0f6276bae89c69f769d6c92d
+# Exported for install-harness-cli.sh's agy row, so a build that adds
+# EXTRA_HARNESS_CLIS=agy pins the same version + sha256 as the install above
+# (and UBI — which has no baked agy — pins the same values).
+ENV AGY_VERSION=${AGY_VERSION} \
+    AGY_SHA256_AMD64=${AGY_SHA256_AMD64} \
+    AGY_SHA256_ARM64=${AGY_SHA256_ARM64}
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) asset="agy_cli_linux_x64.tar.gz"; sha="$AGY_SHA256_AMD64" ;; \
+      arm64) asset="agy_cli_linux_arm64.tar.gz"; sha="$AGY_SHA256_ARM64" ;; \
+      *) echo "ERROR: unsupported arch '$arch' for agy" >&2; exit 1 ;; \
+    esac; \
+    url="https://github.com/google-antigravity/antigravity-cli/releases/download/${AGY_VERSION}/${asset}"; \
+    curl -fsSL -o /tmp/agy.tar.gz "$url"; \
+    echo "${sha}  /tmp/agy.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/agy.tar.gz -C /tmp antigravity; \
+    install -m 0755 /tmp/antigravity /usr/local/bin/agy; \
+    rm -f /tmp/agy.tar.gz /tmp/antigravity; \
+    test -x /usr/local/bin/agy; \
+    installed="$(/usr/local/bin/agy --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
+    if [ "$installed" != "$AGY_VERSION" ]; then \
+      echo "ERROR: agy reports '${installed:-<unparseable>}', expected '$AGY_VERSION'." >&2; \
+      exit 1; \
+    fi; \
+    echo "agy ${AGY_VERSION} pinned (sha256 verified)"
+
+# GitHub CLI (`gh`) — the read-only "GitHub" side panel shells out to `gh` in the
+# runner (omnigent/runner/github_resource.py: `gh pr view` / `gh pr diff` /
+# `gh api .../pulls/<n>/files`) to render the session branch's PR + file diffs, so
+# a managed host image must carry it or the panel degrades to a "gh not installed"
+# state. Pinned + SHA256-verified per arch, like agy above; to bump, update
+# GH_VERSION and both SHA256s from the release's `gh_<ver>_checksums.txt` at
+# https://github.com/cli/cli/releases.
+ARG GH_VERSION=2.100.0
+ARG GH_SHA256_AMD64=e4d4bb4498e8d007abe545b6568926793ace1b6447da598294a610018cb164be
+ARG GH_SHA256_ARM64=ea4e7a581a32ccad6cc7923cb1576ac5859ba4b9a16ab22eb8f8a96e78e2e961
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) sha="$GH_SHA256_AMD64" ;; \
+      arm64) sha="$GH_SHA256_ARM64" ;; \
+      *) echo "ERROR: unsupported arch '$arch' for gh" >&2; exit 1 ;; \
+    esac; \
+    asset="gh_${GH_VERSION}_linux_${arch}.tar.gz"; \
+    curl -fsSL -o /tmp/gh.tar.gz \
+      "https://github.com/cli/cli/releases/download/v${GH_VERSION}/${asset}"; \
+    echo "${sha}  /tmp/gh.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/gh.tar.gz -C /tmp "gh_${GH_VERSION}_linux_${arch}/bin/gh"; \
+    install -m 0755 "/tmp/gh_${GH_VERSION}_linux_${arch}/bin/gh" /usr/local/bin/gh; \
+    rm -rf /tmp/gh.tar.gz "/tmp/gh_${GH_VERSION}_linux_${arch}"; \
+    test -x /usr/local/bin/gh; \
+    installed="$(/usr/local/bin/gh --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"; \
+    if [ "$installed" != "$GH_VERSION" ]; then \
+      echo "ERROR: gh reports '${installed:-<unparseable>}', expected '$GH_VERSION'." >&2; \
+      exit 1; \
+    fi; \
+    echo "gh ${GH_VERSION} pinned (sha256 verified)"
+
+# Copy the venv and source tree. The editable install's .pth files reference
+# /build/omnigent and /build/sdks/* -- both denied by the k8s Landlock LSM
+# policy. Re-install without -e so the package bytes land in the venv's
+# site-packages and imports no longer require /build at runtime.
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build /build
+RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
+ && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /opt/venv/lib/python*/site-packages
 
 # Sandbox launchers exec commands through `bash -lc`, and Debian's
 # /etc/profile unconditionally resets PATH for login shells — the ENV
@@ -214,6 +405,19 @@ COPY --from=builder /build /build
 # resolve to the system Python instead of the venv. profile.d snippets
 # are sourced after that reset, so this puts the venv back in front.
 RUN echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
+
+# Optional extra harness CLIs, off by default: space-separated harness names
+# with optional @version pins, or npm:<pkg-spec> — see install-harness-cli.sh
+# and deploy/docker/README.md. Kept at the end of the stage so script churn
+# doesn't bust the layers above. `set -f` stops glob expansion in the unquoted
+# arg list (npm specs may contain *). The script is removed after use.
+ARG EXTRA_HARNESS_CLIS=
+COPY deploy/docker/install-harness-cli.sh /tmp/install-harness-cli.sh
+RUN if [ -n "${EXTRA_HARNESS_CLIS}" ]; then \
+        set -f; \
+        bash /tmp/install-harness-cli.sh ${EXTRA_HARNESS_CLIS}; \
+    fi; \
+    rm -f /tmp/install-harness-cli.sh
 
 WORKDIR /root
 

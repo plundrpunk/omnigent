@@ -35,7 +35,6 @@ import contextlib
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -46,6 +45,8 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+
+from tests._helpers.live_server import find_free_port
 
 _REPO = Path(__file__).resolve().parents[2]
 _PROFILE = "oss"
@@ -224,13 +225,6 @@ def _clean_env(profile: str = _PROFILE) -> dict[str, str]:
     return env
 
 
-def _free_port() -> int:
-    """:returns: An ephemeral localhost port the OS just confirmed free."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _get(base: str, path: str, token: str | None) -> dict:
     """
     GET a JSON object from the local server.
@@ -377,7 +371,7 @@ def local_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     :raises RuntimeError: If the server never passes health.
     """
     workdir = tmp_path_factory.mktemp("subagent_elicit_e2e")
-    port = _free_port()
+    port = find_free_port()
     base = f"http://127.0.0.1:{port}"
     log = open(workdir / "server.log", "w")  # noqa: SIM115 — lives for the Popen lifetime
     proc = subprocess.Popen(
@@ -537,7 +531,7 @@ def agent_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
     Writes the inlined supervisor + sub-agent specs in the on-disk bundle
     layout ``omnigent run`` expects (``config.yaml`` at the root,
-    ``agents/<name>/config.yaml`` per sub-agent).
+    ``agents/<dir>/config.yaml`` per sub-agent).
 
     :param tmp_path_factory: Pytest tmp-dir factory (module-scoped so all
         parametrized cases share one bundle).
@@ -588,6 +582,7 @@ def test_subagent_prompt_surfaces_on_parent_and_resolves_via_child(
     request: pytest.FixtureRequest,
     sub_agent: str,
     scenario: str,
+    using_mock_llm: bool,
 ) -> None:
     """
     A prompting sub-agent's approval is forwarded to the parent and answered there.
@@ -617,7 +612,14 @@ def test_subagent_prompt_surfaces_on_parent_and_resolves_via_child(
     :param scenario: Which elicitation the worker raises — ``"command"``
         (a gated shell command) or ``"ask_user_question"`` (Claude's
         built-in interactive question tool).
+    :param using_mock_llm: Whether mock LLM mode is active.
     """
+    if using_mock_llm:
+        pytest.skip(
+            "sub-agent elicitation forwarding e2e requires real native CLI "
+            "harnesses (claude/codex) with OAuth authentication; not feasible "
+            "under mock LLM"
+        )
     from tests.e2e._harness_probes import cli_unavailable_reason
 
     # The delegated worker is a real CLI (claude / codex); skip the row if its
@@ -695,7 +697,9 @@ def test_subagent_prompt_surfaces_on_parent_and_resolves_via_child(
 
         baseline = {
             s.get("id")
-            for s in _get(local_server, "/v1/sessions?order=desc&limit=60", token).get("data", [])
+            for s in _get(
+                local_server, "/v1/sessions?order=desc&limit=60&visibility=all", token
+            ).get("data", [])
         }
         log = open(log_path, "w")  # noqa: SIM115 — lives for the run subprocess lifetime
         run_proc = subprocess.Popen(
@@ -730,7 +734,9 @@ def test_subagent_prompt_surfaces_on_parent_and_resolves_via_child(
         #    polling the full turn budget).
         parent_deadline = time.monotonic() + _PARENT_DISCOVER_TIMEOUT_SEC
         while time.monotonic() < parent_deadline and parent_id is None:
-            for s in _get(local_server, "/v1/sessions?order=desc&limit=60", token).get("data", []):
+            for s in _get(
+                local_server, "/v1/sessions?order=desc&limit=60&visibility=all", token
+            ).get("data", []):
                 if s.get("id") not in baseline and (
                     (s.get("agent_name") or "").lower() == "ask-mode-supervisor"
                 ):

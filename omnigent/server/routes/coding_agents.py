@@ -19,7 +19,7 @@ Why this is not part of the AMS bridge (:mod:`omnigent.server.routes.ams`):
 proxied answer would describe the *remote* host's binaries, not this one.
 Local capability is only answerable locally, so discovery runs in-process.
 
-Complements :mod:`omnigent.model_catalog`, which resolves *provider* models
+Complements :mod:`omnigent.models.model_catalog`, which resolves *provider* models
 over HTTP. That answers "which models could we call?"; this answers "which
 coding agents can we actually launch here, and what will each of them run?"
 
