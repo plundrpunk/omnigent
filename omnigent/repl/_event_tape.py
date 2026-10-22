@@ -24,6 +24,8 @@ from typing import Protocol, TextIO, runtime_checkable
 from rich.console import Group, RenderableType
 from rich.text import Text
 
+from omnigent.process_logging import data_dir
+
 # ── Constants ──────────────────────────────────────────────────────────
 
 # Maximum entries the ring buffer retains. Old entries are evicted
@@ -750,7 +752,7 @@ def open_event_log(session_id: str) -> pathlib.Path:
         ``~/.omnigent/debug/events-sess_abc123.jsonl``.
     """
     safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in session_id)
-    debug_dir = pathlib.Path.home() / ".omnigent" / _DEBUG_DIR_NAME
+    debug_dir = data_dir() / _DEBUG_DIR_NAME
     debug_dir.mkdir(parents=True, exist_ok=True)
     return debug_dir / f"events-{safe_id}.jsonl"
 

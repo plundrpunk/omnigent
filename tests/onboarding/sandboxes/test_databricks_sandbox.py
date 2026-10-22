@@ -8,7 +8,10 @@ the SDK sends for the launcher and how it maps responses and errors.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -300,7 +303,10 @@ def test_keep_alive_without_proxy_bearer_still_runs_a_command() -> None:
     assert call["body"]["args"][1].endswith("true")
 
 
-def test_keep_alive_refreshes_bearer_via_envs_only_when_running() -> None:
+@pytest.mark.parametrize("state_override", [None, "absolute", "tilde"])
+def test_keep_alive_refreshes_bearer_via_envs_only_when_running(
+    tmp_path: Path, state_override: str | None
+) -> None:
     api = _FakeApi()
     api.set_states("sb-1", "SANDBOX_STATE_RUNNING")
     api.exec_results = [
@@ -315,6 +321,32 @@ def test_keep_alive_refreshes_bearer_via_envs_only_when_running() -> None:
     assert call["body"]["envs"] == {"OMNIGENT_PROXY_BEARER_VALUE": "launcher-token"}
     assert "launcher-token" not in " ".join(call["body"]["args"])
     assert "umask 077" in call["body"]["args"][1]
+    home = tmp_path / "home"
+    home.mkdir()
+    state = home / "state with spaces" if state_override else home / ".omnigent"
+    env = {**os.environ, "HOME": str(home), **call["body"]["envs"]}
+    env.pop("OMNIGENT_DATA_DIR", None)
+    if state_override:
+        env["OMNIGENT_DATA_DIR"] = (
+            "~/state with spaces" if state_override == "tilde" else str(state)
+        )
+    result = subprocess.run(
+        ["bash", *call["body"]["args"]], env=env, check=True, capture_output=True, text=True
+    )
+    bearer = state / "proxy-bearer"
+    assert result.stdout == str(bearer)
+    assert bearer.read_text() == "launcher-token"
+    assert bearer.stat().st_mode & 0o777 == 0o600
+    paths = subprocess.run(
+        ["bash", "-c", f'printf "%s\\n" "{mod._HOST_LOG}" "{mod._HOST_LOCK}"'],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert paths.stdout.splitlines() == [str(state / "host.log"), str(state / "host.lock")]
+    if state_override:
+        assert not (home / ".omnigent").exists()
 
 
 def test_keep_alive_soft_fails_when_the_bearer_write_fails() -> None:
@@ -406,8 +438,8 @@ def test_start_host_without_proxy_bearer_sets_no_bearer_env() -> None:
     assert not any("proxy-bearer" in " ".join(c["body"]["args"]) for c in api.exec_calls())
 
 
-def test_host_launch_logs_under_home_and_holds_a_lock() -> None:
-    """$HOME survives a stop; the lock makes a replayed launch exit, not double-start."""
+def test_host_launch_logs_under_data_dir_and_holds_a_lock() -> None:
+    """The host uses the resolved state paths and keeps replayed launches locked out."""
     api = _FakeApi()
     api.exec_results = [_stdout(""), _stdout("/home/u")]  # pkill, $HOME probe
     _launcher(api).start_host(
@@ -418,9 +450,9 @@ def test_host_launch_logs_under_home_and_holds_a_lock() -> None:
         server_url="https://omnigent.example.com",
     )
     launch = api.exec_calls()[-1]["body"]["args"][1]
-    assert 'mkdir -p "$HOME/.omnigent";' in launch
-    assert 'setsid nohup flock -n "$HOME/.omnigent/host.lock" sh -c ' in launch
-    assert '>> "$HOME/.omnigent/host.log"' in launch
+    assert f'mkdir -p "{mod._HOST_LOG_DIR}";' in launch
+    assert f'setsid nohup flock -n "{mod._HOST_LOCK}" sh -c ' in launch
+    assert f'>> "{mod._HOST_LOG}"' in launch
 
 
 @pytest.mark.parametrize(

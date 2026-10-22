@@ -39,6 +39,7 @@ import os
 import keyring
 import keyring.errors
 
+from omnigent.config import global_config_path
 from omnigent.errors import ErrorCode, OmnigentError
 
 # The subset of keyring exceptions that mean "this backend can't serve the
@@ -106,16 +107,13 @@ def active_backend() -> str:
 def _config_home() -> str:
     """Return the omnigent config home directory.
 
-    Respects ``$OMNIGENT_CONFIG_HOME`` for test isolation, matching the
-    convention in :func:`omnigent.onboarding.provider_config._config_path`.
+    Respects ``$OMNIGENT_CONFIG_HOME`` before ``$OMNIGENT_DATA_DIR``,
+    keeping file-backed secrets beside the global config.
 
     :returns: The config home path, e.g. ``"/home/u/.omnigent"`` or the
         value of ``$OMNIGENT_CONFIG_HOME`` when set.
     """
-    config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
-    if config_home:
-        return config_home
-    return os.path.join(os.path.expanduser("~"), ".omnigent")
+    return str(global_config_path().parent)
 
 
 def _secrets_path() -> str:

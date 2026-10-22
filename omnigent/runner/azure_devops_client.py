@@ -94,9 +94,16 @@ def _epoch(value: object) -> float | None:
 
 def _token_from_file() -> AzureToken | None:
     """Read a bearer token from the token file, ignoring it when expired or malformed."""
+    from omnigent.process_logging import DATA_DIR_ENV_VAR, data_dir
+
     # Reserved for a future credential part that writes this file.
     try:
-        path = Path.home() / ".config" / "omnigent" / "azure-devops" / "token.json"
+        root = (
+            data_dir()
+            if os.environ.get(DATA_DIR_ENV_VAR)
+            else Path.home() / ".config" / "omnigent"
+        )
+        path = root / "azure-devops" / "token.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, RuntimeError, ValueError):
         return None

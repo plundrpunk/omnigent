@@ -162,6 +162,7 @@ def test_resolve_admin_list_path_env_override(monkeypatch: pytest.MonkeyPatch) -
 def test_resolve_data_dir_uses_credentials_parent(monkeypatch: pytest.MonkeyPatch) -> None:
     """Data dir co-locates with the credentials file (Docker ``/data``)."""
     monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", "/data/admin-credentials")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", "/other-data")
     monkeypatch.delenv("OMNIGENT_ADMIN_LIST_PATH", raising=False)
     assert resolve_data_dir() == Path("/data")
     assert resolve_admin_list_path() == Path("/data/admins")
@@ -171,8 +172,21 @@ def test_resolve_data_dir_defaults_to_home(monkeypatch: pytest.MonkeyPatch) -> N
     """With no env, the data dir is ``~/.omnigent``."""
     monkeypatch.delenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", raising=False)
     monkeypatch.delenv("OMNIGENT_ADMIN_LIST_PATH", raising=False)
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
     assert resolve_data_dir() == Path.home() / ".omnigent"
     assert resolve_admin_list_path() == Path.home() / ".omnigent" / "admins"
+
+
+@pytest.mark.parametrize("credentials_path", ["", "  "])
+def test_resolve_data_dir_honors_shared_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, credentials_path: str
+) -> None:
+    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", credentials_path)
+    monkeypatch.delenv("OMNIGENT_ADMIN_LIST_PATH", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", "~/isolated")
+    assert resolve_data_dir() == tmp_path / "isolated"
+    assert resolve_admin_list_path() == tmp_path / "isolated" / "admins"
 
 
 def test_load_admin_list_binds_resolved_path(monkeypatch: pytest.MonkeyPatch) -> None:

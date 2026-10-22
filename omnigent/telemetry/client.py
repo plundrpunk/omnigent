@@ -72,8 +72,9 @@ import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING, TypedDict, cast
+
+from omnigent.config import global_config_path
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -225,11 +226,7 @@ def _config_telemetry_disabled() -> bool:
     try:
         import re as _re
 
-        config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
-        if config_home:
-            config_path = Path(config_home) / "config.yaml"
-        else:
-            config_path = Path.home() / ".omnigent" / "config.yaml"
+        config_path = global_config_path()
         if not config_path.exists():
             return False
         # Read raw text and match `telemetry: false` directly to avoid

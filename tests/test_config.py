@@ -119,6 +119,22 @@ def test_global_config_path_respects_config_home(
     assert global_config_path() == tmp_path / "config.yaml"
 
 
+@pytest.mark.parametrize("override", [None, "", "~/state"])
+def test_global_config_path_data_dir_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, override: str | None
+) -> None:
+    monkeypatch.delenv("OMNIGENT_CONFIG_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    if override is None:
+        monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_DATA_DIR", override)
+    expected = tmp_path / ("state" if override else ".omnigent") / "config.yaml"
+    assert global_config_path() == expected
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    assert global_config_path() == tmp_path / "config" / "config.yaml"
+
+
 def test_effective_config_merges_project_over_user(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

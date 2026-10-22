@@ -551,7 +551,7 @@ def _server_uvicorn_log_config(
 # Tests may set ``OMNIGENT_CONFIG_HOME`` to isolate subprocesses from a
 # developer's real ``~/.omnigent/config.yaml``.
 _CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
-_GLOBAL_CONFIG_PATH: Path = Path.home() / ".omnigent" / "config.yaml"
+_GLOBAL_CONFIG_PATH: Path = data_dir() / "config.yaml"
 
 # Per-user state directories before / after the omniagents -> omnigent rename.
 # All per-user state (config, registered agents, auth tokens, the host daemon
@@ -560,7 +560,7 @@ _GLOBAL_CONFIG_PATH: Path = Path.home() / ".omnigent" / "config.yaml"
 # directory on first run. ``OMNIGENT_DATA_DIR`` is the data-isolation override
 # a worktree / test sets; when present the user manages their own state and
 # migration is skipped.
-_STATE_DIR: Path = Path.home() / ".omnigent"
+_STATE_DIR: Path = data_dir()
 # Pre-rename state directories, newest first. The name evolved
 # ``~/.omniagents`` -> ``~/.omnigents`` -> ``~/.omnigent``; migrate from the
 # newest legacy directory that still exists.
@@ -594,9 +594,9 @@ def _migrate_legacy_state_dir() -> None:
 
     :returns: ``None``.
     """
-    if _STATE_DIR.exists():
-        return
     if os.environ.get(_CONFIG_HOME_ENV_VAR) or os.environ.get(_DATA_DIR_ENV_VAR):
+        return
+    if _STATE_DIR.exists():
         return
     legacy_src = next((d for d in _LEGACY_STATE_DIRS if d.exists()), None)
     if legacy_src is None:
@@ -661,7 +661,7 @@ _ConfigValue: TypeAlias = (
     str | int | float | bool | list["_ConfigValue"] | dict[str, "_ConfigValue"] | None
 )
 
-_GLOBAL_AGENTS_DIR: Path = Path.home() / ".omnigent" / "agents"
+_GLOBAL_AGENTS_DIR: Path = data_dir() / "agents"
 _INTERNAL_BETA_DEFAULT_AGENT_NAME: str = "databricks_coding_agent.yaml"
 _INTERNAL_BETA_BUNDLED_AGENTS: tuple[str, ...] = (
     "databricks_coding_agent.yaml",

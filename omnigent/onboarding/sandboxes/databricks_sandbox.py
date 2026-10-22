@@ -56,8 +56,15 @@ _EXEC_HTTP_TIMEOUT_S: int = _EXEC_TIMEOUT_S + 120
 _STATE_TIMEOUT_S: float = 600.0
 _STATE_POLL_S: float = 1.0
 
-# Under $HOME, the only sandbox storage that survives a stop / resume cycle.
-_HOST_LOG_DIR: str = "$HOME/.omnigent"
+# Match data_dir() on the remote host, even before Omnigent is installed.
+_HOST_LOG_DIR: str = (
+    "$(python3 -c "
+    + shlex.quote(
+        "import os; "
+        "print(os.path.expanduser(os.environ.get('OMNIGENT_DATA_DIR') or '~/.omnigent'))"
+    )
+    + ")"
+)
 _HOST_LOG: str = f"{_HOST_LOG_DIR}/host.log"
 # Held by the running host supervisor; a replayed launch fails to take it and exits.
 _HOST_LOCK: str = f"{_HOST_LOG_DIR}/host.lock"
@@ -595,10 +602,10 @@ class DatabricksSandboxLauncher(SandboxLauncher):
         """Atomically (re)write the proxy bearer file; return its absolute path."""
         result = self.run(
             sandbox_id,
-            'umask 077; mkdir -p "$HOME/.omnigent" && '
-            'printf %s "$OMNIGENT_PROXY_BEARER_VALUE" > "$HOME/.omnigent/proxy-bearer.tmp" && '
-            'mv -f "$HOME/.omnigent/proxy-bearer.tmp" "$HOME/.omnigent/proxy-bearer" && '
-            'printf %s "$HOME/.omnigent/proxy-bearer"',
+            f'umask 077; state_dir="{_HOST_LOG_DIR}" && mkdir -p "$state_dir" && '
+            'printf %s "$OMNIGENT_PROXY_BEARER_VALUE" > "$state_dir/proxy-bearer.tmp" && '
+            'mv -f "$state_dir/proxy-bearer.tmp" "$state_dir/proxy-bearer" && '
+            'printf %s "$state_dir/proxy-bearer"',
             envs={"OMNIGENT_PROXY_BEARER_VALUE": self._current_bearer()},
         )
         return result.stdout.strip()

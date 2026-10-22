@@ -268,7 +268,11 @@ _HOST_CONFIG_WRITE_SCRIPT: str = """\
 import base64, json, os, tempfile, yaml
 
 config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
-config_dir = config_home if config_home else os.path.join(os.path.expanduser("~"), ".omnigent")
+data_dir = os.environ.get("OMNIGENT_DATA_DIR")
+config_dir = config_home or (
+    os.path.expanduser(data_dir)
+    if data_dir else os.path.join(os.path.expanduser("~"), ".omnigent")
+)
 path = os.path.join(config_dir, "config.yaml")
 marker = os.path.join(config_dir, ".injected_host_config.json")
 existing = {}
@@ -337,7 +341,7 @@ def render_host_config_write_command(host_config: dict[str, object]) -> str:
     """
     Build the remote command that installs *host_config* into the
     sandbox's config directory before ``omnigent host`` starts. The directory
-    is ``$OMNIGENT_CONFIG_HOME`` when truthy, otherwise ``~/.omnigent``, exactly
+    is ``$OMNIGENT_CONFIG_HOME``, then ``$OMNIGENT_DATA_DIR``, then ``~/.omnigent``,
     matching :func:`omnigent.onboarding.provider_config._config_path`.
 
     Server-managed replacement semantics: the server OWNS the names/keys it

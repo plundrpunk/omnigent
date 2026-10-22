@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+import sys
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import click
 import httpx
 import pytest
+import yaml
 
 from omnigent.onboarding.sandboxes import bootstrap as bootstrap_mod
 from omnigent.onboarding.sandboxes.base import (
@@ -757,7 +759,10 @@ def test_connect_runs_bare_host_command() -> None:
     assert launcher.foreground_commands == ["omnigent host --server https://app.example.com"]
 
 
-def test_connect_sets_host_name_before_connecting() -> None:
+@pytest.mark.parametrize("config_override", [False, True])
+def test_connect_sets_host_name_before_connecting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config_override: bool
+) -> None:
     """
     When ``host_name`` is set, connect must (a) edit the sandbox's
     ``~/.omnigent/config.yaml`` to use that name, and (b) THEN run
@@ -775,11 +780,33 @@ def test_connect_sets_host_name_before_connecting() -> None:
     name_command = launcher.run_commands[0]
     assert "python3" in name_command
     assert "shivam-sandbox-1" in name_command
-    assert "config.yaml" in name_command
+    assert "global_config_path" in name_command
     # The edit lands before the host starts (which reads config.yaml).
     name_entry = next(entry for entry in launcher.log if entry.startswith("run:python3"))
     foreground_entry = next(entry for entry in launcher.log if entry.startswith("foreground:"))
     assert launcher.log.index(name_entry) < launcher.log.index(foreground_entry)
+    home = tmp_path / "home"
+    home.mkdir()
+    state = tmp_path / "state"
+    config_dir = tmp_path / "config" if config_override else state
+    config_dir.mkdir()
+    config_path = config_dir / "config.yaml"
+    config_path.write_text("host:\n  host_id: preserved-id\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
+    monkeypatch.delenv("OMNIGENT_CONFIG_HOME", raising=False)
+    if config_override:
+        monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_dir))
+    home.chmod(0o000)
+    try:
+        subprocess.run([sys.executable, *shlex.split(name_command)[1:]], check=True)
+        assert yaml.safe_load(config_path.read_text())["host"] == {
+            "host_id": "preserved-id",
+            "name": "shivam-sandbox-1",
+        }
+    finally:
+        home.chmod(0o700)
+    assert not list(home.iterdir())
 
 
 def test_connect_raises_on_nonzero_exit() -> None:

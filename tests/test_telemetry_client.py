@@ -194,13 +194,18 @@ def test_config_opt_out_reads_config_home(tmp_path: Path, monkeypatch: pytest.Mo
     assert _config_telemetry_disabled() is True
 
 
-def test_config_opt_out_defaults_to_home_dot_omnigent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("override", [False, True])
+def test_config_opt_out_respects_data_dir_and_home_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, override: bool
 ) -> None:
     monkeypatch.delenv("OMNIGENT_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    (tmp_path / ".omnigent").mkdir()
-    (tmp_path / ".omnigent" / "config.yaml").write_text("telemetry: false\n", encoding="utf-8")
+    config_dir = tmp_path / ("isolated-data" if override else ".omnigent")
+    if override:
+        monkeypatch.setenv("OMNIGENT_DATA_DIR", str(config_dir))
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("telemetry: false\n", encoding="utf-8")
 
     assert _config_telemetry_disabled() is True
 

@@ -100,6 +100,22 @@ def make_executable(path: Path) -> Path:
     return path
 
 
+def test_token_file_uses_data_dir_without_home_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    state = tmp_path / "state"
+    token_file = state / "azure-devops" / "token.json"
+    token_file.parent.mkdir(parents=True)
+    token_file.write_text(json.dumps({"access_token": "isolated-token", "expires_at": 4e9}))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
+
+    def forbidden_home() -> Path:
+        pytest.fail("Isolated Azure token storage must not resolve HOME")
+
+    monkeypatch.setattr(Path, "home", forbidden_home)
+    assert azure_devops_client._token_from_file() == AzureToken("isolated-token", "bearer", 4e9)
+
+
 @pytest.fixture(autouse=True)
 def home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
     """Start each test with no token file, no PAT, no ``az``, and no real subprocess."""
@@ -107,6 +123,7 @@ def home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Path]:
     home_dir.mkdir()
     monkeypatch.setenv("HOME", str(home_dir))
     monkeypatch.setenv("USERPROFILE", str(home_dir))
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
     monkeypatch.delenv("AZURE_DEVOPS_EXT_PAT", raising=False)
     monkeypatch.delenv("OMNIGENT_AZURE_DEVOPS_TIMEOUT_SECONDS", raising=False)
     monkeypatch.setattr(azure_devops_client.shutil, "which", lambda _cmd, **_kw: None)

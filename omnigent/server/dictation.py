@@ -83,6 +83,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from omnigent.process_logging import data_dir
+
 _logger = logging.getLogger(__name__)
 
 ENGINE_ENV = "OMNIGENT_DICTATION_ENGINE"
@@ -221,12 +223,12 @@ def register_engine(
 
 
 def _asr_dir() -> Path:
-    default = Path.home() / ".omnigent" / "models" / "dictation" / "asr"
+    default = data_dir() / "models" / "dictation" / "asr"
     return Path(os.environ.get(MODEL_DIR_ENV) or default).expanduser()
 
 
 def _punct_dir() -> Path:
-    default = Path.home() / ".omnigent" / "models" / "dictation" / "punct"
+    default = data_dir() / "models" / "dictation" / "punct"
     return Path(os.environ.get(PUNCT_DIR_ENV) or default).expanduser()
 
 

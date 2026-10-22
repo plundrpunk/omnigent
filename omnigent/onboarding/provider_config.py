@@ -51,6 +51,7 @@ from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.config import global_config_path
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.spec.parser import check_unresolved_env_vars
@@ -581,16 +582,13 @@ def resolve_secret(ref: str) -> str:
 def _config_path() -> str:
     """Return the path to the global omnigent config file.
 
-    Respects ``$OMNIGENT_CONFIG_HOME`` for test isolation (matching the
-    rest of the onboarding layer).
+    Respects ``$OMNIGENT_CONFIG_HOME`` before ``$OMNIGENT_DATA_DIR``,
+    matching the CLI and runtime configuration readers.
 
     :returns: Path to ``config.yaml``, e.g.
         ``"/home/u/.omnigent/config.yaml"``.
     """
-    config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
-    if config_home:
-        return os.path.join(config_home, "config.yaml")
-    return os.path.join(os.path.expanduser("~"), ".omnigent", "config.yaml")
+    return str(global_config_path())
 
 
 def _load_config() -> dict[str, object]:

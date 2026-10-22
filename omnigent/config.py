@@ -22,6 +22,7 @@ from omnigent.preferences import (
     preferences_from_config,
     resolve_preferences,
 )
+from omnigent.process_logging import data_dir
 
 _log = logging.getLogger(__name__)
 _cwd_missing_warned = False
@@ -29,7 +30,6 @@ _cwd_missing_warned = False
 _Config: TypeAlias = dict[str, object]
 
 _CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
-_GLOBAL_CONFIG_PATH = Path.home() / ".omnigent" / "config.yaml"
 _LOCAL_CONFIG_RELPATH = Path(".omnigent") / "config.yaml"
 
 
@@ -37,7 +37,7 @@ def global_config_path(default_path: Path | None = None) -> Path:
     """Return the effective user-level config path."""
     if config_home := os.environ.get(_CONFIG_HOME_ENV_VAR):
         return Path(config_home) / "config.yaml"
-    return default_path or _GLOBAL_CONFIG_PATH
+    return default_path or data_dir() / "config.yaml"
 
 
 def load_global_config(path: Path | None = None) -> _Config:

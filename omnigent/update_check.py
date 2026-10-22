@@ -49,6 +49,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from omnigent.process_logging import data_dir
+
 if TYPE_CHECKING:
     # Imported only for type hints; the heavy/optional imports remain lazy
     # at runtime so importing this module stays cheap.
@@ -59,7 +61,7 @@ if TYPE_CHECKING:
     from rich.console import Console
 
 _ENV_SKIP = "OMNIGENT_NO_UPDATE_CHECK"
-_CACHE_DIR = Path.home() / ".omnigent"
+_CACHE_DIR = data_dir()
 _CACHE_FILE = _CACHE_DIR / ".update_check.json"
 _STALENESS_SECONDS = 4 * 60 * 60  # 4 hours
 _GIT_TIMEOUT_SECONDS = 5

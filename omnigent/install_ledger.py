@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import NotRequired, TypedDict, cast
 
+from omnigent.process_logging import data_dir
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 SCHEMA_VERSION = 1
@@ -29,9 +30,7 @@ def utc_now() -> str:
 
 
 def state_dir() -> Path:
-    if data_dir := os.environ.get("OMNIGENT_DATA_DIR"):
-        return Path(data_dir).expanduser()
-    return Path.home() / ".omnigent"
+    return data_dir()
 
 
 def ledger_path() -> Path:
