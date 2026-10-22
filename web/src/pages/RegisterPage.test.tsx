@@ -11,6 +11,8 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RegisterPage } from "./RegisterPage";
 import * as accountsApi from "@/lib/accountsApi";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 
 vi.mock("@/lib/accountsApi", () => ({ register: vi.fn() }));
 
@@ -79,6 +81,23 @@ describe("RegisterPage", () => {
     renderRegisterAt("?invite=tok123");
     expect(screen.getByLabelText(/username/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /create account/i })).toBeInTheDocument();
+  });
+
+  it("names the Omnigent server by default and Automaton OS under the fleet look", () => {
+    const { unmount } = renderRegisterAt("?invite=tok123");
+    expect(screen.getByText("You were invited to join this Omnigent server.")).toBeInTheDocument();
+    unmount();
+
+    render(
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, fleet_ui: true }}>
+        <MemoryRouter initialEntries={["/register?invite=tok123"]}>
+          <RegisterPage />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+    expect(
+      screen.getByText("You were invited to join this Automaton OS server."),
+    ).toBeInTheDocument();
   });
 
   it("disables submit until a username and an 8+ char password are entered", () => {

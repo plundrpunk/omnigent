@@ -1056,6 +1056,16 @@ describe("Sidebar session list", () => {
     expect(badge).not.toHaveClass("bg-[var(--sidebar-active)]");
   });
 
+  it("shows the Advanced entry only under the fleet look", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    const { unmount } = renderSidebar(true, "/", undefined, FALLBACK_SERVER_INFO);
+    expect(screen.queryByTestId("advanced-button")).toBeNull();
+    unmount();
+
+    renderSidebar(true, "/", undefined, { ...FALLBACK_SERVER_INFO, fleet_ui: true });
+    expect(screen.getByTestId("advanced-button")).toBeInTheDocument();
+  });
+
   it("hides Usage navigation while the release feature is off", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
     renderSidebar();

@@ -131,6 +131,7 @@ import {
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
 import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { useHeading, usePoweredBy } from "@/lib/branding";
+import { useFleetUi } from "@/lib/fleetUi";
 import {
   isSlashCommandText,
   matchSlashCommandInvocation,
@@ -2167,6 +2168,7 @@ export function NewChatLandingScreen() {
   const { trackClick } = useOmnigentAnalytics();
   const heading = useHeading();
   const poweredBy = usePoweredBy();
+  const fleetUi = useFleetUi();
   const serverUrl = getCliServerUrl();
 
   // Project driving this visit, when the sidebar's per-project "new session"
@@ -6203,9 +6205,9 @@ export function NewChatLandingScreen() {
           viewport edges on phones. */}
       <div className="flex min-h-0 w-full max-w-[800px] flex-col items-center px-4 pt-8 pb-[max(20px,env(safe-area-inset-bottom))] md:pb-16 md:select-none">
         <div className="mb-6 flex w-full flex-1 flex-col items-center justify-center gap-3.5 md:flex-none">
-          {/* AUTOMATON OS banner: ANSI-shadow blocks, grayscale, decorative.
+          {/* AUTOMATON OS banner (fleet look only): ANSI-shadow blocks, decorative.
               Shown on the plain landing only; a project landing keeps its icon. */}
-          {selectedProject ? null : (
+          {selectedProject || !fleetUi ? null : (
             <pre
               aria-hidden="true"
               data-testid="automaton-ascii-banner"

@@ -1,5 +1,7 @@
 import { useEffect, useRef } from "react";
 import { OttoIcon } from "@/components/icons/OttoIcon";
+import { DEFAULT_APP_NAME } from "@/lib/branding";
+import { FLEET_APP_NAME, useFleetUi } from "@/lib/fleetUi";
 
 // Eye geometry in the SVG's own viewBox coordinate system (0 0 1024 1024).
 // Each of Otto's eyes is a fixed near-circular white with a concentric pupil
@@ -183,7 +185,7 @@ function caretPointFor(field: HTMLElement): ScreenPoint | null {
 }
 
 /**
- * The AUTOMATON wolf mascot with eyes that track the cursor: each
+ * The Omnigent starfish mascot (Otto) with eyes that follow the cursor: each
  * black pupil slides to the inner edge of its white eye on the side nearest
  * whatever Otto is watching.
  *
@@ -207,6 +209,8 @@ function caretPointFor(field: HTMLElement): ScreenPoint | null {
  */
 export function OttoEyes({ className }: { className?: string }) {
   const svgRef = useRef<SVGSVGElement>(null);
+  const fleetUi = useFleetUi();
+  const productName = fleetUi ? FLEET_APP_NAME : DEFAULT_APP_NAME;
 
   useEffect(() => {
     const svg = svgRef.current;
@@ -378,7 +382,8 @@ export function OttoEyes({ className }: { className?: string }) {
       window.removeEventListener("resize", onCaretMaybeShifted);
       if (frame) cancelAnimationFrame(frame);
     };
-  }, []);
+    // Re-query the pupils when the look swaps the mascot's svg.
+  }, [fleetUi]);
 
   return (
     <OttoIcon
@@ -387,7 +392,7 @@ export function OttoEyes({ className }: { className?: string }) {
       // The hero mascot is meaningful (not decorative), so OttoIcon's
       // decorative aria-hidden default is overridden with image semantics.
       role="img"
-      aria-label="Automaton OS"
+      aria-label={productName}
       aria-hidden={false}
     />
   );

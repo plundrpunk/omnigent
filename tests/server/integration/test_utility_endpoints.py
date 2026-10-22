@@ -181,6 +181,26 @@ async def test_info_advertises_installable_harnesses_when_enabled(
     assert "codex-native" in data["installable_harnesses"]
 
 
+async def test_info_advertises_fleet_ui_switch(
+    app: FastAPI,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``fleet_ui`` is off by default and reports the app's resolved switch."""
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["fleet_ui"] is False
+    # Upstream servers omit the field, which reads as off.
+    del data["fleet_ui"]
+    assert ServerInfoResponse.model_validate(data).fleet_ui is False
+
+    monkeypatch.setattr(app.state, "fleet_ui", True)
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    assert resp.json()["fleet_ui"] is True
+
+
 # ── GET /v1/info: smart_routing_enabled ──────────────────
 #
 # The flag is the SPA's and the CLI's first gate: with it false, no Smart

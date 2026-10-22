@@ -100,6 +100,7 @@ import {
 } from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
+import { isFleetUiEnabled } from "@/lib/fleetUi";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { holdsInitialDraft, isTempConvId, useChatStore } from "@/store/chatStore";
 import { supportsSideChat } from "@/lib/sideChat";
@@ -914,16 +915,20 @@ function AppShellImpl() {
   // a one-entry list, not a dead end).
   const agentCount = childSessions.length + 1;
 
+  // Run (the Work Loop) is always present under the fleet look; otherwise
+  // only when the session has Work Loop data (a harness work receipt).
+  const fleetUi = isFleetUiEnabled(serverInfo);
+  const showRunTab = useChatStore(
+    (s) => fleetUi || s.blocks.some((block) => block.type === "work_receipt"),
+  );
+
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
   const railTabsAvailable = useMemo(
     () =>
       ({
-        // Run is the primary session object. It is always available and
-        // reports missing verifier evidence explicitly rather than hiding the
-        // gap behind the chat transcript.
-        run: true,
+        run: showRunTab,
         files: showFilesPanel,
         "content-search":
           showFilesPanel && isFeatureEnabled(serverInfo, "workspace_content_search"),
@@ -944,7 +949,7 @@ function AppShellImpl() {
         // rail's tab strip (see WorkspacePanel's TerminalTabsStrip / "+"
         // menu). Mobile keeps a shells drawer (see ``showShellsTab`` below).
       }) as const,
-    [showFilesPanel, serverInfo],
+    [showFilesPanel, serverInfo, showRunTab],
   );
   // Whether the rail has anything at all to show. When false the workspace
   // card doesn't mount and the header hides its collapse toggle — a
@@ -1283,6 +1288,7 @@ function AppShellImpl() {
       if (tab === null) return fallbackTab;
       if (tab === "sidechat") return tab;
       if (tab === "content-search" && serverInfo === "loading") return tab;
+      if (tab === "run" && serverInfo === "loading") return tab;
       if (railTabsAvailable[tab]) return tab;
       return fallbackTab;
     });
@@ -2593,18 +2599,22 @@ function AppShellImpl() {
                     rightRailTab={rightRailTab}
                     tabListRef={workspaceTabListRef}
                     onRightRailTabChange={handleRightRailTabChange}
-                    workLoop={{
-                      conversationId,
-                      sessionTitle: activeSession?.title ?? activeConv?.title ?? null,
-                      liveness,
-                      pendingApprovalCount: activeSession?.pendingElicitations?.length ?? 0,
-                      changedCount,
-                      agentCount,
-                      agentsWorking: subagentsWorking,
-                      showFilesPanel,
-                      onOpenFiles: () => handleRightRailTabChange("files"),
-                      onOpenAgents: () => handleRightRailTabChange("subagents"),
-                    }}
+                    workLoop={
+                      showRunTab
+                        ? {
+                            conversationId,
+                            sessionTitle: activeSession?.title ?? activeConv?.title ?? null,
+                            liveness,
+                            pendingApprovalCount: activeSession?.pendingElicitations?.length ?? 0,
+                            changedCount,
+                            agentCount,
+                            agentsWorking: subagentsWorking,
+                            showFilesPanel,
+                            onOpenFiles: () => handleRightRailTabChange("files"),
+                            onOpenAgents: () => handleRightRailTabChange("subagents"),
+                          }
+                        : undefined
+                    }
                     openPanels={openPanels}
                     onClosePanel={closeWorkspacePanel}
                     showFilesPanel={showFilesPanel}

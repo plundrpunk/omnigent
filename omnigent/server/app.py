@@ -89,6 +89,7 @@ from omnigent.server.background_session_titles import (
     RunnerBackgroundTitleGenerator,
 )
 from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
+from omnigent.server.fleet_ui import fleet_ui_enabled
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_gateway import McpGatewayBackend
@@ -232,6 +233,9 @@ class ServerInfoResponse(BaseModel):
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     branding: BrandingInfo
+    # Fork presentation switch (``OMNIGENT_FLEET_UI``): the SPA keeps upstream's
+    # look unless this is true. Absent on upstream servers, which read as off.
+    fleet_ui: bool = False
 
 
 def _resolve_extension_state(
@@ -1980,6 +1984,7 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    app.state.fleet_ui = fleet_ui_enabled()
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
     # strip) can prefix it themselves. "" for a root deployment.
@@ -3263,6 +3268,7 @@ def create_app(
                     "all_types": filesystem_attachment_policy.all_types,
                 },
                 "branding": branding_snapshot.config(),
+                "fleet_ui": app.state.fleet_ui,
             }
         )
 

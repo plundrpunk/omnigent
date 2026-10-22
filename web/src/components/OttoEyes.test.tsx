@@ -1,5 +1,7 @@
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { OttoEyes } from "./OttoEyes";
 
 afterEach(() => {
@@ -21,6 +23,20 @@ function transformOf(pupil: SVGGElement): { tx: number; ty: number } | null {
 }
 
 describe("OttoEyes", () => {
+  it("names the mascot Automaton OS and tracks the wolf's pupils under the fleet look", () => {
+    const { container } = render(
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, fleet_ui: true }}>
+        <OttoEyes />
+      </CapabilitiesProvider>,
+    );
+    const svg = container.querySelector("svg");
+    expect(svg).toHaveAttribute("aria-label", "Automaton OS");
+    expect(container.querySelector("#otto-wolf-aura")).not.toBeNull();
+    for (const pupil of container.querySelectorAll<SVGGElement>("g.otto-pupil")) {
+      expect(pupil.style.transition).toContain("transform");
+    }
+  });
+
   it("renders the mascot with image semantics", () => {
     const { container } = render(<OttoEyes className="h-18" />);
     const svg = container.querySelector("svg");
@@ -28,7 +44,7 @@ describe("OttoEyes", () => {
     // OttoIcon's decorative aria-hidden default; losing the override would
     // silently hide the brand image from screen readers.
     expect(svg).toHaveAttribute("role", "img");
-    expect(svg).toHaveAttribute("aria-label", "Automaton OS");
+    expect(svg).toHaveAttribute("aria-label", "Omnigent");
     expect(svg).toHaveAttribute("aria-hidden", "false");
     expect(svg).toHaveClass("h-18");
   });
