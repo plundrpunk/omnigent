@@ -16,6 +16,7 @@ import { SessionUpdatesProvider } from "./hooks/SessionUpdatesProvider";
 import { getBasePath, withBasePath } from "./lib/basePath";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
+import { documentBrandingFor } from "./lib/fleetUi";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
 import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
 import { isLoginRedirectPending, resolveIdentity, setSessionHostResolver } from "./lib/identity";
@@ -137,8 +138,8 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
   }, []);
   useEffect(() => {
     if (info === "loading") return;
-    if (info.branding?.app_name) document.title = info.branding.app_name;
-    const faviconUrl = info.branding?.logos.favicon;
+    const { title, faviconUrl } = documentBrandingFor(info);
+    if (title) document.title = title;
     if (!faviconUrl) return;
     let link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
     if (!link) {

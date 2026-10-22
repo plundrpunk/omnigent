@@ -7783,6 +7783,17 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull();
   });
 
+  it("shows the Automaton OS banner on the plain landing only under the fleet look", async () => {
+    const { unmount } = renderLanding();
+    await screen.findByTestId("new-chat-landing-input");
+    expect(screen.queryByTestId("automaton-ascii-banner")).toBeNull();
+    unmount();
+
+    renderLanding({ fleet_ui: true });
+    await screen.findByTestId("new-chat-landing-input");
+    expect(screen.getByTestId("automaton-ascii-banner")).toBeInTheDocument();
+  });
+
   it("sends the background-title opt-out header on direct session creation", async () => {
     localStorage.setItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY, "off");
     renderLanding();

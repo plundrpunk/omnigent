@@ -306,6 +306,7 @@ import { AppShell } from "./AppShell";
 import { useTerminalFirst } from "./TerminalFirstContext";
 import { useForkDialog } from "./ForkDialogContext";
 import { useChatStore } from "@/store/chatStore";
+import type { AnyBlock } from "@/lib/blocks";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
 
@@ -3045,11 +3046,12 @@ describe("Right workspace card visibility", () => {
     expect(second.parentElement).not.toHaveAttribute("data-workspace-panel-animate");
   });
 
-  it("keeps the card mounted with Run and Agents for a minimal agent", () => {
-    // A no-os_env agent (available: false) with no shells still has the
-    // unconditional Run and Agents tabs, so the card mounts, the pinned-page
-    // fallback lands on Agents, Run stays one click away, and Files/Shells
-    // are absent.
+  it("keeps the card mounted with Agents as the only tab for a minimal agent", () => {
+    // A no-os_env agent (available: false) with no shells
+    // still has the unconditional Agents tab (the panel lists at least
+    // the main agent), so the card mounts, the Agents tab is selected
+    // by the fallback, and Files/Shells are absent. An unmounted
+    // card here means the always-visible Agents rule regressed.
     useEnvironmentMock.mockReturnValue({
       data: { available: false, root: null, home: null },
       isLoading: false,
@@ -3061,9 +3063,52 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: /Files/i })).toBeNull();
     expect(screen.queryByRole("tab", { name: /Shells/i })).toBeNull();
+    // The tab-fallback effect lands on Agents (the only available tab).
     expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("tab", { name: /^Run$/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Collapse right panel" })).toBeInTheDocument();
+  });
+
+  it("adds the Run tab for every session under the fleet look", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+
+    renderShell("/c/conv_abc", serverInfo({ fleet_ui: true }));
+
+    expect(screen.getByRole("tab", { name: /^Run$/i })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Agents/i })).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("shows the Run tab without the fleet look once the session has a work receipt", () => {
+    useEnvironmentMock.mockReturnValue({
+      data: { available: false, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+
+    renderShell("/c/conv_abc", serverInfo());
+    expect(screen.queryByRole("tab", { name: /^Run$/i })).toBeNull();
+
+    try {
+      act(() => {
+        useChatStore.setState({
+          blocks: [
+            {
+              type: "work_receipt",
+              ctx: { agent: null, depth: 0, turn: 1, timestamp: 0, responseId: "r1", itemId: null },
+              receipt: { status: "completed" },
+            } as unknown as AnyBlock,
+          ],
+        });
+      });
+      expect(screen.getByRole("tab", { name: /^Run$/i })).toBeInTheDocument();
+    } finally {
+      act(() => {
+        useChatStore.setState({ blocks: [] });
+      });
+    }
   });
 
   it("starts collapsed for a fresh session (no stored open-state)", () => {

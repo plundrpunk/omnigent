@@ -1,17 +1,20 @@
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { OttoIcon } from "./OttoIcon";
+import { WolfIcon } from "./WolfIcon";
 
 afterEach(cleanup);
 
 describe("OttoIcon", () => {
   it("exposes four otto-eye groups for the blink animation", () => {
     const { container } = render(<OttoIcon />);
-    // The blink keyframes target `.otto-working .otto-eye` in index.css — a
-    // descendant selector, so nesting depth doesn't matter, but renaming the
-    // class would freeze the eyes with no other signal (CSS fails silently).
-    const eyes = container.querySelectorAll("svg g.otto-eye");
-    // 4 = Otto's two eyes + the buddy pup's two; dropping the buddy's
+    // The blink keyframes target `.otto-working .otto-eye` in index.css; CSS
+    // selectors fail silently, so renaming/flattening these groups would
+    // freeze the eyes with no other signal.
+    const eyes = container.querySelectorAll("svg > g.otto-eye");
+    // 4 = Otto's two eyes + the buddy starfish's two; dropping the buddy's
     // groups would leave it staring unblinking next to a blinking Otto.
     expect(eyes).toHaveLength(4);
     // 3 paths per eye = sclera + pupil + highlight; losing one shifts the
@@ -56,5 +59,40 @@ describe("OttoIcon", () => {
     // only works while the spread stays after the aria-hidden default.
     expect(svg).toHaveAttribute("aria-hidden", "false");
     expect(svg).toHaveAttribute("aria-label", "Omnigent");
+  });
+});
+
+describe("OttoIcon fleet look", () => {
+  it("renders the starfish unless the server selects the fleet look", () => {
+    const { container } = render(
+      <CapabilitiesProvider info={FALLBACK_SERVER_INFO}>
+        <OttoIcon />
+      </CapabilitiesProvider>,
+    );
+    expect(container.querySelector("#otto-wolf-aura")).toBeNull();
+  });
+
+  it("swaps in the wolf and forwards props when fleet_ui is on", () => {
+    const { container } = render(
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, fleet_ui: true }}>
+        <OttoIcon className="otto-working" />
+      </CapabilitiesProvider>,
+    );
+    expect(container.querySelector("#otto-wolf-aura")).not.toBeNull();
+    expect(container.querySelector("svg")).toHaveClass("otto-working");
+  });
+});
+
+describe("WolfIcon", () => {
+  it("keeps Otto's eye and pupil contract for the blink and cursor tracking", () => {
+    const { container } = render(<WolfIcon />);
+    // The wolf nests its eyes under the aura group, so match descendants.
+    const eyes = container.querySelectorAll("svg g.otto-eye");
+    expect(eyes).toHaveLength(4);
+    for (const eye of eyes) {
+      expect(eye.querySelectorAll("path, circle, ellipse").length).toBeGreaterThan(0);
+    }
+    expect(container.querySelectorAll("svg g.otto-eye > g.otto-pupil")).toHaveLength(2);
+    expect(container.querySelector("svg")).toHaveAttribute("viewBox", "0 0 1024 1024");
   });
 });

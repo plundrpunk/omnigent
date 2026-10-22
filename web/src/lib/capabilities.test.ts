@@ -176,6 +176,16 @@ describe("resolveServerInfo release features", () => {
   });
 });
 
+describe("resolveServerInfo fleet_ui", () => {
+  it("reads the fleet look switch", async () => {
+    expect((await probe({ fleet_ui: true })).fleet_ui).toBe(true);
+  });
+
+  it("keeps upstream's look for a server that omits it", async () => {
+    expect((await probe({})).fleet_ui).toBe(false);
+  });
+});
+
 describe("resolveServerInfo archive_worktree_cleanup", () => {
   it("reads the advertised capability", async () => {
     expect((await probe({ archive_worktree_cleanup: true })).archive_worktree_cleanup).toBe(true);

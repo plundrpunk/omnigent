@@ -238,6 +238,8 @@ export interface ServerInfo {
   filesystem_attachments?: FilesystemAttachmentsInfo | null;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
+  /** Fork fleet look (``OMNIGENT_FLEET_UI``); absent or false keeps upstream's look. */
+  fleet_ui?: boolean;
 }
 
 /** The server's filesystem attachment policy, as reported by ``/v1/info``. */
@@ -433,6 +435,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           agent_config_edit: data.agent_config_edit === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           branding: parseBranding(data.branding),
+          fleet_ui: data.fleet_ui === true,
         };
         return cachedServerInfo;
       }

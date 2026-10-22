@@ -181,6 +181,7 @@ import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import { isFleetUiEnabled } from "@/lib/fleetUi";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
@@ -694,6 +695,8 @@ function SidebarImpl({
   const branding = useBranding();
   const serverInfo = useServerInfo();
   const usagePageEnabled = isFeatureEnabled(serverInfo, "usage_page");
+  // The Advanced (Automaton OS pages) entry is part of the fleet look.
+  const advancedNavEnabled = isFleetUiEnabled(serverInfo);
   const canvasEnabled = isFeatureEnabled(serverInfo, "canvas");
   const [searchParams] = useSearchParams();
   const canvasDestination = canvasLocation(searchParams.get(CANVAS_QUERY_PARAM) ?? MAIN_CANVAS_ID);
@@ -1324,29 +1327,31 @@ function SidebarImpl({
                   </Link>
                 </Button>
               )}
-              <Button
-                asChild
-                variant="ghost"
-                className={cn(
-                  SIDEBAR_ROW,
-                  "w-full justify-start border-0 font-normal",
-                  SIDEBAR_HOVER_HIGHLIGHT,
-                  isAdvancedPage && SIDEBAR_ACTIVE_HIGHLIGHT,
-                )}
-                data-testid="advanced-button"
-              >
-                <Link to="/advanced" onClick={onNavClick} componentId="sidebar.advanced">
-                  <LayersIcon
-                    className={cn(
-                      "ui-icon",
-                      isAdvancedPage
-                        ? "text-[var(--sidebar-active-foreground)]"
-                        : "text-muted-foreground",
-                    )}
-                  />
-                  Advanced
-                </Link>
-              </Button>
+              {advancedNavEnabled && (
+                <Button
+                  asChild
+                  variant="ghost"
+                  className={cn(
+                    SIDEBAR_ROW,
+                    "w-full justify-start border-0 font-normal",
+                    SIDEBAR_HOVER_HIGHLIGHT,
+                    isAdvancedPage && SIDEBAR_ACTIVE_HIGHLIGHT,
+                  )}
+                  data-testid="advanced-button"
+                >
+                  <Link to="/advanced" onClick={onNavClick} componentId="sidebar.advanced">
+                    <LayersIcon
+                      className={cn(
+                        "ui-icon",
+                        isAdvancedPage
+                          ? "text-[var(--sidebar-active-foreground)]"
+                          : "text-muted-foreground",
+                      )}
+                    />
+                    Advanced
+                  </Link>
+                </Button>
+              )}
             </div>
 
             {/* Wrapper (not the `aside`) anchors the floating Settings button:
