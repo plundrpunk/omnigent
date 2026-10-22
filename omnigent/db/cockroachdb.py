@@ -319,7 +319,7 @@ def _initialize_or_verify_crdb_schema(engine: Engine, db_uri: str) -> None:
             _finish_crdb_bootstrap(engine, version)
         return
 
-    _verify_db_revision_is_supported(db_uri, current, head)
+    _verify_db_revision_is_supported(engine, db_uri, current, head)
     if not _crdb_revision_is_supported(db_uri, current, head):
         raise RuntimeError(
             f"CockroachDB schema revision {current!r} predates Omnigent's CRDB "

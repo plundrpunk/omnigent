@@ -39,7 +39,7 @@ def _type_check() -> tuple[str, bool]:
 def _replace_check(old_name: str, new_name: str, predicate: str) -> None:
     bind = op.get_bind()
     if bind.dialect.name == "cockroachdb" and old_name == new_name:
-        # Publish the drop before reusing its name; startup owns the transaction.
+        # Publish the drop before reusing its name; this makes the CRDB run non-atomic.
         with op.batch_alter_table("conversation_items") as batch_op:
             batch_op.drop_constraint(old_name, type_="check")
         bind.commit()
@@ -55,8 +55,8 @@ def _replace_check(old_name: str, new_name: str, predicate: str) -> None:
 def upgrade() -> None:
     """Admit work_receipt (code 12) in conversation_items.type."""
     name, admits_receipt = _type_check()
-    if not admits_receipt:
-        _replace_check(name, _RECEIPT_CHECK_NAME, _CODES_WITH_RECEIPT)
+    if not admits_receipt or name != _CHECK_NAME:
+        _replace_check(name, _CHECK_NAME, _CODES_WITH_RECEIPT)
 
 
 def downgrade() -> None:
