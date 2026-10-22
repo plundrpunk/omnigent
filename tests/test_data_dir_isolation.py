@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import subprocess
 import sys
 import textwrap
@@ -10,11 +11,80 @@ from importlib import import_module
 from pathlib import Path
 
 import httpx
+import keyring.errors
 import pytest
 
 from omnigent import cli
 from omnigent.host import local_server
+from omnigent.onboarding import harness_auth, provider_config, secrets
 from tests._helpers.live_server import isolated_local_server, isolated_process_env
+
+
+@pytest.mark.parametrize("config_override", [False, True])
+@pytest.mark.parametrize("keyring_unavailable", [False, True])
+def test_onboarding_config_and_secrets_with_inaccessible_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    config_override: bool,
+    keyring_unavailable: bool,
+) -> None:
+    home = tmp_path / "inaccessible-home"
+    home.mkdir()
+    state = tmp_path / "state"
+    config_dir = tmp_path / "config-override" if config_override else state
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
+    monkeypatch.delenv("OMNIGENT_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG", raising=False)
+    if config_override:
+        monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_dir))
+    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "0" if keyring_unavailable else "1")
+
+    def unavailable_keyring(*args: object) -> None:
+        if not keyring_unavailable:
+            pytest.fail("Disabled keyring must not be accessed")
+        raise keyring.errors.KeyringError("test backend unavailable")
+
+    for method in ("set_password", "get_password", "delete_password"):
+        monkeypatch.setattr(keyring, method, unavailable_keyring)
+
+    home.chmod(0o000)
+    try:
+        load, save = harness_auth._config_writer()
+        assert load() == {}
+        assert provider_config._config_path() == str(config_dir / "config.yaml")
+        secrets.store_secret("isolated", "test-provider-key")
+        settings = provider_config.provider_entry_settings(
+            "isolated",
+            {
+                "kind": "key",
+                "openai": {
+                    "base_url": "https://provider.example.test/v1",
+                    "api_key_ref": "keychain:isolated",
+                },
+            },
+            make_default=True,
+        )
+        save(settings, deep_merge_providers=True)
+        save({"host": {"name": "isolated-host"}}, deep_merge_providers=False)
+        config = load()
+        assert config["providers"] == settings["providers"]
+        assert config["host"] == {"name": "isolated-host"}
+        provider = provider_config.load_providers(config)["isolated"]
+        assert provider.family("openai").api_key == "test-provider-key"
+        assert (config_dir / "config.yaml").is_file()
+        secret_file = config_dir / "secrets.json"
+        assert stat.S_IMODE(secret_file.stat().st_mode) == 0o600
+        secret_file.chmod(0o644)
+        secrets.store_secret("other", "test-other-key")
+        assert stat.S_IMODE(secret_file.stat().st_mode) == 0o600
+        secrets.delete_secret("isolated")
+        assert secrets._read_secrets_file() == {"other": "test-other-key"}
+        if config_override:
+            assert not state.exists()
+    finally:
+        home.chmod(0o700)
+    assert not list(home.iterdir())
 
 
 @pytest.mark.parametrize("override", ["OMNIGENT_DATA_DIR", "OMNIGENT_CONFIG_HOME"])
@@ -104,6 +174,8 @@ def test_server_and_cli_start_with_inaccessible_home(
         ("cli", "_GLOBAL_CONFIG_PATH", "config.yaml"),
         ("cli", "_GLOBAL_AGENTS_DIR", "agents"),
         ("config", "global_config_path", "config.yaml"),
+        ("onboarding.providers", "_catalog_cache_root", "model-catalog"),
+        ("inner.egress.ca", "_default_cache_dir", "egress"),
         ("host.identity", "CONFIG_PATH", "config.yaml"),
         ("host.local_server", "_local_data_dir", "."),
         ("install_ledger", "state_dir", "."),

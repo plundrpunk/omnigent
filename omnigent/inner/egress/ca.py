@@ -19,11 +19,19 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
+from omnigent.process_logging import DATA_DIR_ENV_VAR, data_dir
+
 logger = logging.getLogger(__name__)
 
-_DEFAULT_CACHE_DIR = os.path.expanduser("~/.cache/omnigent-egress")
 _CA_VALIDITY_DAYS = 365
 _CA_KEY_SIZE = 2048
+
+
+def _default_cache_dir() -> Path:
+    """Honor runtime isolation while preserving the legacy cache default."""
+    if os.environ.get(DATA_DIR_ENV_VAR):
+        return data_dir() / "egress"
+    return Path.home() / ".cache" / "omnigent-egress"
 
 
 def ensure_ca(cache_dir: Path | None = None) -> tuple[Path, Path]:
@@ -35,7 +43,7 @@ def ensure_ca(cache_dir: Path | None = None) -> tuple[Path, Path]:
         ``~/.cache/omnigent-egress``.
     :returns: Tuple of ``(cert_path, key_path)`` as absolute :class:`Path`.
     """
-    cache = cache_dir or Path(_DEFAULT_CACHE_DIR)
+    cache = cache_dir or _default_cache_dir()
     cache.mkdir(parents=True, exist_ok=True)
 
     cert_path = cache / "ca.pem"
@@ -65,7 +73,7 @@ def ensure_ca_bundle(
         store).
     :returns: Path to the combined bundle file.
     """
-    cache = cache_dir or Path(_DEFAULT_CACHE_DIR)
+    cache = cache_dir or _default_cache_dir()
     cache.mkdir(parents=True, exist_ok=True)
     bundle_path = cache / "ca-bundle.pem"
 

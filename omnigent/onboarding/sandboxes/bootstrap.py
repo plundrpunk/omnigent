@@ -619,13 +619,14 @@ def set_sandbox_host_name(launcher: SandboxLauncher, sandbox_id: str, host_name:
     :param host_name: New host name to write into config.yaml.
     :raises click.ClickException: If the remote command fails.
     """
-    click.echo(f"  → setting host name to '{host_name}' in ~/.omnigent/config.yaml")
+    click.echo(f"  → setting host name to '{host_name}' in the sandbox's global config")
     # Quote the host name in single quotes for the python literal,
     # then escape any single quotes the user passed in.
     safe_name = host_name.replace("'", "\\'")
     py = (
         "import os, uuid, yaml; "
-        "p=os.path.expanduser('~/.omnigent/config.yaml'); "
+        "from omnigent.config import global_config_path; "
+        "p=str(global_config_path()); "
         "os.makedirs(os.path.dirname(p), exist_ok=True); "
         "cfg=yaml.safe_load(open(p)) if os.path.exists(p) else {}; "
         "cfg=cfg or {}; "

@@ -163,6 +163,10 @@ def _catalog_now() -> float:
 
 def _catalog_cache_root() -> Path:
     """Return the platform user-cache directory for model catalogs."""
+    from omnigent.process_logging import DATA_DIR_ENV_VAR, data_dir
+
+    if os.environ.get(DATA_DIR_ENV_VAR):
+        return data_dir() / "model-catalog"
     home = Path.home()
     if sys.platform == "darwin":
         return home / "Library" / "Caches" / "Omnigent" / "model-catalog"

@@ -6,6 +6,7 @@ import datetime
 import ssl
 from pathlib import Path
 
+import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -13,6 +14,28 @@ from cryptography.x509.oid import NameOID
 
 from omnigent.inner.egress import ca as ca_module
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
+
+
+@pytest.mark.parametrize("explicit_cache", [False, True])
+def test_ca_and_bundle_use_isolated_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, explicit_cache: bool
+) -> None:
+    state = tmp_path / "state"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
+
+    def forbidden_home() -> Path:
+        pytest.fail("Isolated CA storage must not resolve HOME")
+
+    monkeypatch.setattr(Path, "home", forbidden_home)
+    cache = tmp_path / "explicit" if explicit_cache else None
+    expected = cache or state / "egress"
+    cert, key = ensure_ca(cache_dir=cache)
+    bundle = ensure_ca_bundle(cert, cache_dir=cache)
+    assert cert.parent == key.parent == bundle.parent == expected
+    assert cert.read_bytes() in bundle.read_bytes()
+    assert key.stat().st_mode & 0o777 == 0o600
+    if explicit_cache:
+        assert not state.exists()
 
 
 def test_ensure_ca_generates_new_ca(tmp_path: Path) -> None:

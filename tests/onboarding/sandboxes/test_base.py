@@ -377,6 +377,7 @@ def _run_write_command(
     """Run the rendered write command through a real shell + python3."""
     env = {**os.environ, "HOME": str(home)}
     env.pop("OMNIGENT_CONFIG_HOME", None)
+    env.pop("OMNIGENT_DATA_DIR", None)
     if config_home is not None:
         env["OMNIGENT_CONFIG_HOME"] = str(config_home)
     if extra_env is not None:
@@ -406,23 +407,29 @@ def test_render_host_config_write_command_creates_config_from_scratch(tmp_path: 
     assert written == _GATEWAY_HOST_CONFIG
 
 
-def test_render_host_config_write_command_honors_omnigent_config_home(
+@pytest.mark.parametrize("config_override", [False, True])
+def test_render_host_config_write_command_honors_isolated_directories(
     tmp_path: Path,
+    config_override: bool,
 ) -> None:
-    """The writer uses OMNIGENT_CONFIG_HOME as the config directory itself."""
+    """Config-home overrides data-dir; otherwise data-dir isolates both files."""
     home = tmp_path / "home"
     home.mkdir()
     config_home = tmp_path / "custom-config"
-
-    written = _materialize(
+    state = tmp_path / "state"
+    config_dir = config_home if config_override else state
+    _run_write_command(
         render_host_config_write_command(_GATEWAY_HOST_CONFIG),
         home,
-        config_home=config_home,
+        config_home=config_home if config_override else None,
+        extra_env={"OMNIGENT_DATA_DIR": str(state)},
     )
-
+    written = yaml.safe_load((config_dir / "config.yaml").read_text())
     assert written == _GATEWAY_HOST_CONFIG
-    assert (config_home / ".injected_host_config.json").exists()
+    assert (config_dir / ".injected_host_config.json").exists()
     assert not (home / ".omnigent").exists()
+    if config_override:
+        assert not state.exists()
 
 
 def test_render_host_config_write_command_merges_providers_and_replaces_other_keys(
