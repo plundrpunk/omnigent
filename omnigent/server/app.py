@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
 from fastapi import FastAPI, Query, Request
-from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -78,7 +77,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
-from omnigent.server.api_errors import register_api_error_handlers
+from omnigent.server.api_errors import register_api_error_handlers, validation_error_response
 from omnigent.server.auth import (
     AuthProvider,
     SharingMode,
@@ -2484,13 +2483,15 @@ def create_app(
         request: Request,
         exc: RequestValidationError,
     ) -> JSONResponse:
-        """Attribute schema-validation rejections, then return the stock 422 body.
+        """Attribute schema-validation rejections, then return the API error envelope.
 
         A schema/transport-invalid request is caller-side input (category=user),
         and it rejects one request without harming the session (impact=benign).
         Attribution rides the per-request audit row rather than a dedicated
-        ERROR/WARN line; the response is delegated to FastAPI's default handler
-        so the 422 shape is unchanged.
+        ERROR/WARN line. The body comes from the fleet's api_errors handler —
+        ``{"error": ..., "detail": [...]}`` with FastAPI's ``detail`` list minus
+        the submitted ``input`` values — which this later registration would
+        otherwise replace with the stock 422 body.
         """
         # Attribute on the per-request audit row, not the ERROR stream: a schema
         # rejection is expected, low-signal caller input, so it should be
@@ -2502,7 +2503,7 @@ def create_app(
             error_impact=ErrorImpact.BENIGN.value,
             error_phase=ErrorPhase.REQUEST.value,
         )
-        return await request_validation_exception_handler(request, exc)
+        return await validation_error_response(request, exc)
 
     @app.exception_handler(ConversationNotFoundError)
     async def _handle_conversation_not_found(

@@ -48,7 +48,14 @@ async def _http_error(request: Request, exc: Exception) -> JSONResponse:
         error = detail["error"]
         if isinstance(error.get("code"), str) and isinstance(error.get("message"), str):
             code, detail = error["code"], error["message"]
-    message = detail if isinstance(detail, str) else json.dumps(detail)
+    if _is_validation_error_list(detail):
+        # Routes that re-raise pydantic errors as HTTPException (e.g. session
+        # create) get the same treatment as RequestValidationError: a readable
+        # message and no echo of the submitted input.
+        message = _validation_message(detail)
+        raw_detail = _strip_input(detail)
+    else:
+        message = detail if isinstance(detail, str) else json.dumps(detail)
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": {"code": code, "message": message}, "detail": raw_detail},
@@ -56,19 +63,39 @@ async def _http_error(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
-async def _validation_error(request: Request, exc: Exception) -> JSONResponse:
+def _is_validation_error_list(detail: Any) -> bool:
+    """Whether ``detail`` is a pydantic/FastAPI-style list of error dicts."""
+    return (
+        isinstance(detail, list)
+        and len(detail) > 0
+        and all(isinstance(e, dict) and "loc" in e and "msg" in e for e in detail)
+    )
+
+
+def _validation_message(errors: Any) -> str:
+    """Render ``loc: msg`` pairs; an empty loc (model-level error) is just ``msg``."""
+    parts = []
+    for error in errors:
+        loc = ".".join(str(part) for part in error["loc"])
+        parts.append(f"{loc}: {error['msg']}" if loc else str(error["msg"]))
+    return "; ".join(parts)
+
+
+def _strip_input(errors: Any) -> list[dict[str, Any]]:
+    """FastAPI's default error shape minus the submitted ``input`` values."""
+    return [
+        {"loc": list(error["loc"]), "msg": error["msg"], "type": error.get("type")}
+        for error in errors
+    ]
+
+
+async def validation_error_response(request: Request, exc: Exception) -> JSONResponse:
     """Report field locations and reasons without echoing submitted input."""
     del request
     if not isinstance(exc, RequestValidationError):
         raise exc
-    message = "; ".join(
-        f"{'.'.join(str(part) for part in error['loc'])}: {error['msg']}" for error in exc.errors()
-    )
-    # FastAPI's default shape minus the submitted ``input`` values.
-    detail = [
-        {"loc": list(error["loc"]), "msg": error["msg"], "type": error["type"]}
-        for error in exc.errors()
-    ]
+    message = _validation_message(exc.errors())
+    detail = _strip_input(exc.errors())
     return JSONResponse(
         status_code=422,
         content={"error": {"code": ErrorCode.INVALID_INPUT, "message": message}, "detail": detail},
@@ -78,7 +105,7 @@ async def _validation_error(request: Request, exc: Exception) -> JSONResponse:
 def register_api_error_handlers(app: FastAPI) -> None:
     """Install before adding routes so runtime and OpenAPI agree on errors."""
     app.add_exception_handler(HTTPException, _http_error)
-    app.add_exception_handler(RequestValidationError, _validation_error)
+    app.add_exception_handler(RequestValidationError, validation_error_response)
     app.router.responses.update(
         {
             "default": {"model": APIErrorResponse, "description": "API error"},

@@ -777,12 +777,14 @@ async def test_managed_session_create_validator_errors_serialize_as_422(
     body = resp.json()
     error = body["error"]
     assert error["code"] == "invalid_input"
-    assert "takes a git repository URL" in error["message"]
+    assert "git repository URL" in error["message"]
     detail = body["detail"]
     # The list-of-errors shape with a human-readable msg is what
     # describeCreateError picks the message from.
     assert isinstance(detail, list) and len(detail) == 1
     assert "git repository URL" in detail[0]["msg"]
+    # The envelope never echoes the submitted request body back.
+    assert "input" not in detail[0]
 
 
 async def test_managed_session_create_rejects_unconfigured_provider(

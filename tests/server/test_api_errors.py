@@ -79,6 +79,35 @@ async def test_structured_http_error_details(app: FastAPI, detail: dict, expecte
 
 
 @pytest.mark.asyncio
+async def test_http_error_with_validation_list_hides_input(app: FastAPI) -> None:
+    """A route re-raising pydantic errors as HTTPException must not echo input."""
+
+    @app.post("/v1/test-error")
+    async def fail() -> None:
+        raise HTTPException(
+            422,
+            [
+                {"type": "value_error", "loc": [], "msg": "Value error, bad", "input": "secret"},
+                {"type": "int_parsing", "loc": ["body", "count"], "msg": "bad int", "input": "x"},
+            ],
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post("/v1/test-error")
+    assert response.status_code == 422
+    assert response.json() == {
+        "error": {"code": "invalid_input", "message": "Value error, bad; body.count: bad int"},
+        "detail": [
+            {"loc": [], "msg": "Value error, bad", "type": "value_error"},
+            {"loc": ["body", "count"], "msg": "bad int", "type": "int_parsing"},
+        ],
+    }
+    assert "secret" not in response.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", [200, 201, 202])
 async def test_successful_model_responses_unchanged(app: FastAPI, status: int) -> None:
     @app.post("/v1/test-success", status_code=status, response_model=_Input)
