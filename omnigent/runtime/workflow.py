@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
 
+from omnigent.config import global_config_path
+
 if TYPE_CHECKING:
     # Lazy: PolicyEngine + PolicyResult are pulled in at runtime via
     # the function-local imports inside ``_handle_policy_ask`` and
@@ -2011,12 +2013,7 @@ def _load_global_auth() -> ApiKeyAuth | DatabricksAuth | None:
         ``None`` when the global config has no ``auth:`` block or the
         file is missing.
     """
-    config_home = os.environ.get("OMNIGENT_CONFIG_HOME")
-    path = (
-        Path(config_home) / "config.yaml"
-        if config_home
-        else Path.home() / ".omnigent" / "config.yaml"
-    )
+    path = global_config_path()
     if not path.exists():
         return None
     try:

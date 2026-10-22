@@ -19,9 +19,10 @@ import yaml
 
 from omnigent.config import global_config_path
 from omnigent.host import identity_env
+from omnigent.process_logging import data_dir
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
 
-CONFIG_PATH = Path.home() / ".omnigent" / "config.yaml"
+CONFIG_PATH = data_dir() / "config.yaml"
 
 # The HOST_ID / HOST_NAME / HOST_TOKEN env-var names live in the dependency-free
 # leaf module omnigent.host.identity_env so the warm-pool readiness probe can

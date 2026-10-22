@@ -13,6 +13,8 @@ import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
+from omnigent.process_logging import data_dir
+
 RUNNER_ID_ENV_VAR = "OMNIGENT_RUNNER_ID"
 RUNNER_PARENT_PID_ENV_VAR = "OMNIGENT_RUNNER_PARENT_PID"
 # Host-launched runners delegate machine-global stale-process cleanup to the
@@ -217,7 +219,7 @@ def load_or_create_runner_id(path: Path) -> str:
     """Load a runner id from *path*, creating one if needed.
 
     :param path: Path to the runner id cache file, e.g.
-        ``Path.home() / ".omnigent" / "runners" / "runner_id"``.
+        ``data_dir() / "runners" / "runner_id"``.
     :returns: The cached or newly-created runner id.
     :raises RuntimeError: If the cache file exists but is empty.
     """
@@ -237,4 +239,4 @@ def _default_runner_id_path() -> Path:
 
     :returns: ``~/.omnigent/runners/runner_id``.
     """
-    return Path.home() / ".omnigent" / "runners" / "runner_id"
+    return data_dir() / "runners" / "runner_id"

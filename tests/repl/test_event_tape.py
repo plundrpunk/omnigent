@@ -538,21 +538,20 @@ def test_open_event_log_creates_file(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``open_event_log`` creates the debug directory and returns a valid path."""
-    # Redirect HOME so we don't pollute the real ~/.omnigent/debug/.
-    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
 
     path = open_event_log("sess_abc123")
 
     assert path.parent.exists(), "Debug directory should be created."
     assert path.name == "events-sess_abc123.jsonl"
-    assert str(tmp_path) in str(path)
+    assert path.parent == tmp_path / "debug"
 
 
 def test_open_event_log_sanitizes_id(
     tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``open_event_log`` replaces unsafe characters in the session id."""
-    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
 
     path = open_event_log("sess/../../etc/passwd")
 

@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent.native import native_bridge_common
+from omnigent.process_logging import data_dir
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
@@ -35,7 +36,7 @@ _STATE_FILE = "state.json"
 # the tmux/TUI section at the end of this module). Written by the runner after
 # the agy terminal launches; read by the executor's first-turn bootstrap.
 _TMUX_FILE = "tmux.json"
-_BRIDGE_ROOT = Path.home() / ".omnigent" / "antigravity-native"
+_BRIDGE_ROOT = data_dir() / "antigravity-native"
 
 # Prefix of the launcher-minted placeholder conversation id (see
 # ``antigravity_native._mint_agy_conversation_id``). agy mints its own real

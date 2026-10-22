@@ -36,6 +36,7 @@ from omnigent.inner import _proc
 from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
+    data_dir,
     open_process_log_file,
 )
 
@@ -96,10 +97,7 @@ def _local_data_dir() -> Path:
 
     :returns: The data directory path (callers create it lazily).
     """
-    value = os.environ.get("OMNIGENT_DATA_DIR")
-    if value:
-        return Path(value).expanduser()
-    return Path.home() / ".omnigent"
+    return data_dir()
 
 
 # Pidfile carrying the background local server's PID + port (two lines).

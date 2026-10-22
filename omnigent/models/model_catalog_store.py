@@ -28,6 +28,8 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from omnigent.process_logging import data_dir
+
 _logger = logging.getLogger(__name__)
 
 
@@ -87,10 +89,7 @@ def _data_dir() -> Path:
 
     :returns: ``$OMNIGENT_DATA_DIR`` when set, else ``~/.omnigent``.
     """
-    value = os.environ.get("OMNIGENT_DATA_DIR")
-    if value:
-        return Path(value).expanduser()
-    return Path.home() / ".omnigent"
+    return data_dir()
 
 
 def catalog_path(harness: str, fingerprint: str) -> Path:

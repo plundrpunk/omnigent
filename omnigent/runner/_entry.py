@@ -30,6 +30,7 @@ import httpx
 from fastapi import FastAPI
 
 from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
+from omnigent.config import global_config_path
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
@@ -54,7 +55,6 @@ _RUNNER_PREWARM_SPEC_PATH_ENV_VAR = "RUNNER_PREWARM_SPEC_PATH"
 # The runner advertises the omnigent version it is actually running (shared
 # with the CLI/server/host) instead of a hard-coded placeholder.
 _RUNNER_VERSION = VERSION
-_RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
 _DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
 _AUTH_DISCOVERY_RETRY_INTERVAL_S = 5.0
@@ -149,10 +149,7 @@ def _runner_config_path() -> Path:
 
     :returns: Config path, e.g. ``Path("~/.omnigent/config.yaml")``.
     """
-    config_home = os.environ.get(_RUNNER_CONFIG_HOME_ENV_VAR)
-    if config_home:
-        return Path(config_home).expanduser() / "config.yaml"
-    return Path.home() / ".omnigent" / "config.yaml"
+    return global_config_path().expanduser()
 
 
 def _load_runner_idle_timeout_s_from_config() -> float:

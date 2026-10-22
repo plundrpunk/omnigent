@@ -209,6 +209,8 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
+    probe_root = tmp_path / "isolated-data"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(probe_root))
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     monkeypatch.setattr(
         codex_native_app_server,
@@ -318,7 +320,7 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
     env = captured["env"]
     assert isinstance(env, dict)
     assert env["DATABRICKS_HOST"] == "https://ws.example"
-    assert str(tmp_path / ".omnigent" / "cache" / "codex-model-probe") in env["CODEX_HOME"]
+    assert Path(env["CODEX_HOME"]).parent == probe_root / "cache" / "codex-model-probe"
     assert Path(env["CODEX_HOME"]).is_dir()
 
 

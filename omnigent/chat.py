@@ -73,6 +73,7 @@ from omnigent.native.native_dispatch import resolve_hook_for_key
 from omnigent.process_logging import (
     PROCESS_LOG_FILE_ENV_VAR,
     child_logging_popen_kwargs,
+    data_dir,
     logs_root,
     open_process_log_file,
     process_log_dir_reference,
@@ -3835,8 +3836,7 @@ def _omnigent_persistent_dir() -> Path:
         guaranteed to exist along with the ``artifacts/``
         subdir.
     """
-    override = os.environ.get("OMNIGENT_DATA_DIR")
-    ap_dir = Path(override).expanduser() if override else Path.home() / ".omnigent"
+    ap_dir = data_dir()
     ap_dir.mkdir(parents=True, exist_ok=True)
     (ap_dir / "artifacts").mkdir(exist_ok=True)
     return ap_dir

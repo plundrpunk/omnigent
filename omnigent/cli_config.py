@@ -37,6 +37,7 @@ from omnigent.onboarding.ucode_setup import (
     find_ucode_command,
     model_gateway_workspace_urls,
 )
+from omnigent.process_logging import data_dir
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
 if TYPE_CHECKING:
@@ -238,8 +239,8 @@ def _isolated_databricks_cfg() -> collections.abc.Generator[None, None, None]:
         if orig_cfg.has_section(spec.name):
             cfg[spec.name] = dict(orig_cfg[spec.name])
 
-    omnigent_dir = Path.home() / ".omnigent"
-    omnigent_dir.mkdir(exist_ok=True)
+    omnigent_dir = data_dir()
+    omnigent_dir.mkdir(parents=True, exist_ok=True)
     tmp_fd, tmp_name = tempfile.mkstemp(
         prefix="databrickscfg-setup-",
         dir=omnigent_dir,
