@@ -11,7 +11,7 @@ import click
 import httpx
 import pytest
 
-from omnigent import pi_native as pi
+from omnigent.harnesses.pi_native import main as pi
 
 
 @pytest.fixture
@@ -389,9 +389,13 @@ def test_resume_picker_filters_sdk_conversations_to_pi(monkeypatch):
         == "picked"
     )
     factory.assert_called_once_with(base_url="http://server", headers=None)
-    picker.assert_awaited_once_with(
-        client, wrapper_value=pi._WRAPPER_LABEL_VALUE, agent_name="pi-native-ui"
-    )
+    picker.assert_awaited_once()
+    args, kwargs = picker.await_args
+    assert args == (client,)
+    # Upstream also scopes the picker to this machine's host id.
+    assert kwargs["wrapper_value"] == pi._WRAPPER_LABEL_VALUE
+    assert kwargs["agent_name"] == "pi-native-ui"
+    assert "host_id" in kwargs
 
 
 def test_bridge_directory_uses_shared_session_mapping(monkeypatch):
