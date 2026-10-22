@@ -13,7 +13,7 @@ from sqlalchemy.engine import Engine
 from omnigent.db.enum_codecs import ITEM_TYPE
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
 
-_PRE_REVISION = "e5d9bc8ac650"
+_PRE_REVISION = "nf12ab34cd56"
 
 
 @pytest.fixture

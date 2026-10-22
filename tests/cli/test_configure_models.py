@@ -38,10 +38,10 @@ load-bearing behavior — it has dedicated coverage below.
 from __future__ import annotations
 
 import os
+import tomllib
 from unittest.mock import Mock
 
 import pytest
-import tomllib
 import yaml
 from click.testing import CliRunner
 
@@ -618,11 +618,12 @@ def test_add_menu_options_ordering() -> None:
         "AWS Bedrock — API key",
     ]
 
-    # Gemini (antigravity) scoped: API key only — Gemini is key-only (no
-    # subscription/gateway/Databricks), and it must NOT appear in the
-    # openai-family "Other provider" catch-all (asserted via `codex` above).
     gemini = [o.label.split(None, 1)[1] for o in add_menu_options_for_family(GEMINI_FAMILY)]
-    assert gemini == ["Gemini — API key"]
+    assert gemini == [
+        "Gemini — API key",
+        "Gemini API gateway — URL + key",
+        "Databricks — profile",
+    ]
 
 
 def test_add_menu_databricks_option_gated_on_extra(monkeypatch) -> None:
@@ -656,7 +657,7 @@ def test_add_menu_databricks_option_gated_on_extra(monkeypatch) -> None:
     monkeypatch.undo()
     options = add_menu_options()
     databricks = next(o for o in options if o.label.endswith("Databricks — workspace"))
-    assert "Unity AI Gateway" in databricks.description
+    assert "Unity Gateway" in databricks.description
 
 
 def test_configure_models_add_databricks_aborts_without_extra(
@@ -714,7 +715,7 @@ def test_configure_models_add_databricks_aborts_without_extra(
         ("key", "openai", None, "OpenAI API Key"),
         ("databricks", "databricks", "oss", "Databricks (oss)"),
         ("databricks", "databricks", None, "Databricks"),
-        ("gateway", "my-proxy", None, "My-Proxy"),  # display-name fallback
+        ("gateway", "my-proxy", None, "My-Proxy"),
     ],
 )
 def test_credential_label_by_kind(
@@ -729,6 +730,24 @@ def test_credential_label_by_kind(
     disagree — the exact inconsistency the shared helper was added to fix.
     """
     assert credential_label(kind, name, profile=profile) == expected
+
+
+@pytest.mark.parametrize("family", ["anthropic", "openai", "gemini"])
+def test_gateway_label_preserves_spelling_only_for_gemini(family):
+    from omnigent.cli_config import _family_credential_label
+
+    config = {
+        "providers": {
+            "my-proxy": {
+                "kind": "gateway",
+                family: {"base_url": "https://gateway.example", "api_key": "fake"},
+            }
+        }
+    }
+    entry = load_providers(config)["my-proxy"]
+    assert _family_credential_label(config, family, "my-proxy", entry) == (
+        "my-proxy" if family == "gemini" else "My-Proxy"
+    )
 
 
 @pytest.mark.parametrize("kind", ["key", "subscription", "gateway", "databricks", "local"])
@@ -945,6 +964,30 @@ def test_remove_databricks_cleans_ucode_wiring_without_asking(isolated_config) -
     assert not (codex_dir / "ucode.config.toml").exists()
 
 
+def test_remove_databricks_gemini_preserves_other_harness_wiring(isolated_config) -> None:
+    (isolated_config / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "agy-db": {"kind": "databricks", "profile": "test", "native_gemini": True}
+                }
+            }
+        )
+    )
+    codex_dir = isolated_config / ".codex"
+    codex_dir.mkdir()
+    wiring = codex_dir / "ucode.config.toml"
+    wiring.write_text('model_provider = "ucode-databricks"\n')
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--no-internal-beta"],
+        input="\n".join(["7", "3", "1", "2", "q", "q", "q"]) + "\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "agy-db" not in _config_yaml(isolated_config).get("providers", {})
+    assert wiring.read_text() == 'model_provider = "ucode-databricks"\n'
+
+
 def test_remove_databricks_without_ucode_wiring_still_removes(isolated_config) -> None:
     """Remove works when no ucode wiring exists on the machine.
 
@@ -999,6 +1042,51 @@ def test_render_listing_excludes_configured_subscription_clis(
     # …while an unrelated ambient detection still surfaces as a hint.
     assert "Detected (not configured)" in out
     assert "gemini" in out
+
+
+@pytest.mark.parametrize(
+    ("auth_json", "expected_note", "forbidden_note"),
+    [
+        # An apikey-mode login must name its real auth mode on the row.
+        (
+            '{"auth_mode": "apikey", "OPENAI_API_KEY": "sk-dead-key"}',
+            "API key login",
+            None,
+        ),
+        # A real ChatGPT-plan login stays a plain subscription row.
+        (
+            '{"tokens": {"access_token": "at-real", "refresh_token": "rt-real"}}',
+            "via codex CLI",
+            "API key login",
+        ),
+    ],
+)
+def test_config_list_names_codex_effective_auth_mode(
+    isolated_config,
+    auth_json: str,
+    expected_note: str,
+    forbidden_note: str | None,
+) -> None:
+    """The codex subscription row reflects the login's effective auth mode.
+
+    ``codex`` itself reports ``auth_mode: apikey`` for an API-key-backed
+    ``auth.json``; a listing that says only "subscription" for it sends a
+    quota diagnosis at the wrong credential (the plan looks healthy while the
+    dead API key is the problem). Failure means the row's auth summary no
+    longer discriminates the modes.
+    """
+    codex_dir = os.path.join(isolated_config, ".codex")
+    os.makedirs(codex_dir)
+    with open(os.path.join(codex_dir, "auth.json"), "w") as f:
+        f.write(auth_json)
+    _seed_config(isolated_config, {"codex": {"kind": "subscription", "cli": "codex"}})
+
+    result = CliRunner().invoke(cli, ["config", "list"])
+    assert result.exit_code == 0, result.output
+    assert "subscription" in result.output
+    assert expected_note in result.output, result.output
+    if forbidden_note is not None:
+        assert forbidden_note not in result.output, result.output
 
 
 def _seed_config(config_home, providers: dict[str, object]) -> None:
@@ -1699,10 +1787,14 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Antigravity",
         "Qwen Code",
         "Goose",
-        # Builtin ACP CLI rows (ACP_CLI_HARNESSES) render after Goose, the other
-        # ACP-family builtin, sorted by id, before the non-ACP harnesses.
+        # Devin's NATIVE row (devin-native) renders in the slot its former builtin
+        # ACP row held. The ACP harness is deprecated: it stays resolvable via
+        # `--harness devin-acp` but is no longer offered here, so native Devin is
+        # the sole "Devin" row. The remaining builtin ACP CLI rows follow, sorted
+        # by id, before the non-ACP harnesses.
         "Devin",
         "Grok Build",
+        "Jcode",
         "Copilot",
         "Kiro",
         "Kimi Code",
@@ -1765,35 +1857,41 @@ def test_overview_shows_one_row_when_acp_agent_shadows_builtin(
 ) -> None:
     """A configured agent named after a builtin ACP row replaces it, not doubles it.
 
-    "Devin" slugifies to ``devin``, which is also an ``ACP_CLI_HARNESSES`` id, so
+    "Grok" slugifies to ``grok``, which is also an ``ACP_CLI_HARNESSES`` id, so
     both sources want a row. The configured one wins — it names the exact command,
     which the fixed row argv cannot express — and the builtin is dropped so the
-    list never shows two identically labeled "Devin" rows from different sources.
+    list never shows two identically labeled rows from different sources.
+
+    Devin is the contrast: its ACP row is keyed ``devin-acp`` and the bare
+    ``devin`` spelling belongs to the native wrap, so a configured ``acp:devin``
+    agent adds its own row rather than shadowing either.
     """
     from rich.text import Text
 
     config_path = os.path.join(isolated_config, "config.yaml")
     with open(config_path, "w") as f:
         yaml.safe_dump(
-            {
-                "acp": {
-                    "agents": [{"name": "Devin", "command": "devin acp --model swe-1-7-medium"}]
-                }
-            },
+            {"acp": {"agents": [{"name": "Grok", "command": "grok agent stdio --verbose"}]}},
             f,
         )
     options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
     names = _overview_row_names(options, selectable)
-    assert names.count("Devin") == 1, f"expected exactly one Devin row, got {names}"
-    # A non-colliding builtin row is untouched.
-    assert "Grok Build" in names
+    assert names.count("Grok") == 1, f"expected exactly one Grok row, got {names}"
+    # The builtin row it shadowed is gone: the ``grok`` row's own label is
+    # "Grok Build", so its absence proves the row was dropped rather than
+    # rendered alongside the user's.
+    assert "Grok Build" not in names, f"builtin grok row should be shadowed, got {names}"
+    # Devin is unaffected by a collision elsewhere: its native row stays. The ACP
+    # row is deprecated, so it is not offered here regardless of this collision.
+    assert names.count("Devin") == 1, f"expected the native Devin row, got {names}"
+    assert "Devin (ACP)" not in names
     # The surviving row is the user's: its status carries the configured command,
     # not the builtin's "own auth" label.
     # (the status is width-capped, so match its head rather than the full command)
-    devin_row = next(o for o in options if Text.from_markup(o).plain.startswith("Devin "))
-    assert "ACP · devin acp" in Text.from_markup(devin_row).plain
+    grok_row = next(o for o in options if Text.from_markup(o).plain.startswith("Grok "))
+    assert "ACP · grok agent" in Text.from_markup(grok_row).plain
 
 
 def test_setup_reports_invalid_acp_omnigent_mcp(isolated_config) -> None:
@@ -1866,7 +1964,9 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["15", "", "", "q"]) + "\n"
+    # 16 is the OpenClaw import row: hiding Devin's builtin ACP row moved every
+    # row after it one lower (see the dispatch table's note).
+    stdin = "\n".join(["16", "", "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1888,7 +1988,7 @@ def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) 
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["15", "", str(selected), "", "q"]) + "\n"
+    stdin = "\n".join(["16", "", str(selected), "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1905,7 +2005,7 @@ def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
     selected = isolated_config / "package.json"
     selected.write_text('{"name": "unrelated"}', encoding="utf-8")
 
-    stdin = "\n".join(["15", "", str(selected), "2", "q"]) + "\n"
+    stdin = "\n".join(["16", "", str(selected), "2", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -2096,14 +2196,17 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("5", "_manage_hermes_harness"),
         ("8", "_manage_qwen_harness"),
         ("9", "_manage_goose_harness"),
-        # 10-11 are the builtin ACP CLI rows (Devin, Grok Build — sorted by id);
-        # every row after them shifted down by two when that block landed.
-        ("10", "_show_acp_cli_harness"),
+        # 10 is Devin's NATIVE row (devin-native), in the slot its builtin ACP
+        # row used to hold. The ACP path is deprecated (not offered), so 11-12
+        # are the remaining builtin ACP CLI rows (Grok Build, Jcode; sorted by
+        # id); every row after them sits one lower.
+        ("10", "_manage_devin_harness"),
         ("11", "_show_acp_cli_harness"),
-        ("12", "_manage_copilot_harness"),
-        ("13", "_manage_kiro_harness"),
-        ("14", "_manage_kimi_harness"),
-        ("16", "_add_acp_agent"),
+        ("12", "_show_acp_cli_harness"),
+        ("13", "_manage_copilot_harness"),
+        ("14", "_manage_kiro_harness"),
+        ("15", "_manage_kimi_harness"),
+        ("17", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(
@@ -2571,7 +2674,7 @@ def test_credential_label_cli_config_uses_provider_name() -> None:
     from omnigent.onboarding.configure_models import credential_label
 
     label = credential_label(
-        "cli-config", "isaac-databricks-codex", display_name="Databricks AI Gateway"
+        "cli-config", "isaac-databricks-codex", display_name="Databricks Unity Gateway"
     )
     assert label == "Isaac-Databricks-Codex"
 
@@ -2594,11 +2697,11 @@ def test_build_cli_config_provider_entry_shapes() -> None:
     """
     from omnigent.onboarding.configure_models import build_cli_config_provider_entry
 
-    assert build_cli_config_provider_entry("codex", "Databricks", "Databricks AI Gateway") == {
+    assert build_cli_config_provider_entry("codex", "Databricks", "Databricks Unity Gateway") == {
         "kind": "cli-config",
         "cli": "codex",
         "model_provider": "Databricks",
-        "display_name": "Databricks AI Gateway",
+        "display_name": "Databricks Unity Gateway",
     }
     # No display name → key omitted entirely (labels fall back to the
     # entry name), not written as None/empty.
@@ -2617,7 +2720,7 @@ _CODEX_CONFIG_TOML = """
 model_provider = "Databricks"
 
 [model_providers.Databricks]
-name = "Databricks AI Gateway"
+name = "Databricks Unity Gateway"
 base_url = "https://example.ai-gateway.cloud.databricks.com/codex/v1"
 
 [model_providers.Databricks.auth]
@@ -2701,7 +2804,7 @@ def test_add_menu_readds_dismissed_cli_config_credential(isolated_config) -> Non
     # the friendly display name for labels.
     assert entry["kind"] == "cli-config"
     assert entry["model_provider"] == "Databricks"
-    assert entry["display_name"] == "Databricks AI Gateway"
+    assert entry["display_name"] == "Databricks Unity Gateway"
     # Re-claims the codex (openai) default — there is no other credential.
     assert entry["default"] is True or entry.get("default") == "true"
     # The dismissal is cleared, so the credential behaves like an ordinary
@@ -3458,5 +3561,413 @@ def test_claude_subscription_relabeled_as_managed_gateway(tmp_path, monkeypatch)
         )
     )
     monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
-    assert _credential_label("claude", entry) == "Databricks AI Gateway"
-    assert _compact_credential_label(det) == "Databricks AI Gateway"
+    assert _credential_label("claude", entry) == "Databricks Unity Gateway"
+    assert _compact_credential_label(det) == "Databricks Unity Gateway"
+
+
+def _cp1252_console():
+    """Build a Rich console whose file encodes as cp1252, like a legacy Windows shell.
+
+    :returns: A ``(console, buffer)`` pair; decode *buffer* as cp1252 after
+        flushing the console's file to read what was rendered.
+    """
+    import io
+
+    from rich.console import Console
+
+    buffer = io.BytesIO()
+    stream = io.TextIOWrapper(buffer, encoding="cp1252", newline="")
+    return Console(file=stream, force_terminal=True, width=100), buffer
+
+
+@pytest.mark.parametrize(
+    "kind", ["key", "subscription", "gateway", "local", "databricks", "cli-config", "bedrock"]
+)
+def test_kind_glyph_falls_back_to_ascii_on_non_utf8_console(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a cp1252 console every kind glyph degrades to an encodable 2-cell token.
+
+    A legacy-codepage Windows console cannot encode the emoji glyphs, and the
+    raw write raises UnicodeEncodeError. The fallback must both survive the
+    encode and keep the listing's columns aligned (2 display cells, same as
+    the emoji it replaces).
+    """
+    from omnigent.inner.banner import _display_width
+
+    legacy, _ = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    glyph = kind_glyph(kind)
+    glyph.encode("cp1252")  # raises UnicodeEncodeError if the fallback didn't kick in
+    assert _display_width(glyph) == 2, f"fallback for {kind!r} must stay 2 cells; got {glyph!r}"
+
+
+def test_kind_glyph_keeps_emoji_on_utf8_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A UTF-8 console still gets the real emoji — the fallback is Windows-only fallout."""
+    import io
+
+    from rich.console import Console
+
+    from omnigent.onboarding.configure_models import _KIND_GLYPH
+
+    utf8 = Console(file=io.TextIOWrapper(io.BytesIO(), encoding="utf-8"), force_terminal=True)
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", utf8)
+
+    for kind, expected in _KIND_GLYPH.items():
+        assert kind_glyph(kind) == expected
+
+
+def test_render_listing_by_harness_survives_non_utf8_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``config list`` renders on a cp1252 console instead of dying on the glyph.
+
+    Reproduces the Windows crash: the shared console's file encodes with the
+    legacy ANSI codepage, so writing the emoji kind glyph raised
+    UnicodeEncodeError and aborted the whole command.
+    """
+    from omnigent.onboarding.configure_models import render_provider_listing_by_harness
+    from omnigent.onboarding.provider_config import load_providers
+
+    legacy, buffer = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    config: dict[str, object] = {
+        "providers": {"claude-subscription": {"kind": "subscription", "cli": "claude"}}
+    }
+    render_provider_listing_by_harness(config, load_providers(config))
+
+    legacy.file.flush()
+    out = buffer.getvalue().decode("cp1252")
+    assert "claude-subscription" in out
+    assert "subscription" in out
+
+
+def test_render_listing_survives_non_utf8_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The flat provider listing survives a legacy-codepage console too."""
+    from omnigent.onboarding.configure_models import render_provider_listing
+    from omnigent.onboarding.provider_config import load_providers
+
+    legacy, buffer = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    config: dict[str, object] = {
+        "providers": {"claude-subscription": {"kind": "subscription", "cli": "claude"}}
+    }
+    render_provider_listing(config, load_providers(config), [])
+
+    legacy.file.flush()
+    out = buffer.getvalue().decode("cp1252")
+    assert "claude-subscription" in out
+
+
+def test_add_menu_labels_survive_non_utf8_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ``+ Add a credential`` menu labels are cp1252-encodable as well."""
+    from omnigent.onboarding.configure_models import add_menu_options
+
+    legacy, _ = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    for option in add_menu_options():
+        option.label.encode("cp1252")
+
+
+def test_default_marker_falls_back_to_ascii_on_non_utf8_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ``✓ default`` check mark degrades to ``*`` on a cp1252 console.
+
+    The check mark is not cp1252-encodable either, so without its own
+    fallback the listing would still depend entirely on the stream-level
+    errors relaxation to survive a legacy codepage.
+    """
+    from omnigent.onboarding.configure_models import default_marker
+
+    legacy, _ = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    marker = default_marker()
+    marker.encode("cp1252")  # raises UnicodeEncodeError if the fallback didn't kick in
+    assert marker == "*"
+
+
+def test_default_marker_keeps_check_mark_on_utf8_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A UTF-8 console still gets the real check mark."""
+    import io
+
+    from rich.console import Console
+
+    from omnigent.onboarding.configure_models import default_marker
+
+    utf8 = Console(file=io.TextIOWrapper(io.BytesIO(), encoding="utf-8"), force_terminal=True)
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", utf8)
+
+    assert default_marker() == "\N{CHECK MARK}"
+
+
+def test_render_listing_default_marker_survives_non_utf8_console(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A listing with a default provider renders on cp1252 without the stream layer.
+
+    Drives the flat listing with a provider that carries the ``default``
+    marker through a strict cp1252 console (no errors relaxation) — the
+    write itself must survive, proving the marker's fallback makes the
+    render layer independently safe.
+    """
+    from omnigent.onboarding.configure_models import render_provider_listing
+    from omnigent.onboarding.provider_config import load_providers
+
+    legacy, buffer = _cp1252_console()
+    monkeypatch.setattr("omnigent.onboarding.configure_models.console", legacy)
+
+    config: dict[str, object] = {
+        "providers": {
+            "anthropic": {
+                "kind": "key",
+                "default": True,
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key_ref": "env:X",
+                    "models": {"default": "claude-sonnet-4-6"},
+                },
+            }
+        }
+    }
+    render_provider_listing(config, load_providers(config), [])
+
+    legacy.file.flush()
+    out = buffer.getvalue().decode("cp1252")
+    assert "anthropic" in out
+    assert "* default" in out
+
+
+def test_antigravity_gateway_setup_persists_native_provider(isolated_config, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.databricks_sdk_installed", lambda: False
+    )
+    # Antigravity -> native providers -> add -> gateway; retain agy's model default.
+    stdin = (
+        "\n".join(
+            [
+                "7",
+                "3",
+                "1",
+                "2",
+                "corp-gemini",
+                "https://gateway.example/gemini/",
+                "gateway-fake-key",
+                "",
+                "q",
+                "q",
+                "q",
+            ]
+        )
+        + "\n"
+    )
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+    config = _config_yaml(isolated_config)
+    entry = load_providers(config)["corp-gemini"]
+    assert entry.kind == "gateway"
+    assert get_default_provider(config, GEMINI_FAMILY) == entry
+    assert get_default_provider(config, OPENAI_FAMILY) is None
+    assert "antigravity" not in config
+    assert entry.family(GEMINI_FAMILY).base_url == "https://gateway.example/gemini"
+    assert secrets.load_secret("corp-gemini") == "gateway-fake-key"
+    assert "gateway-fake-key" not in result.output
+    assert "gateway-fake-key" not in (isolated_config / "config.yaml").read_text()
+
+
+def test_native_gemini_key_setup_uses_agy_model_default(isolated_config) -> None:
+    from omnigent.harnesses.antigravity_native.credentials import resolve_antigravity_credentials
+    from omnigent.onboarding.gemini_gateway import GEMINI_API_BASE_URL
+
+    stdin = "\n".join(["7", "3", "1", "1", "gemini-fake-key", "", "q", "q", "q"]) + "\n"
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
+    assert result.exit_code == 0, result.output
+    credentials = resolve_antigravity_credentials()
+    assert credentials is not None
+    assert credentials.api_key == "gemini-fake-key"
+    assert credentials.base_url == GEMINI_API_BASE_URL
+    assert credentials.model is None
+
+
+@pytest.mark.parametrize("correct_url", [True, False], ids=["correct", "go-back"])
+def test_gemini_gateway_setup_recovers_from_invalid_url(isolated_config, correct_url) -> None:
+    inputs = ["7", "3", "1", "2", "demo-gemini", "https://gateway.example/v1/responses"]
+    if correct_url:
+        inputs += ["https://gateway.example/gemini", "gateway-fake-key", ""]
+    else:
+        inputs += [""]
+    inputs += ["q", "q", "q"]
+    result = CliRunner().invoke(
+        cli, ["setup", "--no-internal-beta"], input="\n".join(inputs) + "\n"
+    )
+    assert result.exit_code == 0, result.output
+    assert "OpenAI Responses and Chat Completions" in " ".join(result.output.split())
+    assert "Databricks — profile" in result.output
+    assert "Traceback" not in result.output
+    config = _config_yaml(isolated_config)
+    if correct_url:
+        entry = load_providers(config)["demo-gemini"]
+        assert entry.family(GEMINI_FAMILY).base_url == "https://gateway.example/gemini"
+        assert secrets.load_secret("demo-gemini") == "gateway-fake-key"
+    else:
+        assert "demo-gemini" not in config.get("providers", {})
+        assert secrets.load_secret("demo-gemini") is None
+
+
+@pytest.mark.parametrize("failure_at", ["config", "token"])
+def test_gemini_databricks_setup_recovers_from_auth_failure(
+    isolated_config, monkeypatch, failure_at
+) -> None:
+    from omnigent.errors import OmnigentError
+
+    source = Mock()
+    if failure_at == "config":
+        source.side_effect = ValueError("Invalid refresh token; private-config-details")
+    else:
+        source.return_value.resolve.side_effect = OmnigentError(
+            "Authentication failed; private-config-details"
+        )
+    monkeypatch.setattr(
+        "omnigent.harnesses.antigravity_native.credentials.databricks_token_source", source
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.databricks_sdk_installed", lambda: True
+    )
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--no-internal-beta"],
+        input="\n".join(["7", "3", "1", "3", "work", "q", "q", "q"]) + "\n",
+    )
+    assert result.exit_code == 0, result.output
+    source.assert_called_once_with("work")
+    assert "databricks auth login --profile work" in " ".join(result.output.split()), result.output
+    assert "private-config-details" not in result.output
+    assert "Traceback" not in result.output
+    assert "databricks-gemini-work" not in _config_yaml(isolated_config).get("providers", {})
+
+
+@pytest.mark.parametrize("prefix", ["", "OMNIGENT_"])
+def test_setup_does_not_adopt_rejected_gemini_endpoint(isolated_config, monkeypatch, prefix):
+    from omnigent.cli_config import _adopt_detected_providers
+    from omnigent.onboarding.ambient import DetectedProvider
+
+    monkeypatch.setenv(prefix + "GEMINI_API_KEY", "fake-key")
+    monkeypatch.setenv(prefix + "GOOGLE_GEMINI_BASE_URL", "https://api.openai.com/v1")
+    monkeypatch.setattr(
+        "omnigent.onboarding.detected.detect_providers",
+        lambda: [
+            DetectedProvider(
+                name="gemini",
+                kind="key",
+                family=GEMINI_FAMILY,
+                source="$" + prefix + "GEMINI_API_KEY",
+            )
+        ],
+    )
+    (isolated_config / "config.yaml").write_text("providers: {}\n")
+    before = (isolated_config / "config.yaml").read_bytes()
+    assert _adopt_detected_providers() == []
+    assert (isolated_config / "config.yaml").read_bytes() == before
+    monkeypatch.setenv(prefix + "GOOGLE_GEMINI_BASE_URL", "https://gateway.example/gemini/")
+    assert _adopt_detected_providers() == ["gemini"]
+    assert (
+        load_providers(_config_yaml(isolated_config))["gemini"].family(GEMINI_FAMILY).base_url
+        == "https://gateway.example/gemini"
+    )
+
+
+def test_detected_gemini_key_invalid_endpoint_returns_to_setup(isolated_config, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-env-key")
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", "https://api.openai.com/v1")
+    # Suppress adoption so the detected-key confirmation path is exercised independently.
+    monkeypatch.setattr("omnigent.cli_config._adopt_detected_providers", list)
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--no-internal-beta"],
+        input="\n".join(["7", "4", "1", "1", "y", "", "q", "q", "q"]) + "\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "OpenAI Responses" in result.output, result.output
+    assert "Traceback" not in result.output
+    assert "gemini" not in _config_yaml(isolated_config).get("providers", {})
+    assert secrets.load_secret("gemini") is None
+
+
+@pytest.mark.parametrize("choice", ["1", "2", "q", "\x1b"])
+@pytest.mark.parametrize("kind", ["gateway", "local"])
+def test_setup_repairs_gemini_upgrade_default_conflict(isolated_config, choice, kind):
+    config_path = isolated_config / "config.yaml"
+    original = {
+        "providers": {
+            "gateway": {
+                "kind": kind,
+                "default": ["openai", "gemini"],
+                "openai": {"base_url": "https://gateway.example/v1", "api_key": "fake"},
+                "gemini": {"base_url": "https://gateway.example/gemini", "api_key": "fake"},
+            },
+            "google": {
+                "kind": "key",
+                "default": True,
+                "gemini": {
+                    "base_url": "https://generativelanguage.googleapis.com",
+                    "api_key": "fake",
+                },
+            },
+        }
+    }
+    config_path.write_text(yaml.safe_dump(original))
+    before = config_path.read_bytes()
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=f"{choice}\nq\n")
+    assert result.exit_code == 0, result.output
+    assert "Multiple defaults for Gemini" in result.output
+    assert "Traceback" not in result.output
+    if choice in {"q", "\x1b"}:
+        assert config_path.read_bytes() == before
+    else:
+        config = load_config()
+        assert get_default_provider(config, "gemini").name == (
+            "gateway" if choice == "1" else "google"
+        )
+        assert get_default_provider(config, "openai").name == "gateway"
+        assert load_providers(config)["gateway"].default_families - {"gemini"} == {"openai"}
+        assert all(
+            {key: value for key, value in config["providers"][name].items() if key != "default"}
+            == {key: value for key, value in entry.items() if key != "default"}
+            for name, entry in original["providers"].items()
+        )
+
+
+@pytest.mark.parametrize(
+    "profile_text",
+    [
+        "token = private-malformed-secret\n",
+        "[broken]\nhost = https://workspace.example\nprivate-malformed-secret\n",
+        "[broken]\nhost = https://one.example\nhost = https://two.example\n",
+    ],
+)
+def test_databricks_setup_recovers_from_malformed_profile(
+    isolated_config, monkeypatch, profile_text
+):
+    profile = isolated_config / "databrickscfg"
+    profile.write_text(profile_text)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(profile))
+    monkeypatch.setattr(
+        "omnigent.onboarding.databricks_config.databricks_sdk_installed", lambda: True
+    )
+    result = CliRunner().invoke(
+        cli,
+        ["setup", "--no-internal-beta"],
+        input="\n".join(["7", "3", "1", "3", "broken", "q", "q", "q"]) + "\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "profile configuration" in " ".join(result.output.split())
+    assert "Traceback" not in result.output
+    assert "private-malformed-secret" not in result.output
+    assert "databricks-gemini-broken" not in _config_yaml(isolated_config).get("providers", {})

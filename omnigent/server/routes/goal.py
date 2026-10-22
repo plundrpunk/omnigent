@@ -58,7 +58,7 @@ import tempfile
 import uuid
 from collections.abc import Mapping
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -429,7 +429,7 @@ def _validate_exec(spec: Any) -> dict[str, Any] | None:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _validate_contract(contract: Any) -> dict[str, Any]:

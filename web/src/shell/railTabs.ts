@@ -4,8 +4,20 @@
  * truth without importing back through `AppShell` (a cycle).
  */
 
-/** The selectable tabs in the right workspace rail, in display order. */
-export type RightRailTab = "run" | "files" | "changes" | "subagents" | "browser";
+/** The selectable tabs in the right workspace rail, in display order.
+ *  "run" is the fleet Work Loop tab, shown first when the host passes Work Loop data.
+ *  "browser" and "sidechat" are dynamic-tab modes (a browser tab / a side-chat
+ *  tab is selected), not fixed nav tabs — the nav strip renders the first four.
+ *  "github" is a stable stored id for the Pull Requests tab; renaming it drops saved choices. */
+export type RightRailTab =
+  | "run"
+  | "files"
+  | "changes"
+  | "github"
+  | "subagents"
+  | "browser"
+  | "sidechat"
+  | "content-search";
 
 /**
  * Count/status badge geometry. Fixed height with min-width == height keeps a

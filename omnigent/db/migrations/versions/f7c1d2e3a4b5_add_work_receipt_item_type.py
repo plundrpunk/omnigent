@@ -1,7 +1,7 @@
 """admit the work_receipt conversation item type
 
 Revision ID: f7c1d2e3a4b5
-Revises: e5d9bc8ac650
+Revises: nf12ab34cd56
 Create Date: 2026-10-21 00:00:00.000000
 
 Widens ``ck_conversation_items_type`` to admit code 12 (``work_receipt``,
@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "f7c1d2e3a4b5"
-down_revision: str | None = "e5d9bc8ac650"
+down_revision: str | None = "nf12ab34cd56"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

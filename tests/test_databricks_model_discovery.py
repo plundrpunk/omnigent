@@ -5,7 +5,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from omnigent.databricks_model_discovery import discover_databricks_claude_catalog
+from omnigent.models.databricks_model_discovery import discover_databricks_claude_catalog
 
 # One-shot stubs for the two discovery endpoints: ``(status, json_payload)``,
 # with a ``None`` payload meaning "no body" (a bare error response).
@@ -235,7 +235,7 @@ def test_truncated_pagination_warns(caplog: pytest.LogCaptureFixture) -> None:
             },
         )
 
-    with caplog.at_level("WARNING", logger="omnigent.databricks_model_discovery"):
+    with caplog.at_level("WARNING", logger="omnigent.models.databricks_model_discovery"):
         families = discover_databricks_claude_catalog(
             "https://workspace.example.com",
             "token",
@@ -293,7 +293,7 @@ def test_a_model_only_unity_catalog_serves_keeps_its_own_spelling() -> None:
 
 
 def test_family_shim_warns_and_delegates_to_the_catalog() -> None:
-    from omnigent.databricks_model_discovery import discover_databricks_claude_models
+    from omnigent.models.databricks_model_discovery import discover_databricks_claude_models
 
     def _handler(request: httpx.Request) -> httpx.Response:
         payload = (
@@ -312,9 +312,9 @@ def test_family_shim_warns_and_delegates_to_the_catalog() -> None:
     assert families == {"opus": "system.ai.claude-opus-5"}
 
 
-def _discover_codex(model_services: list[dict[str, str]]) -> tuple[str, ...]:
+def _discover_codex(model_services: list[dict[str, object]]) -> tuple[str, ...]:
     """Run codex discovery against a canned ``system.ai`` model-services page."""
-    from omnigent.databricks_model_discovery import discover_databricks_codex_models
+    from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
 
     def _handler(request: httpx.Request) -> httpx.Response:
         assert request.url.params["parent"] == "schemas/system.ai"
@@ -327,7 +327,14 @@ def _discover_codex(model_services: list[dict[str, str]]) -> tuple[str, ...]:
     )
 
 
-def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> None:
+@pytest.mark.parametrize(
+    "api_types",
+    [None, ["codex/v1/responses"], ["codex/v1/responses", "openai/v1/responses"]],
+    ids=["legacy", "codex-route", "both-routes"],
+)
+def test_discover_codex_models_filters_non_codex_and_ranks_curated_first(
+    api_types: list[str] | None,
+) -> None:
     """Codex discovery keeps only codex-servable ids, curated catalog first.
 
     The listing says what a workspace *can* serve, not which to launch on:
@@ -335,16 +342,19 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> No
     versioned GPT ids newest-first, then the rest — and non-codex families
     (Claude) are dropped entirely.
     """
-    servable = _discover_codex(
-        [
-            {"name": "model-services/system.ai.gpt-5-5"},
-            {"name": "model-services/system.ai.gpt-5-6-luna"},
-            {"name": "model-services/system.ai.gpt-5-6-sol"},
-            {"name": "model-services/system.ai.gpt-6-1"},
-            {"name": "model-services/system.ai.kimi-k2"},
-            {"name": "model-services/system.ai.claude-opus-5"},
-        ]
-    )
+    services: list[dict[str, object]] = [
+        {"name": "model-services/system.ai.gpt-5-5"},
+        {"name": "model-services/system.ai.gpt-5-6-luna"},
+        {"name": "model-services/system.ai.gpt-5-6-sol"},
+        {"name": "model-services/system.ai.gpt-6-1"},
+        {"name": "model-services/system.ai.kimi-k2"},
+        {"name": "model-services/system.ai.glm-9"},
+        {"name": "model-services/system.ai.claude-opus-5"},
+    ]
+    if api_types is not None:
+        for service in services:
+            service["supported_api_types"] = api_types
+    servable = _discover_codex(services)
 
     assert servable == (
         # Curated (cheapest-safe-first) beats a newer non-curated generation.
@@ -355,6 +365,44 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first() -> No
         "system.ai.gpt-6-1",
         # Codex-compatible but unversioned, last.
         "system.ai.kimi-k2",
+        "system.ai.glm-9",
+    )
+
+
+def test_discover_codex_models_drops_models_without_the_codex_route() -> None:
+    """A GPT-named model serving only chat routes cannot run a codex turn."""
+    servable = _discover_codex(
+        [
+            {
+                "name": "model-services/system.ai.gpt-oss-120b",
+                "supported_api_types": ["mlflow/v1/chat/completions", "mlflow/v1/responses"],
+            },
+            {
+                "name": "model-services/system.ai.gpt-5-5",
+                "supported_api_types": ["mlflow/v1/responses", "Codex/v1/Responses"],
+            },
+            # An empty list or explicit null reports nothing, like a listing that
+            # predates the field.
+            {"name": "model-services/system.ai.gpt-5-4", "supported_api_types": []},
+            {"name": "model-services/system.ai.gpt-5-4-mini", "supported_api_types": None},
+            # Values are compared trimmed.
+            {
+                "name": "model-services/system.ai.gpt-5-6-luna",
+                "supported_api_types": [" codex/v1/responses "],
+            },
+            # A malformed (non-list) value is not a name-based fallback.
+            {
+                "name": "model-services/system.ai.gpt-6-1",
+                "supported_api_types": "codex/v1/responses",
+            },
+        ]
+    )
+
+    assert servable == (
+        "system.ai.gpt-5-6-luna",
+        "system.ai.gpt-5-5",
+        "system.ai.gpt-5-4",
+        "system.ai.gpt-5-4-mini",
     )
 
 
@@ -365,7 +413,7 @@ def test_discover_codex_models_empty_listing_is_authoritative() -> None:
 
 def test_select_servable_model_matches_legacy_spelling() -> None:
     """A legacy ``databricks-`` request resolves to the served ``system.ai.`` id."""
-    from omnigent.databricks_model_discovery import select_servable_model
+    from omnigent.models.databricks_model_discovery import select_servable_model
 
     servable = ("system.ai.gpt-5-6-luna", "system.ai.gpt-5-5")
     assert select_servable_model("databricks-gpt-5-6-luna", servable) == "system.ai.gpt-5-6-luna"
