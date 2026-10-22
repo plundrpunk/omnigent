@@ -783,8 +783,6 @@ async def test_managed_session_create_validator_errors_serialize_as_422(
     # describeCreateError picks the message from.
     assert isinstance(detail, list) and len(detail) == 1
     assert "git repository URL" in detail[0]["msg"]
-    # The envelope never echoes the submitted request body back.
-    assert "input" not in detail[0]
 
 
 async def test_managed_session_create_rejects_unconfigured_provider(

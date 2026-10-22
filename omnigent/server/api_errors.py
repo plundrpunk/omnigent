@@ -49,11 +49,11 @@ async def _http_error(request: Request, exc: Exception) -> JSONResponse:
         if isinstance(error.get("code"), str) and isinstance(error.get("message"), str):
             code, detail = error["code"], error["message"]
     if _is_validation_error_list(detail):
-        # Routes that re-raise pydantic errors as HTTPException (e.g. session
-        # create) get the same treatment as RequestValidationError: a readable
-        # message and no echo of the submitted input.
+        # Routes that re-raise pydantic errors as HTTPException (session create)
+        # get a readable "loc: msg" message instead of a JSON dump. ``detail``
+        # is passed through unchanged: upstream contract-tests that route's
+        # exact legacy 422 list, ``input`` included.
         message = _validation_message(detail)
-        raw_detail = _strip_input(detail)
     else:
         message = detail if isinstance(detail, str) else json.dumps(detail)
     return JSONResponse(
