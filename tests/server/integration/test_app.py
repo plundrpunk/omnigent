@@ -24,10 +24,12 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.mark.parametrize("path", ["/v1", "/v1/", "/v1/missing", "/v1/missing.json"])
+@pytest.mark.parametrize("method", ["GET", "POST"])
 async def test_unknown_api_path_never_serves_spa(
     app: FastAPI,
     tmp_path: Path,
     path: str,
+    method: str,
 ) -> None:
     """The SPA mount must not turn an API typo into a successful HTML page."""
     web_ui = tmp_path / "spa"
@@ -41,10 +43,11 @@ async def test_unknown_api_path_never_serves_spa(
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",
     ) as client:
-        response = await client.get(path)
+        response = await client.request(method, path, content="private-input")
         assert response.status_code == 404
         assert response.headers["content-type"] == "application/json"
-        assert isinstance(response.json(), dict)
+        assert response.json() == {"error": {"code": "not_found", "message": "Not found"}}
+        assert "cache-control" not in response.headers
         for ui_path in ("/c/session_123", "/v1-settings"):
             shell = await client.get(ui_path)
             assert shell.status_code == 200

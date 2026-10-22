@@ -4903,7 +4903,10 @@ class _SPAStaticFiles(StaticFiles):
         # Unmatched API requests must never resolve to a bundled asset or
         # the SPA shell, even when the UI build contains a v1 directory.
         if path == "v1" or path.startswith("v1/"):
-            raise StarletteHTTPException(status_code=404, detail="Not Found")
+            return JSONResponse(
+                status_code=404,
+                content={"error": {"code": ErrorCode.NOT_FOUND, "message": "Not found"}},
+            )
         served_path = path
         # The HTML shell (root, directory, or SPA history fallback) is served
         # from the rebased in-memory copy rather than the file on disk, so
