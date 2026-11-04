@@ -64,7 +64,8 @@ from urllib.parse import quote
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 
-from omnigent.server.auth import LEVEL_EDIT, AuthProvider
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.routes import ams
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.stores import ConversationStore
@@ -688,7 +689,8 @@ def create_goal_router(
     :param auth_provider: Auth provider used to identify the requesting
         user. ``None`` in single-user mode (endpoint is open).
     :param conversation_store: Sessions used by the shared access check.
-    :param permission_store: Session grants; ``None`` disables enforcement.
+    :param permission_store: Session grants for shared run reads; without
+        this store, multi-user reads are restricted to the recorded owner.
     :returns: A configured :class:`APIRouter`.
     """
     if permission_store is not None and conversation_store is None:
@@ -697,6 +699,38 @@ def create_goal_router(
     registry = GoalRunRegistry()
     # Exposed for tests: the registry is per-router, not module-global.
     router.state = registry  # type: ignore[attr-defined]
+
+    async def _can_read(run: dict[str, Any], user_id: str | None) -> bool:
+        """Allow the owner or a session reader; hide legacy runs in multi-user mode."""
+        if user_id is None or user_id == RESERVED_USER_LOCAL:
+            return True
+        owner = run.get("owner")
+        if not isinstance(owner, str) or not owner.strip():
+            return False
+        if owner == user_id:
+            return True
+        conversation_id = run.get("conversation_id")
+        # Missing stores must not turn require_access's disabled-mode no-op
+        # into permission to read another user's run.
+        if not conversation_id or conversation_store is None or permission_store is None:
+            return False
+        try:
+            await require_access(
+                user_id, conversation_id, LEVEL_READ, permission_store, conversation_store
+            )
+        except OmnigentError as exc:
+            if exc.code not in (ErrorCode.FORBIDDEN, ErrorCode.NOT_FOUND):
+                raise
+            return False
+        return True
+
+    async def _readable_run(run_id: str, user_id: str | None) -> dict[str, Any] | None:
+        """Authorize before fetching fleet receipts or reading local artifacts."""
+        run = registry.get(run_id)
+        if user_id is not None and user_id != RESERVED_USER_LOCAL:
+            if run is None or not await _can_read(run, user_id):
+                raise HTTPException(status_code=404, detail=f"unknown goal run: {run_id}")
+        return run
 
     def _require_configured() -> None:
         if not _automaton_bin() or not _goal_cwd():
@@ -805,16 +839,20 @@ def create_goal_router(
     @router.get("/goal")
     async def list_goals(request: Request, conversation_id: str | None = None) -> dict[str, Any]:
         """List runs, newest first; empty list means exactly that."""
-        require_user(request, auth_provider)
+        user_id = require_user(request, auth_provider)
         if not ams._base_url():
             _require_configured()
-        return {"runs": [_public(r) for r in registry.list(conversation_id)]}
+        return {
+            "runs": [
+                _public(r) for r in registry.list(conversation_id) if await _can_read(r, user_id)
+            ]
+        }
 
     @router.get("/goal/{run_id}")
     async def get_goal(run_id: str, request: Request) -> dict[str, Any]:
         """One run by id."""
-        require_user(request, auth_provider)
-        run = registry.get(run_id)
+        user_id = require_user(request, auth_provider)
+        run = await _readable_run(run_id, user_id)
         if run is not None and run.get("dispatch") == "fleet":
             await _refresh_fleet_goal(run)
             return _public(run)
@@ -831,8 +869,8 @@ def create_goal_router(
         ``since`` is an event index, so the client can poll for the tail
         rather than re-fetching the whole run each time.
         """
-        require_user(request, auth_provider)
-        run = registry.get(run_id)
+        user_id = require_user(request, auth_provider)
+        run = await _readable_run(run_id, user_id)
         if run is not None and run.get("dispatch") == "fleet":
             await _refresh_fleet_goal(run)
             return {"run_id": run_id, "status": run["status"], "events": [], "total": 0}
@@ -969,5 +1007,5 @@ def _normalise_event(index: int, event: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _public(run: dict[str, Any]) -> dict[str, Any]:
-    """Serializable view of a run (drops the internal task handle)."""
-    return {k: v for k, v in run.items() if not k.startswith("_")}
+    """Serializable view of a run, without internal identity or task state."""
+    return {k: v for k, v in run.items() if k != "owner" and not k.startswith("_")}

@@ -608,6 +608,7 @@ async def test_goal_records_authenticated_owner_and_own_run_appears(
         headers={"X-Test-User": ALICE},
     )
     assert response.status_code == 202
+    assert "owner" not in response.json()
     run = registry.get(response.json()["run_id"])
     assert run["owner"] == ALICE
     assert run["conversation_id"] == conversation_id
@@ -674,3 +675,143 @@ async def test_single_user_keeps_legacy_run_and_ownerless_receipt(
         )
         assert detail.status_code == 200
         assert "user_id" not in detail.json()
+
+
+@pytest.fixture()
+def goal_reads(monkeypatch, seeded, registry, dispatch_stubs):
+    """Spy on side effects so denied reads cannot touch artifacts or AMS."""
+    from unittest.mock import Mock
+
+    from omnigent.server.routes import goal
+
+    refresh = AsyncMock()
+    artifact = Mock(wraps=goal._artifact_for)
+    monkeypatch.setattr(goal, "_refresh_fleet_goal", refresh)
+    monkeypatch.setattr(goal, "_artifact_for", artifact)
+    return refresh, artifact
+
+
+@pytest.mark.parametrize("dispatch", ["local", "fleet"])
+@pytest.mark.parametrize("caller", [ALICE, BOB])
+async def test_goal_reads_scope_list_detail_and_events(
+    client, seeded, registry, goal_reads, dispatch, caller
+) -> None:
+    registry.get("run-alice")["dispatch"] = dispatch
+    headers = {"X-Test-User": caller}
+    listing = await client.get("/v1/goal", headers=headers)
+    assert listing.status_code == 200
+    expected = "run-alice" if caller == ALICE else "run-bob"
+    assert [run["run_id"] for run in listing.json()["runs"]] == [expected]
+    assert all("owner" not in run for run in listing.json()["runs"])
+    filtered = await client.get(
+        "/v1/goal", params={"conversation_id": seeded["alice"]}, headers=headers
+    )
+    assert len(filtered.json()["runs"]) == (1 if caller == ALICE else 0)
+    detail = await client.get("/v1/goal/run-alice", headers=headers)
+    async with client.stream("GET", "/v1/goal/run-alice/events", headers=headers) as events:
+        await events.aread()
+    assert detail.status_code == events.status_code == (200 if caller == ALICE else 404)
+    assert "owner" not in detail.json()
+    assert "owner" not in events.json()
+    if caller == BOB:
+        for suffix, response in (("", detail), ("/events", events)):
+            missing = await client.get(f"/v1/goal/missing{suffix}", headers=headers)
+            assert missing.status_code == response.status_code == 404
+            assert response.json() == {"detail": "unknown goal run: run-alice"}
+        goal_reads[0].assert_not_awaited()
+        goal_reads[1].assert_not_called()
+    elif dispatch == "fleet":
+        assert goal_reads[0].await_count == 2
+        goal_reads[1].assert_not_called()
+    else:
+        assert events.json()["events"][0]["summary"] == "wrote file"
+        goal_reads[1].assert_called_once()
+
+
+@pytest.mark.parametrize("owner", [None, "", "  "])
+async def test_goal_reads_hide_legacy_even_with_session_access(
+    client, seeded, stores, registry, goal_reads, owner
+) -> None:
+    run = registry.get("run-alice")
+    if owner is None:
+        run.pop("owner")
+    else:
+        run["owner"] = owner
+    stores[1].grant(BOB, seeded["alice"], LEVEL_READ)
+    for caller in (ALICE, BOB):
+        headers = {"X-Test-User": caller}
+        listing = await client.get("/v1/goal", headers=headers)
+        assert "run-alice" not in listing.text
+        for suffix in ("", "/events"):
+            response = await client.get(f"/v1/goal/run-alice{suffix}", headers=headers)
+            assert response.status_code == 404
+    goal_reads[0].assert_not_awaited()
+    goal_reads[1].assert_not_called()
+
+
+@pytest.mark.parametrize("session", ["alice", "child"])
+async def test_goal_reads_use_session_grants_and_recheck_revocation(
+    client, seeded, stores, registry, goal_reads, session
+) -> None:
+    registry.get("run-alice")["conversation_id"] = seeded[session]
+    stores[1].grant(BOB, seeded["alice"], LEVEL_READ)
+    headers = {"X-Test-User": BOB}
+    listing = await client.get("/v1/goal", headers=headers)
+    assert {run["run_id"] for run in listing.json()["runs"]} == {"run-alice", "run-bob"}
+    for suffix in ("", "/events"):
+        response = await client.get(f"/v1/goal/run-alice{suffix}", headers=headers)
+        assert response.status_code == 200
+        assert "owner" not in response.json()
+    stores[1].revoke(BOB, seeded["alice"])
+    for suffix in ("", "/events"):
+        response = await client.get(f"/v1/goal/run-alice{suffix}", headers=headers)
+        assert response.status_code == 404
+    assert "run-alice" not in (await client.get("/v1/goal", headers=headers)).text
+
+
+@pytest.mark.parametrize("auth_provider", [None, _HeaderAuth()])
+async def test_goal_reads_single_user_keeps_legacy_and_foreign_runs(
+    stores, seeded, registry, goal_reads, auth_provider
+) -> None:
+    router = create_goal_router(auth_provider=auth_provider)
+    for run in registry.list():
+        router.state.create(dict(run))
+    router.state.get("run-alice").pop("owner")
+    app = FastAPI()
+    app.include_router(router, prefix="/v1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as local:
+        headers = {"X-Test-User": "local"}
+        listing = await local.get("/v1/goal", headers=headers)
+        assert {run["run_id"] for run in listing.json()["runs"]} == {"run-alice", "run-bob"}
+        assert all("owner" not in run for run in listing.json()["runs"])
+        for run_id in ("run-alice", "run-bob"):
+            for suffix in ("", "/events"):
+                response = await local.get(f"/v1/goal/{run_id}{suffix}", headers=headers)
+                assert response.status_code == 200
+                assert "owner" not in response.json()
+
+
+@pytest.mark.parametrize("with_conversations", [False, True])
+async def test_goal_reads_without_permission_store_do_not_share_runs(
+    stores, seeded, registry, goal_reads, with_conversations
+) -> None:
+    router = create_goal_router(
+        auth_provider=_HeaderAuth(),
+        conversation_store=stores[0] if with_conversations else None,
+    )
+    router.state.create(dict(registry.get("run-alice")))
+    app = FastAPI()
+    app.include_router(router, prefix="/v1")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as isolated:
+        headers = {"X-Test-User": BOB}
+        assert (await isolated.get("/v1/goal", headers=headers)).json() == {"runs": []}
+        for suffix in ("", "/events"):
+            response = await isolated.get(f"/v1/goal/run-alice{suffix}", headers=headers)
+            assert response.status_code == 404
+        own = await isolated.get("/v1/goal/run-alice", headers={"X-Test-User": ALICE})
+        assert own.status_code == 200
+        assert "owner" not in own.json()
